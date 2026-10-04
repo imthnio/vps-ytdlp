@@ -18,7 +18,7 @@
 #   sh install.sh --uninstall
 #======================================================================
 
-VERSION=1.0.1
+VERSION=1.0.2
 # ytdlp-onekey-begin
 
 if [ -t 1 ]; then
@@ -237,6 +237,8 @@ pkg_name() {
     dnf:htpasswd|yum:htpasswd) printf '%s\n' httpd-tools ;;
     pacman:htpasswd) printf '%s\n' apache ;;
     apt:flock|apk:flock|dnf:flock|yum:flock|pacman:flock|zypper:flock|xbps:flock) printf '%s\n' util-linux ;;
+    apt:python3|apk:python3|dnf:python3|yum:python3|zypper:python3|opkg:python3|xbps:python3) printf '%s\n' python3 ;;
+    pacman:python3) printf '%s\n' python ;;
     *) return 1 ;;
   esac
 }
@@ -359,6 +361,13 @@ port_text_problem() {
     return 0
   fi
   printf '%s\n' ok
+}
+
+# 只有已经装过、并且端口合法时，回车才沿用。第一次安装没有默认端口。
+port_prompt_default() {
+  saved=$(normalize_port "$1" 2>/dev/null) || return 1
+  [ "$(port_text_problem "$saved")" = ok ] || return 1
+  printf '%s\n' "$saved"
 }
 
 user_text_problem() {
@@ -672,6 +681,7 @@ need_tool() {
     ffmpeg) have ffmpeg && have ffprobe ;;
     htpasswd) have htpasswd ;;
     flock) have flock ;;
+    python3) have python3 ;;
     *) return 1 ;;
   esac
 }
@@ -695,12 +705,8 @@ pm_update() {
   PM_UPDATED=1
 }
 
-pm_install_one() {
+pm_install_body() {
   pkg=$1
-  [ -n "$pkg" ] || return 1
-  [ "$PM" = none ] && return 1
-  pm_update || return 1
-  say_info "安装 $pkg"
   case "$PM" in
     apt)
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$pkg"
@@ -715,6 +721,20 @@ pm_install_one() {
     xbps) xbps-install -y "$pkg" ;;
     *) return 1 ;;
   esac
+}
+
+pm_install_one() {
+  pkg=$1
+  [ -n "$pkg" ] || return 1
+  [ "$PM" = none ] && return 1
+  pm_update || return 1
+  say_info "安装 $pkg"
+  # 64MB 的鸡有时会在装到一半时被系统杀掉。清一下缓存再试一次。
+  if ! pm_install_body "$pkg"; then
+    sync
+    drop_page_cache
+    pm_install_body "$pkg" || return 1
+  fi
   drop_page_cache
 }
 
@@ -731,18 +751,71 @@ ensure_tool() {
   need_tool "$what"
 }
 
+# 256MB 及以下不跑 40MB 的 yt-dlp 自解压程序，那个一启动就会把小鸡打死。
+low_mem() {
+  [ -n "${MEM_MB:-}" ] && [ "$MEM_MB" -le 256 ]
+}
+
+# 先用一小块试。容器经常禁止 swapon，没必要先写几百 MB 再失败。
+swap_can_enable() {
+  probe=/yt-dlp-webui.swap.probe
+  swapoff "$probe" >/dev/null 2>&1 || true
+  rm -f "$probe"
+  write_swap_file "$probe" 8 || {
+    rm -f "$probe"
+    return 1
+  }
+  if mkswap "$probe" >/dev/null 2>&1 && swapon "$probe" >/dev/null 2>&1; then
+    swapoff "$probe" >/dev/null 2>&1 || true
+    rm -f "$probe"
+    return 0
+  fi
+  swapoff "$probe" >/dev/null 2>&1 || true
+  rm -f "$probe"
+  return 1
+}
+
+# 不用 seek。空洞文件 swapon 会失败。busybox 的 dd 也没有 oflag。
+write_swap_file() {
+  path=$1
+  mb=$2
+  case "$mb" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  rm -f "$path"
+  if ! { : > "$path"; } 2>/dev/null; then
+    return 1
+  fi
+  left=$mb
+  while [ "$left" -gt 0 ]; do
+    chunk=8
+    if [ "$left" -lt "$chunk" ]; then
+      chunk=$left
+    fi
+    # 括号包住重定向。失败时 busybox 自己会喊 can't create，2>/dev/null 盖不住那一声。
+    if ! { dd if=/dev/zero bs=1048576 count="$chunk" >>"$path"; } 2>/dev/null; then
+      return 1
+    fi
+    left=$((left - chunk))
+    sync
+    drop_page_cache
+  done
+  return 0
+}
+
 prepare_memory() {
   LOW_MEM=0
   if [ -n "$MEM_MB" ] && [ "$MEM_MB" -le 512 ]; then
     LOW_MEM=1
   fi
-  if [ -w /proc/sys/vm/overcommit_memory ] && [ "$LOW_MEM" = 1 ]; then
+  if [ "$LOW_MEM" = 1 ]; then
     oc=$(tr -d ' \r\n' < /proc/sys/vm/overcommit_memory 2>/dev/null || true)
     if [ "$oc" != 1 ]; then
+      # 很多容器的 /proc/sys 是只读的。[ -w ] 仍会说能写，直接重定向还会把报错打到屏幕上。
       if sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 \
-        || printf '1\n' > /proc/sys/vm/overcommit_memory 2>/dev/null; then
+        || { printf '1\n' > /proc/sys/vm/overcommit_memory; } 2>/dev/null; then
         mkdir -p /etc/sysctl.d 2>/dev/null || true
-        printf 'vm.overcommit_memory=1\n' > /etc/sysctl.d/99-yt-dlp-webui-overcommit.conf 2>/dev/null || true
+        { printf 'vm.overcommit_memory=1\n' > /etc/sysctl.d/99-yt-dlp-webui-overcommit.conf; } 2>/dev/null || true
         say_ok "小内存机器已放开内存申请限制"
       fi
     fi
@@ -761,13 +834,18 @@ prepare_memory() {
       return 0
       ;;
   esac
+  if ! swap_can_enable; then
+    say_warn "这台机器不允许打开虚拟内存。安装会继续，下载时会尽量省内存。"
+    return 0
+  fi
   swapf=/yt-dlp-webui.swap
   if [ -f "$swapf" ]; then
     swapoff "$swapf" >/dev/null 2>&1 || true
     rm -f "$swapf"
   fi
   say_info "内存大约 ${MEM_MB:-很少}MB。正在做 ${plan}MB 虚拟内存，下载视频时用得上…"
-  if ! dd if=/dev/zero of="$swapf" bs=1048576 count="$plan" >/dev/null 2>&1; then
+  # 一次写完几百 MB，64MB 的鸡会把内存缓存撑满，终端直接断开。改成一小段一小段写。
+  if ! write_swap_file "$swapf" "$plan"; then
     rm -f "$swapf"
     say_warn "虚拟内存文件没写成，继续安装"
     return 0
@@ -789,19 +867,36 @@ prepare_memory() {
 fetch_first() {
   dest=$1
   shift
+  # 小内存鸡一下灌进几十 MB，页缓存来不及丢掉，系统会把安装进程杀掉。
+  rate=
+  if low_mem; then
+    rate=1M
+  fi
   for url in "$@"; do
     rm -f "$dest"
     say_info "下载 $url"
+    ok=0
     if have curl; then
-      if curl -fL --retry 2 --connect-timeout 20 --max-time 300 -o "$dest" "$url" && [ -s "$dest" ]; then
-        return 0
+      if [ -n "$rate" ]; then
+        curl -fL --retry 2 --connect-timeout 20 --max-time 900 --limit-rate "$rate" -o "$dest" "$url" && [ -s "$dest" ] && ok=1
+      elif curl -fL --retry 2 --connect-timeout 20 --max-time 300 -o "$dest" "$url" && [ -s "$dest" ]; then
+        ok=1
       fi
     elif have wget; then
-      if wget -O "$dest" "$url" && [ -s "$dest" ]; then
-        return 0
+      if [ -n "$rate" ]; then
+        wget -O "$dest" --limit-rate="$rate" "$url" && [ -s "$dest" ] && ok=1
+      elif wget -O "$dest" "$url" && [ -s "$dest" ]; then
+        ok=1
       fi
     else
       return 1
+    fi
+    if [ "$ok" = 1 ]; then
+      if low_mem; then
+        sync
+        drop_page_cache
+      fi
+      return 0
     fi
   done
   rm -f "$dest"
@@ -862,7 +957,14 @@ workdir_for() {
 prepare_workdir() {
   WORK=$(workdir_for "$(fstype_of /tmp)" "$(disk_free_mb /tmp)")
   rm -rf "$WORK"
-  mkdir -p "$WORK"
+  mkdir -p "$WORK/tmp" "$WORK/home" "$WORK/cache"
+  # /tmp 在小内存鸡上经常是内存盘。下载和解压都改到硬盘，避免把内存撑爆。
+  TMPDIR=$WORK/tmp
+  HOME=$WORK/home
+  XDG_CACHE_HOME=$WORK/cache
+  TMP=$TMPDIR
+  TEMP=$TMPDIR
+  export TMPDIR HOME XDG_CACHE_HOME TMP TEMP
 }
 
 install_static_ffmpeg() {
@@ -889,7 +991,16 @@ install_static_ffmpeg() {
     rm -f "$tmp"
     return 1
   fi
-  if ! xz -dc "$tmp" | tar -xf - -C "$dir"; then
+  # 有的系统只有 busybox 的 unxz，没有 xz 这个命令。
+  if have xz; then
+    xz -dc "$tmp" | tar -xf - -C "$dir" || true
+  elif have unxz; then
+    unxz -c "$tmp" | tar -xf - -C "$dir" || true
+  else
+    rm -rf "$dir" "$tmp"
+    return 1
+  fi
+  if ! find "$dir" -type f -name ffmpeg | grep -q .; then
     rm -rf "$dir" "$tmp"
     return 1
   fi
@@ -909,17 +1020,53 @@ install_static_ffmpeg() {
   need_tool ffmpeg
 }
 
+install_apk_ffmpeg_onebyone() {
+  [ "$PM" = apk ] || return 1
+  pm_update || return 1
+  names=$(apk add --simulate --no-cache ffmpeg 2>/dev/null | sed -n 's/.*Installing \([^ ]*\) (.*/\1/p')
+  [ -n "$names" ] || return 1
+  say_info "内存大约 ${MEM_MB}MB。ffmpeg 的软件包一个一个装，避免把小鸡撑死"
+  for name in $names; do
+    if apk info -e "$name" >/dev/null 2>&1; then
+      continue
+    fi
+    if ! apk add --no-cache "$name" >/dev/null 2>&1; then
+      sync
+      drop_page_cache
+      apk add --no-cache "$name" >/dev/null 2>&1 || return 1
+    fi
+    sync
+    drop_page_cache
+  done
+  need_tool ffmpeg
+}
+
 ensure_ffmpeg() {
   if need_tool ffmpeg; then
     say_ok "ffmpeg 已经有了"
     return 0
   fi
   say_step "安装 ffmpeg（合并视频和音频要用）"
+  # 一次装一百个包，64MB 的鸡会被杀掉。Alpine 上改成一个一个装。
+  # 一个一个也失败时，不要再整包重试，那一下会把安装进程杀掉。
+  if low_mem && [ "$PM" = apk ]; then
+    if install_apk_ffmpeg_onebyone; then
+      say_ok "ffmpeg 已从系统软件源装上"
+      return 0
+    fi
+    say_warn "内存大约 ${MEM_MB}MB，ffmpeg 没装完。高画质合并会失败，标清还能下。"
+    return 0
+  fi
   if ensure_tool ffmpeg; then
     say_ok "ffmpeg 已从系统软件源装上"
     return 0
   fi
-  say_info "软件源里没有 ffmpeg，改下静态版本"
+  # 40MB 的静态包在 128MB 及以下会把后面的安装一起打死。
+  if [ -n "${MEM_MB:-}" ] && [ "$MEM_MB" -le 128 ]; then
+    say_warn "内存大约 ${MEM_MB}MB，软件源里的 ffmpeg 没装上。高画质合并会失败，标清还能下。"
+    return 0
+  fi
+  say_info "软件源里的 ffmpeg 没装上，改下静态版本"
   if install_static_ffmpeg; then
     say_ok "已装上静态 ffmpeg"
     return 0
@@ -937,9 +1084,59 @@ place_elf() {
   chmod 755 "$dest"
 }
 
+qjs_eval_ok() {
+  [ -x "$1" ] || return 1
+  "$1" -e 'print(1)' >/dev/null 2>&1
+}
+
+# 下载下来一般是 644。一个执行位都没有时，root 也跑不了。
+# 下载目录还经常挂 noexec。先拷到可以执行的目录，chmod 之后再试。
+place_and_test_qjs() {
+  src=$1
+  errf=$2
+  for dest in /usr/local/bin/qjs /root/qjs; do
+    mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+    cp "$src" "$dest" 2>/dev/null || continue
+    chmod 755 "$dest" 2>/dev/null || true
+    if qjs_eval_ok "$dest"; then
+      printf '%s\n' "$dest"
+      return 0
+    fi
+    "$dest" -e 'print(1)' >"$errf" 2>&1 || true
+    rm -f "$dest"
+  done
+  return 1
+}
+
+try_distro_js() {
+  case "$PM" in
+    apk|apt|dnf|yum|pacman|zypper|opkg|xbps)
+      pm_install_one quickjs >/dev/null 2>&1 || true
+      ;;
+  esac
+  for bin in /usr/bin/qjs /usr/local/bin/qjs /usr/bin/quickjs; do
+    if qjs_eval_ok "$bin"; then
+      JS_RUNTIME=$(js_runtime_value quickjs "$bin")
+      return 0
+    fi
+  done
+  if ! low_mem; then
+    case "$PM" in
+      apk|apt|dnf|yum|pacman|zypper)
+        pm_install_one nodejs >/dev/null 2>&1 || true
+        ;;
+    esac
+    if command -v node >/dev/null 2>&1 && node -e 'console.log(1)' >/dev/null 2>&1; then
+      JS_RUNTIME=$(js_runtime_value node "$(command -v node)")
+      return 0
+    fi
+  fi
+  return 1
+}
+
 install_qjs() {
   say_step "安装 QuickJS（YouTube 现在要它来算签名）"
-  if [ -x /usr/local/bin/qjs ] && /usr/local/bin/qjs -e 'print(1)' >/dev/null 2>&1; then
+  if qjs_eval_ok /usr/local/bin/qjs; then
     JS_RUNTIME=$(js_runtime_value quickjs /usr/local/bin/qjs)
     say_ok "QuickJS 已经能用，跳过下载"
     return 0
@@ -948,6 +1145,8 @@ install_qjs() {
   tag=$(latest_tag quickjs-ng/quickjs)
   [ -n "$tag" ] || tag=v0.17.0
   tmp=$WORK/qjs.new
+  errf=$WORK/qjs.err
+  : > "$errf"
   # shellcheck disable=SC2046
   if ! fetch_first "$tmp" $(github_urls "quickjs-ng/quickjs/releases/download/$tag/$asset"); then
     if [ "$tag" != v0.17.0 ]; then
@@ -957,16 +1156,31 @@ install_qjs() {
   fi
   if ! is_elf "$tmp"; then
     rm -f "$tmp"
+    if try_distro_js; then
+      say_ok "QuickJS 已从系统软件源装上"
+      return 0
+    fi
     die "QuickJS 下载下来不是程序。请检查这台鸡能不能打开 GitHub。"
   fi
-  if ! "$tmp" -e 'print(1)' >/dev/null 2>&1; then
-    rm -f "$tmp"
-    die "QuickJS 在这台鸡上跑不起来。"
-  fi
-  place_elf "$tmp" /usr/local/bin/qjs
+  placed=$(place_and_test_qjs "$tmp" "$errf" || true)
   rm -f "$tmp"
-  JS_RUNTIME=$(js_runtime_value quickjs /usr/local/bin/qjs)
-  say_ok "QuickJS 已放好"
+  if [ -n "$placed" ]; then
+    if [ "$placed" != /usr/local/bin/qjs ] && cp "$placed" /usr/local/bin/qjs 2>/dev/null; then
+      chmod 755 /usr/local/bin/qjs 2>/dev/null || true
+      if qjs_eval_ok /usr/local/bin/qjs; then
+        placed=/usr/local/bin/qjs
+      fi
+    fi
+    JS_RUNTIME=$(js_runtime_value quickjs "$placed")
+    say_ok "QuickJS 已放好"
+    return 0
+  fi
+  if try_distro_js; then
+    say_ok "官方 QuickJS 跑不起来，已改用系统里的 JavaScript"
+    return 0
+  fi
+  why=$(tr '\n' ' ' < "$errf" 2>/dev/null | cut -c1-180)
+  die "QuickJS 在这台鸡上跑不起来。${why}"
 }
 
 ytdlp_try_asset() {
@@ -996,8 +1210,38 @@ ytdlp_try_asset() {
   return 0
 }
 
+install_ytdlp_zipapp() {
+  if ! ensure_tool python3; then
+    return 1
+  fi
+  tmp=$WORK/yt-dlp.zipapp
+  # shellcheck disable=SC2046
+  fetch_first "$tmp" $(github_urls "yt-dlp/yt-dlp/releases/latest/download/yt-dlp") || return 1
+  if ! head -n 1 "$tmp" | grep -q python; then
+    rm -f "$tmp"
+    return 1
+  fi
+  cp "$tmp" /usr/local/bin/yt-dlp
+  chmod 755 /usr/local/bin/yt-dlp
+  rm -f "$tmp"
+  sync
+  drop_page_cache
+  ver=$(/usr/local/bin/yt-dlp --version 2>/dev/null | head -n 1) || return 1
+  [ -n "$ver" ] || return 1
+  say_ok "yt-dlp 已装上（$ver）"
+  return 0
+}
+
 install_ytdlp() {
   say_step "安装 yt-dlp"
+  # 官方那个独立程序有 40MB，一运行会先把自己解压到内存里。64MB 的鸡会被直接打死。
+  if low_mem; then
+    say_info "内存大约 ${MEM_MB}MB，改用小的 yt-dlp（要有 Python）"
+    if install_ytdlp_zipapp; then
+      return 0
+    fi
+    die "小的 yt-dlp 没跑起来。内存大约 ${MEM_MB}MB，不能再试那个会撑死小鸡的大程序。"
+  fi
   asset=$(ytdlp_asset "$ARCH" "$LIBC" 2>/dev/null || true)
   [ -n "$asset" ] || die "没有适合这台鸡的 yt-dlp（架构 $ARCH，库 $LIBC）。"
   if ytdlp_try_asset "$asset"; then
@@ -1043,6 +1287,8 @@ write_one_wrapper() {
 #!/bin/sh
 # 小内存机器一次只跑一个 yt-dlp。网页如果排了两个，第二个在这里等着。
 export TMPDIR="${TMPDIR:-/var/lib/yt-dlp-webui/tmp}"
+export TEMP="$TMPDIR"
+export TMP="$TMPDIR"
 export HOME="${HOME:-/var/lib/yt-dlp-webui/home}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/var/lib/yt-dlp-webui/cache}"
 mkdir -p "$TMPDIR" "$HOME" "$XDG_CACHE_HOME" 2>/dev/null || true
@@ -1351,15 +1597,16 @@ collect_addrs() {
 hash_password() {
   user=$1
   pass=$2
+  # 不能在这里 die。调用方把它放在 $(...) 里，die 只会退出这个小括号，外面还会继续装。
   if ! need_tool htpasswd; then
-    ensure_tool htpasswd || die "装不上生成密码用的 htpasswd。没有登录不能把网页暴露出去。"
+    ensure_tool htpasswd >/dev/null || return 1
   fi
   line=$(htpasswd -nbB "$user" "$pass" 2>/dev/null || true)
   hash=$(printf '%s\n' "$line" | awk -F: 'NR==1 {print substr($0, index($0, ":")+1)}')
   case "$hash" in
     \$2a\$*|\$2b\$*|\$2y\$*) printf '%s\n' "$hash"; return 0 ;;
   esac
-  die "密码哈希没生成。htpasswd 的输出是：${line:-空}"
+  return 1
 }
 
 read_saved_password() {
@@ -1568,13 +1815,23 @@ ask_settings() {
   reset_pass=$1
   PASS_MODE=new
   say_step "先回答 6 个问题"
-  printf '%s\n' "每一题都可以直接按回车。回车就是适合新手的选项。"
+  printf '%s\n' "除了网页端口，其他题可以直接按回车。回车就是适合新手的选项。"
+  printf '%s\n' "端口要你自己填一个数字。脚本不会替你定成 3033。"
 
   saved_port=$(config_get port 2>/dev/null || true)
-  [ -n "$saved_port" ] || saved_port=3033
+  if ! port_prompt_default "$saved_port" >/dev/null 2>&1; then
+    saved_port=
+  else
+    saved_port=$(port_prompt_default "$saved_port")
+  fi
   printf '\n%s\n' "第 1 题：网页端口"
   printf '%s\n' "Mac 打开网页时，地址是 http://小鸡IP:端口"
-  printf '%s\n' "端口就是冒号后面那个数字。例如 3033。"
+  printf '%s\n' "端口就是冒号后面那个数字。请从 1 到 65535 里自己选一个，不要用 22。"
+  if [ -n "$saved_port" ]; then
+    printf '%s\n' "这台鸡现在用的是 ${saved_port}。直接回车就继续用这个。"
+  else
+    printf '%s\n' "这一题要自己填，不能直接回车。例如 8080。"
+  fi
   while true; do
     ask_line "想用哪个端口？" "$saved_port" PORT_CHOSEN
     PORT_CHOSEN=$(normalize_port "$PORT_CHOSEN" 2>/dev/null || printf '%s' "$PORT_CHOSEN")
@@ -1582,11 +1839,15 @@ ask_settings() {
     case "$why" in
       ok) ;;
       ssh)
-        say_warn "22 是你登录这台鸡用的，不能给网页。直接回车就用 ${saved_port}。"
+        say_warn "22 是你登录这台鸡用的，不能给网页。请另选一个，例如 8080。"
         continue
         ;;
       *)
-        say_warn "请输入 1 到 65535 的数字。不懂就直接回车。"
+        if [ -n "$saved_port" ]; then
+          say_warn "请输入 1 到 65535 的数字。直接回车就用 ${saved_port}。"
+        else
+          say_warn "请输入 1 到 65535 的数字。这一题要自己填，例如 8080。"
+        fi
         continue
         ;;
     esac
@@ -1615,6 +1876,10 @@ ask_settings() {
   printf '\n%s\n' "第 3 题：登录密码"
   saved_pass=$(read_saved_password 2>/dev/null || true)
   saved_hash=$(config_get password_hash 2>/dev/null || true)
+  case "$saved_hash" in
+    \$2a\$*|\$2b\$*|\$2y\$*) ;;
+    *) saved_hash= ;;
+  esac
   if [ "$reset_pass" != 1 ] && [ -n "$saved_pass" ] && [ -n "$saved_hash" ]; then
     printf '%s\n' "这台鸡已经有密码了。"
     printf '%s\n' "  1) 继续用现在的密码（推荐）"
@@ -1789,6 +2054,8 @@ do_install() {
   ensure_tool curl || die "装不上 curl 或 wget，没法下载程序。"
   ensure_tool tar || die "装不上 tar。"
   ensure_tool flock || die "装不上 flock。小内存机器要用它把下载排成一个一个。"
+  # 趁内存还干净先装这个小工具。放到大文件下载之后，64MB 的鸡会在这一步被杀掉。
+  ensure_tool htpasswd || die "装不上生成密码用的 htpasswd。没有登录不能把网页暴露出去。"
 
   ensure_ffmpeg
   install_qjs
@@ -1814,11 +2081,11 @@ do_install() {
     say_ok "沿用原来的登录密码"
   elif [ "$PASS_MODE" = custom ]; then
     pass=$PASS_CHOSEN
-    hash=$(hash_password "$user" "$pass")
+    hash=$(hash_password "$user" "$pass") || die "登录密码没能生成。没有登录不能把网页暴露出去。"
   else
     say_step "生成登录密码"
     pass=$(rand_hex 8) || die "随机密码没生成。"
-    hash=$(hash_password "$user" "$pass")
+    hash=$(hash_password "$user" "$pass") || die "登录密码没能生成。没有登录不能把网页暴露出去。"
   fi
 
   secret=$(env_get JWT_SECRET 2>/dev/null || true)
