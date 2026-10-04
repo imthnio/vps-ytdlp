@@ -10,7 +10,7 @@
 # 64MB 会先做一块硬盘上的虚拟内存，并让下载一个接一个跑，避免内存被打爆。
 #
 # 安装时会用大白话问端口、登录、一次下几个、Mac 怎么打开、视频放哪。
-# 每一题直接回车就是推荐项。再运行一次会再问，回车就沿用原来的选择。
+# 第一次除了端口，直接回车就是推荐项。已经装过再运行，直接回车就是更新到最新版本。
 #
 #   sh install.sh
 #   sh install.sh --status
@@ -18,7 +18,7 @@
 #   sh install.sh --uninstall
 #======================================================================
 
-VERSION=1.0.2
+VERSION=1.0.3
 # ytdlp-onekey-begin
 
 if [ -t 1 ]; then
@@ -179,6 +179,21 @@ queue_for() {
   fi
 }
 
+# 更新时沿用配置里的同时下载数。小内存机器仍然强制一个一个下。
+queue_choice_for() {
+  saved=$1
+  mem=$2
+  if [ -n "$mem" ] && [ "$mem" -lt 768 ]; then
+    printf '%s\n' 1
+    return 0
+  fi
+  if [ "$saved" = 2 ]; then
+    printf '%s\n' 2
+    return 0
+  fi
+  printf '%s\n' 1
+}
+
 downloader_for() {
   ram=$1
   if [ -n "$ram" ] && [ "$ram" -lt 768 ]; then
@@ -318,6 +333,7 @@ write_config() {
   queue=$7
   data=$8
   down=$9
+  front=${10:-}
   [ -n "$file" ] && [ -n "$port" ] && [ -n "$user" ] && [ -n "$hash" ] || return 1
   [ -n "$down" ] || down="$data/downloads"
   {
@@ -337,6 +353,9 @@ write_config() {
     printf '%s\n' 'logging:'
     printf '%s\n' '  enable_file_logging: true'
     printf '  log_path: "%s"\n' '/var/log/yt-dlp-webui.log'
+    if [ -n "$front" ]; then
+      printf 'frontend_path: "%s"\n' "$front"
+    fi
   } > "$file"
 }
 
@@ -368,6 +387,37 @@ port_prompt_default() {
   saved=$(normalize_port "$1" 2>/dev/null) || return 1
   [ "$(port_text_problem "$saved")" = ok ] || return 1
   printf '%s\n' "$saved"
+}
+
+# 配置、密码哈希和网页程序都在，才算已经装过。坏掉的记录会重新问。
+install_ready() {
+  bin=${YTD_WEBUI_BIN:-/usr/local/bin/yt-dlp-webui}
+  [ -x "$bin" ] || return 1
+  port=$(config_get port) || return 1
+  [ "$(port_text_problem "$port")" = ok ] || return 1
+  user=$(config_get username) || return 1
+  [ "$(user_text_problem "$user")" = ok ] || return 1
+  hash=$(config_get password_hash) || return 1
+  case "$hash" in
+    \$2a\$*|\$2b\$*|\$2y\$*) return 0 ;;
+  esac
+  return 1
+}
+
+# 更新时读回端口、账号和文件夹。打不开防火墙这一项，避免把上次关掉的端口又放开。
+load_saved_choices() {
+  PORT_CHOSEN=$(config_get port) || return 1
+  [ "$(port_text_problem "$PORT_CHOSEN")" = ok ] || return 1
+  USER_CHOSEN=$(config_get username) || return 1
+  [ "$(user_text_problem "$USER_CHOSEN")" = ok ] || return 1
+  PASS_MODE=keep
+  PASS_CHOSEN=$(read_saved_password 2>/dev/null || true)
+  DIR_CHOSEN=$(config_get download_path) || return 1
+  [ "$(dir_text_problem "$DIR_CHOSEN")" = ok ] || return 1
+  saved_q=$(config_get queue_size 2>/dev/null || true)
+  QUEUE_CHOSEN=$(queue_choice_for "$saved_q" "${MEM_MB:-}")
+  OPEN_CHOSEN=0
+  return 0
 }
 
 user_text_problem() {
@@ -1080,8 +1130,11 @@ place_elf() {
   dest=$2
   is_elf "$src" || return 1
   mkdir -p "$(dirname "$dest")"
-  cp "$src" "$dest"
-  chmod 755 "$dest"
+  # 先写到旁边的新文件，确认拷完再替换。失败时原来的程序还在。
+  rm -f "$dest.new"
+  cp "$src" "$dest.new" || return 1
+  chmod 755 "$dest.new" || return 1
+  mv "$dest.new" "$dest"
 }
 
 qjs_eval_ok() {
@@ -1096,14 +1149,18 @@ place_and_test_qjs() {
   errf=$2
   for dest in /usr/local/bin/qjs /root/qjs; do
     mkdir -p "$(dirname "$dest")" 2>/dev/null || true
-    cp "$src" "$dest" 2>/dev/null || continue
-    chmod 755 "$dest" 2>/dev/null || true
-    if qjs_eval_ok "$dest"; then
+    trial=$dest.new
+    rm -f "$trial"
+    cp "$src" "$trial" 2>/dev/null || continue
+    chmod 755 "$trial" 2>/dev/null || true
+    if qjs_eval_ok "$trial"; then
+      mv "$trial" "$dest" || { rm -f "$trial"; continue; }
+      chmod 755 "$dest" 2>/dev/null || true
       printf '%s\n' "$dest"
       return 0
     fi
-    "$dest" -e 'print(1)' >"$errf" 2>&1 || true
-    rm -f "$dest"
+    "$trial" -e 'print(1)' >"$errf" 2>&1 || true
+    rm -f "$trial"
   done
   return 1
 }
@@ -1136,7 +1193,8 @@ try_distro_js() {
 
 install_qjs() {
   say_step "安装 QuickJS（YouTube 现在要它来算签名）"
-  if qjs_eval_ok /usr/local/bin/qjs; then
+  # 第一次装过就能用就跳过。更新时要换成最新的，旧的先留着，新的跑起来再替换。
+  if [ "${UPDATE_MODE:-}" != 1 ] && qjs_eval_ok /usr/local/bin/qjs; then
     JS_RUNTIME=$(js_runtime_value quickjs /usr/local/bin/qjs)
     say_ok "QuickJS 已经能用，跳过下载"
     return 0
@@ -1156,6 +1214,11 @@ install_qjs() {
   fi
   if ! is_elf "$tmp"; then
     rm -f "$tmp"
+    if qjs_eval_ok /usr/local/bin/qjs; then
+      JS_RUNTIME=$(js_runtime_value quickjs /usr/local/bin/qjs)
+      say_warn "新的 QuickJS 没下下来，继续用现在的"
+      return 0
+    fi
     if try_distro_js; then
       say_ok "QuickJS 已从系统软件源装上"
       return 0
@@ -1175,12 +1238,22 @@ install_qjs() {
     say_ok "QuickJS 已放好"
     return 0
   fi
+  if qjs_eval_ok /usr/local/bin/qjs; then
+    JS_RUNTIME=$(js_runtime_value quickjs /usr/local/bin/qjs)
+    say_warn "新的 QuickJS 跑不起来，继续用现在的"
+    return 0
+  fi
   if try_distro_js; then
     say_ok "官方 QuickJS 跑不起来，已改用系统里的 JavaScript"
     return 0
   fi
   why=$(tr '\n' ' ' < "$errf" 2>/dev/null | cut -c1-180)
   die "QuickJS 在这台鸡上跑不起来。${why}"
+}
+
+ytdlp_runs() {
+  [ -x /usr/local/bin/yt-dlp ] || return 1
+  /usr/local/bin/yt-dlp --version >/dev/null 2>&1
 }
 
 ytdlp_try_asset() {
@@ -1201,12 +1274,15 @@ ytdlp_try_asset() {
     rm -rf "$unpack"
   fi
   is_elf "$tmp" || return 1
-  cp "$tmp" /usr/local/bin/yt-dlp
-  chmod 755 /usr/local/bin/yt-dlp
+  rm -f /usr/local/bin/yt-dlp.new
+  cp "$tmp" /usr/local/bin/yt-dlp.new || return 1
+  chmod 755 /usr/local/bin/yt-dlp.new || return 1
   rm -f "$tmp"
-  if ! /usr/local/bin/yt-dlp --version >/dev/null 2>&1; then
+  if ! /usr/local/bin/yt-dlp.new --version >/dev/null 2>&1; then
+    rm -f /usr/local/bin/yt-dlp.new
     return 1
   fi
+  mv /usr/local/bin/yt-dlp.new /usr/local/bin/yt-dlp
   return 0
 }
 
@@ -1221,13 +1297,18 @@ install_ytdlp_zipapp() {
     rm -f "$tmp"
     return 1
   fi
-  cp "$tmp" /usr/local/bin/yt-dlp
-  chmod 755 /usr/local/bin/yt-dlp
+  rm -f /usr/local/bin/yt-dlp.new
+  cp "$tmp" /usr/local/bin/yt-dlp.new || return 1
+  chmod 755 /usr/local/bin/yt-dlp.new || return 1
   rm -f "$tmp"
   sync
   drop_page_cache
-  ver=$(/usr/local/bin/yt-dlp --version 2>/dev/null | head -n 1) || return 1
-  [ -n "$ver" ] || return 1
+  ver=$(/usr/local/bin/yt-dlp.new --version 2>/dev/null | head -n 1) || {
+    rm -f /usr/local/bin/yt-dlp.new
+    return 1
+  }
+  [ -n "$ver" ] || { rm -f /usr/local/bin/yt-dlp.new; return 1; }
+  mv /usr/local/bin/yt-dlp.new /usr/local/bin/yt-dlp
   say_ok "yt-dlp 已装上（$ver）"
   return 0
 }
@@ -1238,6 +1319,10 @@ install_ytdlp() {
   if low_mem; then
     say_info "内存大约 ${MEM_MB}MB，改用小的 yt-dlp（要有 Python）"
     if install_ytdlp_zipapp; then
+      return 0
+    fi
+    if ytdlp_runs; then
+      say_warn "新的 yt-dlp 没换上，继续用现在的"
       return 0
     fi
     die "小的 yt-dlp 没跑起来。内存大约 ${MEM_MB}MB，不能再试那个会撑死小鸡的大程序。"
@@ -1257,6 +1342,10 @@ install_ytdlp() {
       return 0
     fi
   fi
+  if ytdlp_runs; then
+    say_warn "新的 yt-dlp 没换上，继续用现在的"
+    return 0
+  fi
   die "yt-dlp 跑不起来。架构 $ARCH，系统库 $LIBC，内存大约 ${MEM_MB:-未知}MB。"
 }
 
@@ -1275,11 +1364,53 @@ install_webui() {
   fi
   if ! is_elf "$tmp"; then
     rm -f "$tmp"
+    if [ -x /usr/local/bin/yt-dlp-webui ] && is_elf /usr/local/bin/yt-dlp-webui; then
+      say_warn "新的网页程序没下下来，继续用现在的"
+      return 0
+    fi
     die "网页程序下载失败。请检查这台鸡能不能打开 GitHub。"
   fi
   place_elf "$tmp" /usr/local/bin/yt-dlp-webui
   rm -f "$tmp"
   say_ok "网页程序已放好（$tag）"
+}
+
+# 官方程序里的面板是英文，而且没登录时会直接弹出报错页。
+# 这里换成我们改过的面板：默认中文，右上角可以换语言，没登录先去登录页。
+install_panel() {
+  UI_DIR=/usr/local/share/yt-dlp-webui
+  say_step "安装中文面板"
+  tmp=$WORK/ui.tar.gz
+  dest=$WORK/ui-new
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  rm -f "$tmp"
+  if [ -n "${YTD_UI_FILE:-}" ] && [ -s "$YTD_UI_FILE" ]; then
+    cp "$YTD_UI_FILE" "$tmp" || true
+  fi
+  if [ ! -s "$tmp" ]; then
+    fetch_first "$tmp" \
+      "https://github.com/imthnio/vps-ytdlp/releases/download/v${VERSION}/ui.tar.gz" \
+      "https://raw.githubusercontent.com/imthnio/vps-ytdlp/main/ui.tar.gz" \
+      "https://cdn.jsdelivr.net/gh/imthnio/vps-ytdlp@main/ui.tar.gz" || true
+  fi
+  if [ -s "$tmp" ] && tar -xzf "$tmp" -C "$dest" && [ -f "$dest/index.html" ] && [ -d "$dest/assets" ]; then
+    rm -rf "$UI_DIR.new"
+    mkdir -p "$UI_DIR.new"
+    cp -R "$dest/index.html" "$dest/assets" "$UI_DIR.new/"
+    rm -rf "$UI_DIR"
+    mv "$UI_DIR.new" "$UI_DIR"
+    say_ok "中文面板已放好。默认是中文，右上角可以换语言。"
+    return 0
+  fi
+  rm -rf "$dest" "$UI_DIR.new"
+  if [ -f "$UI_DIR/index.html" ]; then
+    say_warn "新的中文面板没下下来，继续用现在这块面板。"
+    return 0
+  fi
+  UI_DIR=
+  say_warn "中文面板没装上，先用程序自带的英文面板。"
+  return 0
 }
 
 write_one_wrapper() {
@@ -1752,7 +1883,7 @@ uninstall_all() {
   rm -f /usr/local/bin/yt-dlp /usr/local/bin/yt-dlp-one /usr/local/bin/qjs \
     /usr/local/bin/yt-dlp-webui /usr/local/sbin/yt-dlp-webui-run /usr/local/sbin/ytdlp-web \
     /usr/bin/ytdlp-web /etc/sysctl.d/99-yt-dlp-webui-overcommit.conf
-  rm -rf /etc/yt-dlp-webui
+  rm -rf /etc/yt-dlp-webui /usr/local/share/yt-dlp-webui
   say_ok "程序已卸掉。下载过的视频还在 ${DATA}/downloads ，没有删。"
 }
 
@@ -2025,8 +2156,38 @@ print_how_to_open() {
   if [ "$QUEUE_CHOSEN" = 1 ]; then
     printf '%s\n' "按你的选择，视频会一个接一个下载。"
   fi
-  printf '%s\n' "以后要改端口、密码或文件夹，再运行一次安装命令，或者输入 ytdlp-web 。每题直接回车就沿用现在的。"
+  printf '%s\n' "面板默认是中文。打开后先登录，右上角可以换成别的语言。"
+  printf '%s\n' "以后再运行一次安装命令，或者输入 ytdlp-web ，直接回车就是更新到最新版本。想改端口或密码就选第 2 项。"
   printf '%s\n' "查看：ytdlp-web --status    换密码：ytdlp-web --reset-password    卸载：ytdlp-web --uninstall"
+}
+
+print_updated() {
+  port=$1
+  user=$2
+  pass=$3
+  dir=$4
+  collect_addrs
+  printf '\n%s\n' "${C_GREEN}更新好了。${C_NC}"
+  printf '%s\n' "程序已经换成最新版本。端口、密码和视频文件夹都没改。"
+  printf '%s\n' "用户名：${user}"
+  if [ -n "$pass" ]; then
+    printf '%s\n' "密码：${pass}"
+  else
+    printf '%s\n' "密码还是原来的那把。忘记了可以输入：ytdlp-web --reset-password"
+  fi
+  printf '%s\n' "密码也记在 /etc/yt-dlp-webui/install.txt ，忘记了可以输入：ytdlp-web --status"
+  if [ -n "$ADDR_V4" ]; then
+    printf '\n%s\n' "在 Mac 浏览器打开："
+    printf '%s\n' "http://${ADDR_V4}:${port}"
+  elif [ -n "$ADDR_V4_PRIVATE" ]; then
+    printf '\n%s\n' "这台小鸡的地址是 ${ADDR_V4_PRIVATE}，外面不能直接打开。"
+    printf '%s\n' "请用公网地址加端口 ${port}，或者在 Mac 终端执行："
+    printf '%s\n' "ssh -L ${port}:127.0.0.1:${port} root@你的鸡"
+    printf '%s\n' "然后浏览器打开 http://127.0.0.1:${port}"
+  fi
+  printf '\n%s\n' "视频还是下到 ${dir} 。"
+  printf '%s\n' "面板默认是中文。右上角可以换成别的语言。打开后如果还没登录，会先进入登录页。"
+  printf '%s\n' "想改端口、密码或文件夹，再运行一次，选第 2 项。"
 }
 
 do_install() {
@@ -2039,13 +2200,32 @@ do_install() {
   webui_asset "$ARCH" >/dev/null || die "这个网页程序没有 $ARCH 的版本，32 位系统装不了。"
   ytdlp_asset "$ARCH" "$LIBC" >/dev/null || die "没有适合 $ARCH / $LIBC 的 yt-dlp。"
 
-  while true; do
-    ask_settings "$reset_pass"
-    show_plan
-    ask_menu PLAN_OK 1 2
-    [ "$PLAN_OK" = 1 ] && break
-    printf '%s\n' "好，我们再答一遍。"
-  done
+  UPDATE_MODE=0
+  if [ "$reset_pass" != 1 ] && install_ready; then
+    say_step "这台鸡已经装过了"
+    printf '%s\n' "再运行一次，就是把程序更新到最新版本。"
+    printf '%s\n' "端口、登录密码和视频文件夹都保持不变。"
+    printf '%s\n' "  1) 更新到最新版本（推荐）"
+    printf '%s\n' "  2) 我想改端口、密码或文件夹"
+    ask_menu UPDATE_CHOICE 1 2
+    if [ "$UPDATE_CHOICE" = 1 ]; then
+      if load_saved_choices; then
+        UPDATE_MODE=1
+        say_ok "按原来的设置更新。端口 ${PORT_CHOSEN}，视频文件夹 ${DIR_CHOSEN}"
+      else
+        say_warn "原来的设置读不全，请再答一遍。"
+      fi
+    fi
+  fi
+  if [ "$UPDATE_MODE" != 1 ]; then
+    while true; do
+      ask_settings "$reset_pass"
+      show_plan
+      ask_menu PLAN_OK 1 2
+      [ "$PLAN_OK" = 1 ] && break
+      printf '%s\n' "好，我们再答一遍。"
+    done
+  fi
 
   say_step "准备内存和软件源"
   prepare_workdir
@@ -2062,6 +2242,7 @@ do_install() {
   install_ytdlp
   stop_service
   install_webui
+  install_panel
 
   mkdir -p "$DATA/downloads" "$DATA/tmp" "$DATA/cache" "$DATA/home" "$DIR_CHOSEN" /etc/yt-dlp-webui /usr/local/sbin
   DL=$(downloader_for_choice "$QUEUE_CHOSEN")
@@ -2078,7 +2259,11 @@ do_install() {
     pass=$PASS_CHOSEN
     hash=$(config_get password_hash 2>/dev/null || true)
     [ -n "$hash" ] || die "原来的密码记录坏了。请重新运行，并选择换一把新密码。"
-    say_ok "沿用原来的登录密码"
+    if [ -n "$pass" ]; then
+      say_ok "沿用原来的登录密码"
+    else
+      say_warn "原来的密码原文没找到。登录密码没变。忘记了可以运行 ytdlp-web --reset-password"
+    fi
   elif [ "$PASS_MODE" = custom ]; then
     pass=$PASS_CHOSEN
     hash=$(hash_password "$user" "$pass") || die "登录密码没能生成。没有登录不能把网页暴露出去。"
@@ -2098,15 +2283,19 @@ do_install() {
 
   port=$PORT_CHOSEN
   q=$QUEUE_CHOSEN
-  write_config /etc/yt-dlp-webui/config.yml "$port" "$user" "$hash" "$DL" "$JS_RUNTIME" "$q" "$DATA" "$DIR_CHOSEN"
+  write_config /etc/yt-dlp-webui/config.yml "$port" "$user" "$hash" "$DL" "$JS_RUNTIME" "$q" "$DATA" "$DIR_CHOSEN" "${UI_DIR:-}"
   chmod 600 /etc/yt-dlp-webui/config.yml
-  write_install_note "$user" "$pass" "$port"
+  if [ -n "$pass" ]; then
+    write_install_note "$user" "$pass" "$port"
+  fi
   write_service
   install_cli
   if [ "$OPEN_CHOSEN" = 1 ]; then
     open_firewall "$port"
-  else
+  elif [ "$OPEN_CHOSEN" = 2 ]; then
     say_info "按你的选择，没有把端口放开到公网。"
+  else
+    say_info "端口放开方式保持原来的。"
   fi
 
   say_step "启动"
@@ -2122,12 +2311,16 @@ do_install() {
   fi
   say_ok "网页已在端口 ${port} 运行"
   rm -rf "$WORK"
-  print_how_to_open "$port" "$user" "$pass" "$OPEN_CHOSEN" "$DIR_CHOSEN"
+  if [ "$UPDATE_MODE" = 1 ]; then
+    print_updated "$port" "$user" "$pass" "$DIR_CHOSEN"
+  else
+    print_how_to_open "$port" "$user" "$pass" "$OPEN_CHOSEN" "$DIR_CHOSEN"
+  fi
 }
 
 usage() {
   printf '%s\n' "用法："
-  printf '%s\n' "  ytdlp-web                 安装或更新（会用大白话问几个问题，直接回车就是推荐项）"
+  printf '%s\n' "  ytdlp-web                 第一次安装会问几个问题。已经装过再运行，直接回车就是更新到最新版本"
   printf '%s\n' "  ytdlp-web --status        查看"
   printf '%s\n' "  ytdlp-web --reset-password  换一把登录密码"
   printf '%s\n' "  ytdlp-web --uninstall     卸掉程序，留下已经下好的视频"
