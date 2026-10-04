@@ -32,7 +32,7 @@
 #   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=2.0.1
+VERSION=2.1.0
 # ytdlp-onekey-begin
 
 #----------------------------------------------------------------------
@@ -68,6 +68,8 @@ NOTE_FILE=$CONF_DIR/install.txt
 LIB_DIR=/usr/local/lib/ytdlp-web
 SERVER_FILE=${YTD_SERVER_FILE:-$LIB_DIR/server.pl}
 POT_PLUGIN_DIR=$LIB_DIR/pot-plugins
+# 我们自己的 yt-dlp 小插件（小红书、B站、抖音、推特图片）放这里
+PLUGIN_DIR=$LIB_DIR/plugins
 WARP_DIR=$CONF_DIR/warp
 RUNNER=/usr/local/sbin/ytdlp-web-run
 CLI_FILE=/usr/local/sbin/ytdlp-web
@@ -522,6 +524,7 @@ write_config() {
     printf 'open_mode=%s\n' "${4:-1}"
     printf 'warp=%s\n' "${5:-0}"
     printf 'cookies=%s\n' "$CONF_DIR/cookies.txt"
+    printf 'plugins=%s\n' "$PLUGIN_DIR"
     printf 'keep_hours=%s\n' 6
     printf 'grace=%s\n' 120
     printf 'log=%s\n' "$LOG_FILE"
@@ -1792,6 +1795,315 @@ install_warp() {
 # 网页服务本身（server.pl）。整份程序就写在这个脚本里，装的时候原样放出去。
 # 这样脚本和网页永远是同一个版本，不会一个新一个旧。
 #----------------------------------------------------------------------
+#----------------------------------------------------------------------
+# 我们自己的 yt-dlp 小插件。yt-dlp 自己搞不定的平台（小红书、B站、抖音、推特图片）
+# 由它换一种不用登录的办法拿地址。网页服务把网址写成 ytweb:平台:原链接 交给它。
+#----------------------------------------------------------------------
+write_plugin() {
+  d=$PLUGIN_DIR/ytdlp-web/yt_dlp_plugins/extractor
+  mkdir -p "$d"
+  cat > "$d/ytdlp_web.py.new" <<'YTDLP_WEB_PLUGIN_EOF'
+# ytdlp-web 自带的小插件：yt-dlp 自己搞不定的几个平台，由这里换一种不用登录的办法拿视频/图片地址。
+#   ytweb:xhs:<链接>     小红书：用手机浏览器的身份打开分享页，从页面里的数据拿视频（优先 h264）或图片
+#   ytweb:bili:<链接>    B站：手机版页面 + html5 播放接口，拿 Mac 能直接播的 mp4（不登录最高 720p）
+#   ytweb:douyin:<链接>  抖音：分享页里的数据，拿无水印视频或图片；拿不到就报 YTWEB_NEED_COOKIES
+#   ytweb:ximg:<链接>    推特/X：纯图片推文，从公开的 fxtwitter/vxtwitter 接口拿原图
+# 报错里的 YTWEB_xxx 暗号由网页程序翻译成中文。
+import json
+import re
+import time
+import urllib.parse
+
+from yt_dlp.extractor.common import InfoExtractor
+from yt_dlp.utils import ExtractorError
+
+MOBILE_UA = ('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 '
+             '(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1')
+
+
+def _fail(code, msg=''):
+    raise ExtractorError(f'{code} {msg}'.strip(), expected=True)
+
+
+def _json_after(html, marker):
+    i = html.find(marker)
+    if i < 0:
+        return None
+    i = html.find('{', i)
+    if i < 0:
+        return None
+    depth, instr, esc = 0, False, False
+    for j in range(i, len(html)):
+        ch = html[j]
+        if instr:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                instr = False
+            continue
+        if ch == '"':
+            instr = True
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                raw = html[i:j + 1]
+                raw = re.sub(r'(?<=[:\[,])\s*undefined\b', 'null', raw)
+                try:
+                    return json.loads(raw)
+                except ValueError:
+                    return None
+    return None
+
+
+def _walk(o, key):
+    """在一大坨数据里找第一个名叫 key 的东西。"""
+    stack = [o]
+    while stack:
+        x = stack.pop(0)
+        if isinstance(x, dict):
+            if key in x and x[key]:
+                return x[key]
+            stack.extend(v for v in x.values() if isinstance(v, (dict, list)))
+        elif isinstance(x, list):
+            stack.extend(v for v in x if isinstance(v, (dict, list)))
+    return None
+
+
+class YtdlpWebIE(InfoExtractor):
+    IE_NAME = 'ytweb'
+    _VALID_URL = r'ytweb:(?P<plat>xhs|bili|douyin|ximg):(?P<url>.+)'
+    _TESTS = []
+
+    def _real_extract(self, url):
+        plat, link = self._match_valid_url(url).group('plat', 'url')
+        return getattr(self, '_' + plat)(link)
+
+    def _get(self, url, vid, headers=None, note=None, fatal=True):
+        h = {'User-Agent': MOBILE_UA}
+        h.update(headers or {})
+        return self._download_webpage_handle(url, vid, note=note or '打开页面', headers=h, fatal=fatal)
+
+    def _images(self, vid, title, urls, headers=None):
+        urls = [u for u in urls if u]
+        if not urls:
+            _fail('YTWEB_NO_MEDIA')
+        entries = []
+        for n, u in enumerate(urls, 1):
+            ext = 'png' if '.png' in u.split('?')[0] else 'webp' if 'format=webp' in u or '.webp' in u.split('?')[0] else 'jpg'
+            entries.append({
+                'id': f'{vid}_{n}', 'title': title, 'ext': ext,
+                'formats': [{'url': u, 'ext': ext, 'format_id': 'image', 'http_headers': headers or {}}],
+            })
+        if len(entries) == 1:
+            return entries[0]
+        return {'_type': 'playlist', 'id': vid, 'title': title, 'entries': entries}
+
+    # ---------------- 小红书 ----------------
+    def _xhs(self, link):
+        page, h = self._get(link, 'xhs', note='打开小红书分享页')
+        final = h.url
+        if re.search(r'/login|/website-login|captcha|/404', final):
+            _fail('YTWEB_NEED_COOKIES', 'xhs login page')
+        nid = self._search_regex(r'/(?:explore|discovery/item|item)/([0-9a-f]{24})', final, 'note id', default='xhs')
+        st = _json_after(page, '__INITIAL_STATE__')
+        note = None
+        if st:
+            nd = st.get('noteData') or {}
+            note = (nd.get('data') or {}).get('noteData')
+            if not note:
+                m = (st.get('note') or {}).get('noteDetailMap') or {}
+                for v in m.values():
+                    if isinstance(v, dict) and v.get('note'):
+                        note = v['note']
+                        break
+        if not note or not (note.get('type') or note.get('imageList') or note.get('video')):
+            if '你访问的页面不见了' in page or '笔记不存在' in page or 'Sorry, This Page Isn' in page:
+                _fail('YTWEB_GONE')
+            _fail('YTWEB_NEED_COOKIES', 'xhs no note data')
+        title = (note.get('title') or note.get('desc') or '小红书笔记').strip()[:80] or '小红书笔记'
+        hdr = {'Referer': 'https://www.xiaohongshu.com/', 'User-Agent': MOBILE_UA}
+        if note.get('type') == 'video' and note.get('video'):
+            stream = ((note['video'].get('media') or {}).get('stream')) or {}
+            fmts = []
+            for codec, vc in (('h264', 'avc1'), ('h265', 'hvc1'), ('h266', 'vvc1'), ('av1', 'av01')):
+                for s in stream.get(codec) or []:
+                    u = s.get('masterUrl') or (s.get('backupUrls') or [None])[0]
+                    if not u:
+                        continue
+                    fmts.append({
+                        'url': u.replace('http://', 'https://', 1), 'ext': 'mp4', 'format_id': f'{codec}-{s.get("height") or 0}',
+                        'vcodec': vc, 'acodec': 'mp4a', 'width': s.get('width'), 'height': s.get('height'),
+                        'tbr': (s.get('avgBitrate') or 0) / 1000 or None, 'filesize': s.get('size'), 'http_headers': hdr,
+                    })
+            if not fmts:
+                key = (note['video'].get('consumer') or {}).get('originVideoKey')
+                if key:
+                    fmts.append({'url': f'https://sns-video-bd.xhscdn.com/{key}', 'ext': 'mp4', 'format_id': 'origin', 'http_headers': hdr})
+            if not fmts:
+                _fail('YTWEB_NEED_COOKIES', 'xhs no video url')
+            dur = (note['video'].get('capa') or {}).get('duration')
+            return {'id': nid, 'title': title, 'formats': fmts, 'duration': dur}
+        urls = []
+        for im in note.get('imageList') or []:
+            u = im.get('urlDefault') or im.get('url') or ''
+            infos = im.get('infoList') or []
+            if not u and infos:
+                u = infos[-1].get('url') or ''
+            urls.append(u.replace('http://', 'https://', 1))
+        if not any(urls):
+            _fail('YTWEB_NO_MEDIA')
+        return self._images(nid, title, urls, hdr)
+
+    # ---------------- B站 ----------------
+    def _bili(self, link):
+        if re.search(r'b23\.tv|bili2233\.cn', link):
+            _, h = self._get(link, 'b23', note='展开 B 站短链接')
+            link = h.url
+        m = re.search(r'(BV[0-9A-Za-z]{10})', link)
+        if not m:
+            _fail('YTWEB_BAD_LINK')
+        bv = m.group(1)
+        p = int(self._search_regex(r'[?&]p=(\d+)', link, 'page', default='1'))
+        # 先拿匿名访客 cookie（buvid3/buvid4），B 站风控会看这个。
+        self._get('https://m.bilibili.com/', bv, note='拿 B 站访客 cookie', fatal=False)
+        spi = self._download_json('https://api.bilibili.com/x/frontend/finger/spi', bv, note='拿 buvid4', fatal=False,
+                                  headers={'User-Agent': MOBILE_UA, 'Referer': 'https://m.bilibili.com/'}) or {}
+        d = spi.get('data') or {}
+        if d.get('b_3'):
+            self._set_cookie('.bilibili.com', 'buvid3', d['b_3'])
+        if d.get('b_4'):
+            self._set_cookie('.bilibili.com', 'buvid4', d['b_4'])
+        page, _ = self._get(f'https://m.bilibili.com/video/{bv}', bv, note='打开 B 站手机版页面',
+                            headers={'Referer': 'https://m.bilibili.com/'})
+        st = _json_after(page, '__INITIAL_STATE__') or {}
+        info = (st.get('video') or {}).get('viewInfo') or {}
+        if not info:
+            if '视频去哪了' in page or '啊叻？视频不见了' in page:
+                _fail('YTWEB_GONE')
+            _fail('YTWEB_NEED_COOKIES', 'bili no viewInfo')
+        pages = info.get('pages') or []
+        cid = info.get('cid')
+        title = info.get('title') or bv
+        dur = info.get('duration')
+        if pages and 1 <= p <= len(pages):
+            cid = pages[p - 1].get('cid') or cid
+            dur = pages[p - 1].get('duration') or dur
+            if len(pages) > 1:
+                title = f'{title} P{p} {pages[p - 1].get("part") or ""}'.strip()
+        hdr = {'Referer': 'https://m.bilibili.com/', 'User-Agent': MOBILE_UA}
+        fmts = []
+        for qn in (80, 64):
+            api = (f'https://api.bilibili.com/x/player/playurl?bvid={bv}&cid={cid}&qn={qn}'
+                   '&platform=html5&high_quality=1&fnval=1&fnver=0&fourk=0')
+            j = self._download_json(api, bv, note=f'问 B 站要播放地址（{qn}）', headers=hdr, fatal=False) or {}
+            data = j.get('data') or {}
+            for n, du in enumerate(data.get('durl') or []):
+                if n > 0:
+                    break
+                q = data.get('quality') or qn
+                if any(f['format_id'] == f'mp4-{q}' for f in fmts):
+                    continue
+                height = {16: 360, 32: 480, 64: 720, 80: 1080, 112: 1080, 116: 1080}.get(q)
+                fmts.append({'url': du.get('url'), 'ext': 'mp4', 'format_id': f'mp4-{q}', 'vcodec': 'avc1', 'acodec': 'mp4a',
+                             'height': height, 'filesize': du.get('size'), 'http_headers': hdr})
+            if fmts:
+                break
+        if not fmts:
+            for u in (st.get('video') or {}).get('playUrlInfo') or []:
+                if u.get('url'):
+                    fmts.append({'url': u['url'], 'ext': 'mp4', 'format_id': 'mp4-page', 'vcodec': 'avc1', 'acodec': 'mp4a',
+                                 'height': 360, 'http_headers': hdr})
+        if not fmts:
+            _fail('YTWEB_NEED_COOKIES', 'bili no playurl')
+        return {'id': bv, 'title': title, 'formats': fmts, 'duration': dur}
+
+    # ---------------- 抖音 ----------------
+    def _douyin(self, link):
+        aid = self._search_regex(r'(?:/video/|/note/|/slides/|modal_id=|aweme_id=)(\d{15,21})', link, 'id', default=None)
+        if not aid:
+            _, h = self._get(link, 'douyin', note='展开抖音短链接')
+            aid = self._search_regex(r'(?:/video/|/note/|/slides/|modal_id=|aweme_id=)(\d{15,21})', h.url, 'id', default=None)
+        if not aid:
+            _fail('YTWEB_BAD_LINK')
+        item = None
+        # 分享页偶尔会少给数据，多试几次（每次间隔 1 秒）。
+        for kind in ('video', 'note', 'video', 'note'):
+            if item:
+                break
+            got = self._get(f'https://www.iesdouyin.com/share/{kind}/{aid}/', aid, note='打开抖音分享页', fatal=False)
+            page = got[0] if got else None
+            if not page:
+                time.sleep(1)
+                continue
+            rd = _json_after(page, '_ROUTER_DATA') or {}
+            res = _walk(rd, 'videoInfoRes') or {}
+            lst = res.get('item_list') if isinstance(res, dict) else None
+            if lst:
+                item = lst[0]
+                break
+            if isinstance(res, dict) and res.get('filter_list'):
+                _fail('YTWEB_GONE')
+            time.sleep(1)
+        if not item:
+            _fail('YTWEB_NEED_COOKIES', 'douyin share page has no data')
+        title = (item.get('desc') or '抖音').strip()[:80] or '抖音'
+        hdr = {'User-Agent': MOBILE_UA, 'Referer': 'https://www.douyin.com/'}
+        imgs = item.get('images') or []
+        if imgs:
+            return self._images(aid, title, [(i.get('url_list') or [''])[-1] for i in imgs], hdr)
+        v = item.get('video') or {}
+        urls = (v.get('play_addr') or {}).get('url_list') or []
+        if not urls:
+            _fail('YTWEB_NO_MEDIA')
+        u = re.sub(r'ratio=\w+', 'ratio=1080p', urls[0].replace('playwm', 'play'))  # 去水印，并要最高的 1080p（没有就自动给低一档）
+        return {'id': aid, 'title': title, 'duration': (v.get('duration') or 0) / 1000 or None,
+                'formats': [{'url': u, 'ext': 'mp4', 'format_id': 'nowm', 'vcodec': 'avc1', 'acodec': 'mp4a',
+                             'height': v.get('height'), 'width': v.get('width'), 'http_headers': hdr}]}
+
+    # ---------------- 推特/X 图片 ----------------
+    def _ximg(self, link):
+        tid = self._search_regex(r'/status(?:es)?/(\d+)', link, 'tweet id', default=None)
+        if not tid:
+            _fail('YTWEB_BAD_LINK')
+        tw = None
+        j = self._download_json(f'https://api.fxtwitter.com/status/{tid}', tid, note='问 fxtwitter 要图片', fatal=False) or {}
+        if j.get('tweet'):
+            t = j['tweet']
+            media = t.get('media') or {}
+            tw = {'text': t.get('text') or '', 'author': (t.get('author') or {}).get('name') or '',
+                  'photos': [p.get('url') for p in media.get('photos') or []],
+                  'videos': [v.get('url') for v in media.get('videos') or []]}
+        elif j.get('code') == 404:
+            _fail('YTWEB_GONE')
+        if tw is None:
+            j = self._download_json(f'https://api.vxtwitter.com/Twitter/status/{tid}', tid, note='问 vxtwitter 要图片', fatal=False) or {}
+            if j.get('tweetID') or j.get('text') is not None:
+                ms = j.get('media_extended') or []
+                tw = {'text': j.get('text') or '', 'author': j.get('user_name') or '',
+                      'photos': [m.get('url') for m in ms if m.get('type') == 'image'],
+                      'videos': [m.get('url') for m in ms if m.get('type') in ('video', 'gif')]}
+        if tw is None:
+            _fail('YTWEB_NEED_COOKIES', 'x api unavailable')
+        title = (f'{tw["author"]} - ' if tw['author'] else '') + (re.sub(r'https?://\S+', '', tw['text']).strip()[:60] or tid)
+        if tw['photos']:
+            urls = []
+            for u in tw['photos']:
+                if 'pbs.twimg.com/media/' in u and 'name=' not in u:
+                    u = u + ('&' if '?' in u else '?') + 'name=orig'
+                urls.append(u)
+            return self._images(tid, title, urls)
+        if tw['videos']:
+            return {'id': tid, 'title': title, 'formats': [{'url': tw['videos'][0], 'ext': 'mp4', 'format_id': 'mp4'}]}
+        _fail('YTWEB_NO_MEDIA')
+YTDLP_WEB_PLUGIN_EOF
+  mv "$d/ytdlp_web.py.new" "$d/ytdlp_web.py"
+  chmod 644 "$d/ytdlp_web.py"
+}
+
 write_server() {
   mkdir -p "$LIB_DIR"
   cat > "$LIB_DIR/server.pl.new" <<'YTDLP_WEB_SERVER_EOF'
@@ -1800,8 +2112,9 @@ write_server() {
 # ytdlp-web 网页服务
 #----------------------------------------------------------------------
 # 这是 install.sh 装到 VPS 上的小网页。Mac 浏览器打开的就是它。
-# 你贴一个链接，它让 yt-dlp 把视频下到 VPS，下完马上让浏览器存到 Mac，
-# 传完以后自动把 VPS 上的文件删掉。只用 Perl 自带的模块，64MB 小鸡也跑得动。
+# 你贴一个链接（或者 App 里「分享 → 复制链接」的整段文字），它让 yt-dlp 把视频下到 VPS，
+# 下完马上让浏览器存到 Mac，传完以后自动把 VPS 上的文件删掉。只用 Perl 自带的模块，64MB 小鸡也跑得动。
+# 支持 YouTube、抖音、小红书、B站、TikTok、推特/X、Instagram（以及 yt-dlp 认得的其他网站）。
 #
 # 名词小词典
 #   网页服务  一直在 VPS 上跑的这个程序，听一个端口，浏览器连进来
@@ -1814,6 +2127,15 @@ write_server() {
 #   断点续传  网断了，浏览器从断的地方接着下，不用从头来（HTTP 的 Range）
 #   会话      登录成功后浏览器拿到的通行证（一个 cookie），30 天有效
 #   送达      文件的每一个字节都已经发给了浏览器
+#   平台      链接是哪个网站的：youtube douyin xhs(小红书) bili(B站) tiktok x(推特) ig(Instagram) other
+#   分享文字  App 里「复制链接」得到的一整段话，里面夹着一个网址。我们自动把网址挑出来
+#   短链接    v.douyin.com、xhslink.cn、b23.tv 这种，打开后会跳到真正的地址
+#   插件      ytdlp_web.py，装在 plugins 文件夹。yt-dlp 自己搞不定的平台由它换办法拿地址，
+#             网址写成 ytweb:平台:原链接 就会交给它
+#   图文      只有图片没有视频的帖子。一张直接存，多张打成一个 zip
+#   H.264     Mac 自带播放器（QuickTime）能放的视频格式。VP9/AV1 放不了，要转码
+#   转码      把视频重新编码成 H.264。1 核小鸡很慢，大概和视频一样长甚至更久
+#   IPv4/IPv6 两种网络地址。同一个网站，换一种地址去连，有时就不被拦了
 #======================================================================
 use strict;
 use warnings;
@@ -1823,7 +2145,7 @@ use POSIX qw(:sys_wait_h setsid strftime setlocale LC_ALL);
 use Fcntl qw(:flock O_WRONLY O_CREAT O_APPEND);
 use File::Path qw(make_path remove_tree);
 
-my $VERSION = '2.0.0';
+my $VERSION = '2.1.0';
 setlocale(LC_ALL, 'C');
 $SIG{PIPE} = 'IGNORE';
 
@@ -1844,6 +2166,7 @@ my %C = (
   warp_port   => 40000,
   pot         => '',
   pot_plugins => '',
+  plugins     => '',     # 我们自己的 yt-dlp 插件目录（小红书、B站、抖音、推特图片）
   cookies     => '/etc/ytdlp-web/cookies.txt',
   min_free_mb => 300,
   update_hours => 24,
@@ -2232,6 +2555,93 @@ my %QUALITY = (
   mp3  => '只要声音（mp3）',
 );
 
+#----------------------------------------------------------------------
+# 认平台。re 认链接里的网站，ck 认 cookies 文件里的网站，open 是导出 cookies 时要打开的网址。
+#----------------------------------------------------------------------
+my @PLATFORMS = (
+  { key => 'youtube', name => 'YouTube',   re => qr/(?:^|\.)(?:youtube\.com|youtu\.be|youtube-nocookie\.com)$/i, ck => qr/(?:^|\.)youtube\.com$/i,
+    open => 'https://www.youtube.com/robots.txt' },
+  { key => 'douyin',  name => '抖音',      re => qr/(?:^|\.)(?:douyin\.com|iesdouyin\.com)$/i, ck => qr/(?:^|\.)(?:douyin\.com|iesdouyin\.com)$/i,
+    open => 'https://www.douyin.com/' },
+  { key => 'xhs',     name => '小红书',    re => qr/(?:^|\.)(?:xiaohongshu\.com|xhslink\.com|xhslink\.cn)$/i, ck => qr/(?:^|\.)xiaohongshu\.com$/i,
+    open => 'https://www.xiaohongshu.com/explore' },
+  { key => 'bili',    name => 'B站',       re => qr/(?:^|\.)(?:bilibili\.com|b23\.tv|bili2233\.cn)$/i, ck => qr/(?:^|\.)bilibili\.com$/i,
+    open => 'https://www.bilibili.com/' },
+  { key => 'tiktok',  name => 'TikTok',    re => qr/(?:^|\.)tiktok\.com$/i, ck => qr/(?:^|\.)tiktok\.com$/i,
+    open => 'https://www.tiktok.com/' },
+  { key => 'x',       name => '推特/X',    re => qr/(?:^|\.)(?:x\.com|twitter\.com|fxtwitter\.com|vxtwitter\.com|fixupx\.com)$/i, ck => qr/(?:^|\.)(?:x\.com|twitter\.com)$/i,
+    open => 'https://x.com/' },
+  { key => 'ig',      name => 'Instagram', re => qr/(?:^|\.)(?:instagram\.com|instagr\.am)$/i, ck => qr/(?:^|\.)instagram\.com$/i,
+    open => 'https://www.instagram.com/' },
+);
+my %PLAT = map { $_->{key} => $_ } @PLATFORMS;
+
+sub url_host {
+  my ($u) = @_;
+  return '' unless defined $u && $u =~ m{^https?://(?:[^/\@]*\@)?([^/:?#]+)}i;
+  return lc $1;
+}
+
+sub platform_of {
+  my ($u) = @_;
+  my $h = url_host($u);
+  for my $p (@PLATFORMS) { return $p->{key} if $h =~ $p->{re}; }
+  return 'other';
+}
+
+sub plat_name { my ($k) = @_; return $PLAT{ $k || '' } ? $PLAT{$k}{name} : '这个网站'; }
+
+# cookies 文件里一行的网站属于哪个平台。
+sub cookie_plat {
+  my ($domain) = @_;
+  $domain = lc($domain || '');
+  $domain =~ s/^#httponly_//;
+  $domain =~ s/^\.//;
+  for my $p (@PLATFORMS) { return $p->{key} if $domain =~ $p->{ck}; }
+  return '';
+}
+
+#----------------------------------------------------------------------
+# 从一段话里挑出网址。App 的分享文字像这样：
+#   6.99 复制打开抖音，看看【某某的作品】…… https://v.douyin.com/qZn98J7Dp00/ 8@5.com :2pm
+#   一口气带你认识…… http://xhslink.cn/o/AahIzgf95oX 复制后打开【小红书】查看笔记！
+# 规则：找第一个 http(s):// 开头的网址；没有的话，找认识的网站名（比如 youtu.be/xxx）补上 https://。
+# 网址到空格、中文、引号为止，末尾的标点去掉。
+#----------------------------------------------------------------------
+my $KNOWN_HOSTS = qr/(?:youtube\.com|youtu\.be|douyin\.com|iesdouyin\.com|xhslink\.com|xhslink\.cn|xiaohongshu\.com|b23\.tv|bilibili\.com|tiktok\.com|x\.com|twitter\.com|instagram\.com)/i;
+sub extract_link {
+  my ($t) = @_;
+  $t = '' unless defined $t;
+  my $u;
+  if ($t =~ m{(https?://[^\s<>"'`\x80-\xff]+)}i) {
+    $u = $1;
+  } elsif ($t =~ m{(?<![A-Za-z0-9.\-])((?:[A-Za-z0-9\-]+\.)*$KNOWN_HOSTS/[^\s<>"'`\x80-\xff]*)}) {
+    $u = "https://$1";
+  } else {
+    return '';
+  }
+  $u =~ s/[.,;:!?)\]}>]+$//;
+  return $u;
+}
+
+# 去掉没用的追踪参数，把链接整理成平台认的样子。
+sub clean_link {
+  my ($u) = @_;
+  my $plat = platform_of($u);
+  # 分享文字里常是 http://，有些机房不让连 80 端口，统一改成 https://。
+  $u =~ s{^http://}{https://}i if $plat ne 'other';
+  if ($plat eq 'bili' && $u =~ m{bilibili\.com/(?:s/)?video/(BV[0-9A-Za-z]{10}|av\d+)}i) {
+    my $id = $1;
+    my ($pn) = $u =~ /[?&]p=(\d+)/;
+    return "https://www.bilibili.com/video/$id/" . ($pn && $pn > 1 ? "?p=$pn" : '');
+  }
+  if ($plat eq 'x' || $plat eq 'ig' || $plat eq 'tiktok') {
+    $u =~ s/[?#].*$//;
+    $u =~ s{(/status/\d+)/(?:photo|video)/\d+/?$}{$1} if $plat eq 'x';
+  }
+  return $u;
+}
+
 sub job_dir   { return "$JOBS/$_[0]"; }
 sub valid_id  { return defined $_[0] && $_[0] =~ /^[0-9a-f]{6,40}$/; }
 sub job_meta  { return kv_read(job_dir($_[0]) . '/meta'); }
@@ -2301,13 +2711,17 @@ sub job_view {
   my $size = $st->{size} || 0;
   my $sent = ($state eq 'done' && $size) ? delivered_bytes($id, $size) : 0;
   my $line = $st->{line} || '';
+  my $delivered = ($state eq 'done' && $size && $sent >= $size) ? 1 : 0;
+  # 存到 Mac 以后，网页亮一下 ✅ 就收起来；万一网页没开着，15 秒后也不再显示。
+  my $sent_at = $delivered ? ((stat(job_dir($id) . '/sent'))[9] || 0) : 0;
+  my $hidden = $st->{dismissed} || ($delivered && time - $sent_at > 15) ? 1 : 0;
   if ($state eq 'queued') {
-    $line = '排队中，前面的视频下完就轮到它';
+    $line = '排队中，前面的下完就轮到它';
   } elsif ($state eq 'done') {
-    if (!$path) {
+    if ($delivered) {
+      $line = '✅ 已存到 Mac 的「下载」文件夹';
+    } elsif (!$path) {
       $line = $st->{gone} || '已经传到你的 Mac，服务器上的文件已删除';
-    } elsif ($size && $sent >= $size) {
-      $line = '已经传到你的 Mac。服务器上的文件马上自动删除';
     } elsif ($sent > 0) {
       $line = sprintf('正在传到你的 Mac（%d%%）。看浏览器右上角的下载图标', int($sent * 100 / $size));
     } else {
@@ -2317,7 +2731,10 @@ sub job_view {
   return {
     id      => $id,
     url     => $m->{url},
+    plat    => plat_name($m->{plat} || platform_of($m->{url})),
     quality => $QUALITY{ $m->{q} || 'mac' } || '',
+    note    => $st->{note} || '',
+    hidden  => $hidden,
     q       => $m->{q} || 'mac',
     title   => $st->{title} || '',
     state   => $state,
@@ -2326,7 +2743,7 @@ sub job_view {
     file    => $st->{file} || '',
     size    => human_size($size),
     has_file => bool($path),
-    delivered => bool($size && $sent >= $size),
+    delivered => bool($delivered),
     error   => $st->{error} || '',
     hint    => $st->{hint} || '',
     created => num($m->{created} || 0),
@@ -2340,14 +2757,25 @@ sub check_url {
   my ($u) = @_;
   $u = '' unless defined $u;
   $u =~ s/^\s+|\s+$//g;
-  return (undef, '先把视频链接粘贴到框里。') unless length $u;
-  $u = "https://$u" if $u =~ m{^(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/}i;
-  return (undef, '这不像网址。请从浏览器地址栏或 YouTube 的「分享」里复制完整链接，应该以 https:// 开头。')
-    unless $u =~ m{^https?://[^\s/]+\.[^\s/]+\S*$}i && length($u) < 2000;
+  return (undef, '先把视频链接（或 App 里复制的整段分享文字）粘贴到框里。') unless length $u;
+  my $raw = $u;
+  $u = extract_link($u);
+  return (undef, '这不像网址。请从浏览器地址栏，或 App 的「分享 → 复制链接」里复制，应该带 https:// 开头的网址。')
+    unless length $u && $u =~ m{^https?://[^\s/]+\.[^\s/]+\S*$}i && length($u) < 2000;
   if ($u =~ m{^https?://([^/]*\.)?youtube\.com/(playlist|feed|channel|c/|@)}i && $u !~ /[?&]v=/) {
     return (undef, '这是播放列表或频道的链接。一次只能贴一个视频：点进某个视频，再复制它的链接。');
   }
-  return ($u, '');
+  my $plat = platform_of($u);
+  if ($plat eq 'bili' && $u =~ m{bilibili\.com/(bangumi|cheese)/}i) {
+    return (undef, '这是 B 站番剧/课程的链接，一般要大会员或购买，下不了。普通视频（网址里有 BV 号）可以。');
+  }
+  if ($plat eq 'douyin' && $u =~ m{douyin\.com/(user|search|live)}i) {
+    return (undef, '这是抖音主页/搜索/直播的链接。请点进某一条作品，再「分享 → 复制链接」。');
+  }
+  if ($plat eq 'xhs' && $u =~ m{xiaohongshu\.com/user/profile}i) {
+    return (undef, '这是小红书个人主页的链接。请点进某一篇笔记，再「分享 → 复制链接」。');
+  }
+  return (clean_link($u), '');
 }
 
 sub add_job {
@@ -2366,9 +2794,10 @@ sub add_job {
   });
   my $id = strftime('%Y%m%d%H%M%S', localtime) . sprintf('%05d', $seq) . rand_hex(2);
   make_path(job_dir($id));
-  kv_write(job_dir($id) . '/meta', { url => $url, q => $q, created => time });
+  my $plat = platform_of($url);
+  kv_write(job_dir($id) . '/meta', { url => $url, q => $q, plat => $plat, created => time });
   kv_write(job_dir($id) . '/status', { state => 'queued', updated => time });
-  logline("新任务 $id $url ($q)");
+  logline("新任务 $id [$plat] $url ($q)");
   return ($id, '');
 }
 
@@ -2470,34 +2899,87 @@ sub serve_file {
 #----------------------------------------------------------------------
 # cookies：网页上贴进来的 cookies.txt。先检查格式，再存成只有 root 能读的文件。
 #----------------------------------------------------------------------
+#----------------------------------------------------------------------
+# cookies：所有平台放在同一个 cookies.txt 里（yt-dlp 会自己挑对应网站的那几行）。
+# 你可以分几次上传：这次上传了哪些平台，就只替换这些平台的旧 cookies，别的平台的不动。
+#----------------------------------------------------------------------
+sub cookie_rows {
+  my ($text) = @_;
+  my @rows;
+  for my $l (split /\n/, $text) {
+    next if $l =~ /^#(?!HttpOnly_)/i || $l !~ /\S/;
+    my @f = split /\t/, $l;
+    next unless @f >= 7;
+    push @rows, [cookie_plat($f[0]), $l];
+  }
+  return @rows;
+}
+
+# 现在存着哪些平台的 cookies：{ 平台 => 行数 }
+sub cookie_plats {
+  my $d = slurp($C{cookies});
+  my %n;
+  return \%n unless defined $d;
+  $d =~ s/\r\n?/\n/g;
+  $n{ $_->[0] }++ for grep { $_->[0] ne '' } cookie_rows($d);
+  return \%n;
+}
+
+sub has_cookies { my ($plat) = @_; return cookie_plats()->{ $plat || 'youtube' } ? 1 : 0; }
+
+sub cookies_bad_file { my ($plat) = @_; return ($plat || 'youtube') eq 'youtube' ? "$STATE/cookies-bad" : "$STATE/cookies-bad-$plat"; }
+
+sub write_cookie_rows {
+  my (@rows) = @_;
+  my $f = $C{cookies};
+  unless (@rows) { unlink $f; return 1; }
+  my $text = "# Netscape HTTP Cookie File\n# ytdlp-web 保存的 cookies，可以有好几个平台的\n" . join('', map { "$_->[1]\n" } @rows);
+  my $old = umask 077;
+  my $okw = spit($f, $text);
+  umask $old;
+  return 0 unless $okw;
+  chmod 0600, $f;
+  return 1;
+}
+
 sub save_cookies {
   my ($text) = @_;
   $text = '' unless defined $text;
   $text =~ s/\r\n?/\n/g;
-  $text =~ s/^\x{FEFF}//;
   $text =~ s/^\xEF\xBB\xBF//;
-  return '框里是空的。先选择文件，或者把 cookies.txt 的内容粘贴进来。' unless $text =~ /\S/;
-  return '这是 JSON 格式。请在扩展里选「Netscape」或「cookies.txt」格式再导出一次。' if $text =~ /^\s*[\[{]/;
-  my ($ok, $yt) = (0, 0);
-  for my $l (split /\n/, $text) {
-    next if $l =~ /^#(?!HttpOnly_)/ || $l !~ /\S/;
-    my @f = split /\t/, $l;
-    next unless @f >= 7;
-    $ok++;
-    $yt++ if $f[0] =~ /youtube\.com$/i;
+  return ('框里是空的。先选择文件，或者把 cookies.txt 的内容粘贴进来。') unless $text =~ /\S/;
+  return ('这是 JSON 格式。请在扩展里选「Netscape」或「cookies.txt」格式再导出一次。') if $text =~ /^\s*[\[{]/;
+  my @new = cookie_rows($text);
+  return ('看不懂这个文件。要的是扩展导出的 cookies.txt（每行用 Tab 分隔的那种）。') unless @new;
+  my %got = map { $_->[0] => 1 } grep { $_->[0] ne '' } @new;
+  return ('文件里没有认得出的网站的 cookies。支持：' . join('、', map { $_->{name} } @PLATFORMS)
+    . '。请在那个网站的页面上点扩展导出。') unless %got;
+  my $d = slurp($C{cookies});
+  $d = '' unless defined $d;
+  $d =~ s/\r\n?/\n/g;
+  my @keep = grep { $_->[0] ne '' && !$got{ $_->[0] } } cookie_rows($d);
+  return ('保存失败，服务器上写不了文件。') unless write_cookie_rows(@keep, grep { $_->[0] ne '' } @new);
+  unlink cookies_bad_file($_) for keys %got;
+  my @names = map { $_->{name} } grep { $got{ $_->{key} } } @PLATFORMS;
+  logline('收到新的 cookies：' . join(' ', sort keys %got));
+  return ('', \@names);
+}
+
+# 删掉某个平台的 cookies；不说平台就全删。
+sub delete_cookies {
+  my ($plat) = @_;
+  if (!$plat || !$PLAT{$plat}) {
+    unlink $C{cookies};
+    unlink cookies_bad_file($_->{key}) for @PLATFORMS;
+    logline('cookies 已全部删除');
+    return;
   }
-  return '看不懂这个文件。要的是扩展导出的 cookies.txt（每行用 Tab 分隔的那种）。' unless $ok;
-  return '文件里没有 youtube.com 的 cookies。请先在浏览器里打开 YouTube 并登录，再导出。' unless $yt;
-  $text = "# Netscape HTTP Cookie File\n$text" unless $text =~ /^# (Netscape )?HTTP Cookie File/;
-  my $f = $C{cookies};
-  my $old = umask 077;
-  my $okw = spit($f, $text);
-  umask $old;
-  return '保存失败，服务器上写不了文件。' unless $okw;
-  chmod 0600, $f;
-  unlink "$STATE/cookies-bad";
-  logline('收到新的 cookies');
-  return '';
+  my $d = slurp($C{cookies});
+  $d = '' unless defined $d;
+  $d =~ s/\r\n?/\n/g;
+  write_cookie_rows(grep { $_->[0] ne '' && $_->[0] ne $plat } cookie_rows($d));
+  unlink cookies_bad_file($plat);
+  logline("$plat 的 cookies 已删除");
 }
 
 #----------------------------------------------------------------------
@@ -2547,8 +3029,10 @@ sub handle {
     return serve_file($c, $r, $id);
   }
   if ($p eq '/api/jobs' && $m eq 'GET') {
-    my @v = map { job_view($_) } reverse list_jobs();
+    # 已经存到 Mac 的任务不再显示（网页会先亮一下 ✅ 再收起来）。
+    my @v = grep { !$_->{hidden} } map { job_view($_) } reverse list_jobs();
     @v = @v[0 .. 29] if @v > 30;
+    delete $_->{hidden} for @v;
     return respond_json($c, $r, 200, { jobs => \@v, info => server_info() });
   }
   # 改东西的请求必须带上网页自己加的暗号，别的网站骗不了你的浏览器来下单。
@@ -2571,14 +3055,22 @@ sub handle {
       logline("删除任务 $id");
       return respond_json($c, $r, 200, { ok => bool(1) });
     }
+    if ($p eq '/api/dismiss') {
+      # 网页说「这个已经存到 Mac 了，收起来吧」。只收已经送达的；文件还是按原来的规则过一会儿再删。
+      my $id = $f->{id};
+      return respond_json($c, $r, 404, { error => '没有这个任务' }) unless valid_id($id) && -d job_dir($id);
+      my $st = job_stat($id);
+      return respond_json($c, $r, 200, { error => '还没传完' })
+        unless ($st->{state} || '') eq 'done' && ($st->{delivered} || ($st->{size} && delivered_bytes($id, $st->{size}) >= $st->{size}));
+      set_stat($id, dismissed => 1);
+      return respond_json($c, $r, 200, { ok => bool(1) });
+    }
     if ($p eq '/api/cookies') {
-      my $why = save_cookies($f->{text});
-      return respond_json($c, $r, 200, $why ? { error => $why } : { ok => bool(1) });
+      my ($why, $names) = save_cookies($f->{text});
+      return respond_json($c, $r, 200, $why ? { error => $why } : { ok => bool(1), sites => $names });
     }
     if ($p eq '/api/cookies/delete') {
-      unlink $C{cookies};
-      unlink "$STATE/cookies-bad";
-      logline('cookies 已删除');
+      delete_cookies($f->{plat});
       return respond_json($c, $r, 200, { ok => bool(1) });
     }
     if ($p eq '/api/update') {
@@ -2592,9 +3084,12 @@ sub handle {
 sub server_info {
   my $st = kv_read("$STATE/info");
   my $sticky = kv_read("$STATE/sticky");
-  my %names = map { $_->{key} => $_->{label} } all_methods();
+  my %names = map { $_->{key} => $_->{label} } all_methods('youtube');
   my $has_ck = -s $C{cookies} ? 1 : 0;
-  my @ms = map { $_->{label} } grep { $_->{ok} } all_methods();
+  my @ms = map { $_->{label} } grep { $_->{ok} } all_methods('youtube');
+  my $cp = cookie_plats();
+  my @sites = map { { key => $_->{key}, name => $_->{name}, bad => bool(-e cookies_bad_file($_->{key})) } }
+    grep { $cp->{ $_->{key} } } @PLATFORMS;
   return {
     ytdlp      => $st->{ytdlp_version} || '',
     updated    => $st->{last_update_text} || '',
@@ -2602,7 +3097,9 @@ sub server_info {
     methods    => \@ms,
     cookies    => bool($has_ck),
     cookies_at => $has_ck ? strftime('%Y-%m-%d %H:%M', localtime((stat($C{cookies}))[9])) : '',
-    cookies_bad => bool(-e "$STATE/cookies-bad"),
+    cookies_bad => bool(grep { -e cookies_bad_file($_->{key}) } @PLATFORMS),
+    cookie_sites => \@sites,
+    plugins    => bool($C{plugins} && -d $C{plugins}),
     keep_hours => num($C{keep_hours}),
     grace_min  => num(int(($C{grace} + 59) / 60)),
     free       => disk_free_mb($DATA) >= 0 ? human_size(disk_free_mb($DATA) * 1048576) : '',
@@ -2632,25 +3129,69 @@ sub pot_args {
 }
 
 sub all_methods {
+  my ($plat) = @_;
+  $plat ||= 'youtube';
   my @pot = pot_args();
   my $warp = ($C{wireproxy} && -x $C{wireproxy} && $C{warp_conf} && -s $C{warp_conf}) ? 1 : 0;
+  my $v6 = has_global_ipv6();
+  my $ck = has_cookies($plat);
+  if ($plat eq 'youtube') {
+    return (
+      { key => 'direct',  label => '直接下载', ok => 1, args => [] },
+      { key => 'clients', label => '换一种 YouTube 客户端', ok => 1,
+        args => ['--extractor-args', 'youtube:player_client=android_vr,web_safari,tv_downgraded,web_embedded'] },
+      { key => 'ipv6',    label => '改走 IPv6', ok => $v6, args => ['--force-ipv6'] },
+      { key => 'pot',     label => '自动生成 PO 令牌', ok => (@pot ? 1 : 0),
+        args => [@pot, '--extractor-args', 'youtube:player_client=default,mweb'] },
+      { key => 'ipv4',    label => '改走 IPv4 + PO 令牌', ok => ($v6 && @pot ? 1 : 0),
+        args => ['--force-ipv4', @pot, '--extractor-args', 'youtube:player_client=default,mweb'] },
+      { key => 'warp',    label => '换 Cloudflare WARP 线路', ok => $warp, warp => 1,
+        args => ['--proxy', "socks5://127.0.0.1:$C{warp_port}", @pot] },
+      { key => 'cookies', label => '用你上传的 cookies', ok => $ck, cookies => 1,
+        args => ['--cookies', $C{cookies}] },
+    );
+  }
+  # 其他平台：先用 IPv6 再用 IPv4（机器没有 IPv6 就只走 IPv4），再换 WARP，最后才用 cookies。
+  # helper 表示交给我们自己的插件（网址写成 ytweb:平台:链接）。
+  my $plug = ($C{plugins} && -d $C{plugins}) ? 1 : 0;
+  my %helper = (xhs => 'xhs', bili => 'bili', douyin => 'douyin');
+  my $h = $helper{$plat} || '';
+  my $how = $h ? '不登录的网页办法' : '直接下载';
+  my @ip = $v6
+    ? ({ ip => 'IPv6', args => ['--force-ipv6'] }, { ip => 'IPv4', args => ['--force-ipv4'] })
+    : ({ ip => 'IPv4', args => [] });
+  my @m;
+  my $hok = $h ? $plug : 1;
+  for my $x (@ip) {
+    push @m, { key => lc("$x->{ip}"), label => "$how（$x->{ip}）", ip => $x->{ip}, ok => $hok, helper => $h, args => $x->{args} };
+  }
+  push @m, { key => 'warp', label => "$how（Cloudflare WARP 线路）", ip => 'WARP', ok => $warp && $hok, warp => 1, helper => $h,
+    args => ['--proxy', "socks5://127.0.0.1:$C{warp_port}"] };
+  push @m, { key => 'cookies', label => "用你上传的 cookies（$how）", ip => '默认', ok => $ck && $hok, cookies => 1, helper => $h,
+    args => ['--cookies', $C{cookies}] };
+  # 抖音、B站：插件不行时，再让 yt-dlp 自带的办法带着你的 cookies 试一次。
+  push @m, { key => 'cookies2', label => '用你上传的 cookies（yt-dlp 自带办法）', ip => '默认', ok => $ck, cookies => 1, helper => '',
+    args => ['--cookies', $C{cookies}] } if $h && $plat ne 'xhs';
+  return @m;
+}
+
+# 推特那条没有视频时，改去拿图片。
+sub image_methods {
+  my ($plat) = @_;
+  return () unless $C{plugins} && -d $C{plugins};
+  my $v6 = has_global_ipv6();
   return (
-    { key => 'direct',  label => '直接下载', ok => 1, args => [] },
-    { key => 'clients', label => '换一种 YouTube 客户端', ok => 1,
-      args => ['--extractor-args', 'youtube:player_client=android_vr,web_safari,tv_downgraded,web_embedded'] },
-    { key => 'ipv6',    label => '改走 IPv6', ok => has_global_ipv6(), args => ['--force-ipv6'] },
-    { key => 'pot',     label => '自动生成 PO 令牌', ok => (@pot ? 1 : 0),
-      args => [@pot, '--extractor-args', 'youtube:player_client=default,mweb'] },
-    { key => 'warp',    label => '换 Cloudflare WARP 线路', ok => $warp, warp => 1,
-      args => ['--proxy', "socks5://127.0.0.1:$C{warp_port}", @pot] },
-    { key => 'cookies', label => '用你上传的 cookies', ok => (-s $C{cookies} ? 1 : 0), cookies => 1,
-      args => ['--cookies', $C{cookies}] },
+    ($v6 ? ({ key => 'img6', label => '下载推文里的图片（IPv6）', ip => 'IPv6', ok => 1, helper => 'ximg', args => ['--force-ipv6'] }) : ()),
+    { key => 'img4', label => '下载推文里的图片（IPv4）', ip => 'IPv4', ok => 1, helper => 'ximg', args => ($v6 ? ['--force-ipv4'] : []) },
   );
 }
 
+sub sticky_file { my ($plat) = @_; return ($plat || 'youtube') eq 'youtube' ? "$STATE/sticky" : "$STATE/sticky-$plat"; }
+
 sub method_order {
-  my @m = grep { $_->{ok} } all_methods();
-  my $s = kv_read("$STATE/sticky");
+  my ($plat) = @_;
+  my @m = grep { $_->{ok} } all_methods($plat);
+  my $s = kv_read(sticky_file($plat));
   if ($s->{key} && ($s->{at} || 0) > time - 86400) {
     my @first = grep { $_->{key} eq $s->{key} } @m;
     my @rest  = grep { $_->{key} ne $s->{key} } @m;
@@ -2660,7 +3201,8 @@ sub method_order {
 }
 
 sub quality_args {
-  my ($q) = @_;
+  my ($q, $plat) = @_;
+  $plat ||= 'youtube';
   my $ff = ($C{ffmpeg} && -x $C{ffmpeg}) ? 1 : 0;
   if ($q eq 'm4a') {
     return $ff ? ('-f', 'ba[ext=m4a]/ba/b', '-x', '--audio-format', 'm4a') : ('-f', 'ba[ext=m4a]/ba');
@@ -2670,6 +3212,12 @@ sub quality_args {
   }
   my $fmt = $ff ? 'bv*+ba/b' : 'b';
   return ('-f', $fmt, '--merge-output-format', 'mp4/mkv') if $q eq 'best';
+  if ($plat ne 'youtube') {
+    # 别的平台：先找现成的 H.264（avc1），画面和声音分开的就合成 mp4（不转码，很快）；
+    # 实在没有 H.264，才下别的格式，下好后再转码。没标格式的 mp4（比如 Instagram 的）一般也是 H.264。
+    $fmt = $ff ? 'bv*[vcodec^=avc]+ba[acodec^=mp4a]/bv*[vcodec^=avc]+ba/b[vcodec^=avc]/b[ext=mp4]/bv*+ba/b'
+               : 'b[vcodec^=avc]/b[ext=mp4]/b';
+  }
   return ('-f', $fmt, '-S', 'vcodec:h264,res:720,acodec:aac', '--merge-output-format', 'mp4') if $q eq 'p720';
   return ('-f', $fmt, '-S', 'vcodec:h264,res,acodec:aac', '--merge-output-format', 'mp4');
 }
@@ -2684,7 +3232,8 @@ sub base_args {
     '--print', 'video:TITLE %(title)s',
     '--print', 'after_move:FILE %(filepath)s',
     '--paths', "home:$dir", '--paths', "temp:$dir",
-    '-o', '%(title).150B.%(ext)s',
+    # 一条帖子里有好几个文件（多图、多段视频）时，文件名后面加 1 2 3，免得互相覆盖。单个视频的名字和以前一样。
+    '-o', '%(title).150B%(playlist_index& {}|)s.%(ext)s',
     '--retries', '5', '--fragment-retries', '5', '--socket-timeout', '30',
     '--cache-dir', "$DATA/cache",
   );
@@ -2700,7 +3249,7 @@ sub base_args {
 #   cookies_bad  cookies 过期了
 #   fatal        换办法也没用（链接错、视频删了、硬盘满）
 #----------------------------------------------------------------------
-sub classify {
+sub classify_base {
   my ($out, $sig) = @_;
   my $t = lc($out || '');
   my @err = grep { /^error:/i } split /\n/, ($out || '');
@@ -2740,6 +3289,54 @@ sub classify {
   $raw =~ s/^ERROR:\s*//i;
   $raw = substr($raw, 0, 300);
   return ('blocked', "下载失败。原始报错：$raw", '');
+}
+
+# 先看各平台自己的报错（还有我们插件的 YTWEB_ 暗号），认不出来再交给上面 YouTube 那一套。
+#   no_video  推特：这条推文没有视频（多半是图片帖），改去下图片
+sub classify {
+  my ($out, $sig, $plat) = @_;
+  $plat ||= 'youtube';
+  return classify_base($out, $sig) if $plat eq 'youtube';
+  my $name = plat_name($plat);
+  my $t = lc($out || '');
+  my @err = grep { /^error:/i } split /\n/, ($out || '');
+  my $e = lc(join("\n", @err) || $t);
+  return classify_base($out, $sig) if ($sig && $sig == 9) || $t =~ /no space left/;
+  return ('fatal', '这条没有视频也没有图片（可能是纯文字），没有东西可以下载。', '') if $e =~ /ytweb_no_media/;
+  return ('fatal', "这条内容不存在、已经被删除，或者被作者设成了私密。请在手机上确认一下还能不能打开。", '') if $e =~ /ytweb_gone/;
+  return ('fatal', "看不懂这个$name链接。请在 App 里点「分享 → 复制链接」，把整段文字贴过来。", '') if $e =~ /ytweb_bad_link/;
+  return ('cookies_bad', "你上传的 $name cookies 已经失效了。请按下面的步骤重新导出一份再上传。", 'cookies')
+    if $e =~ /cookies are no longer valid|cookies (have|has) (expired|been rotated)/;
+  if ($plat eq 'x') {
+    return ('no_video', '这条推文里没有视频。', '') if $e =~ /no video could be found|no video formats found|there.?s no video in this tweet/;
+    return ('need_cookies', '这条推文被标成了敏感内容，推特要求登录才能看。', 'cookies') if $e =~ /nsfw|sensitive|age.?restricted|log ?in to view/;
+    return ('fatal', '这条推文不存在、已被删除，或者账号设成了不公开。', '') if $e =~ /suspended|protected|tweet unavailable|does not exist|status not found|http error 404/;
+  }
+  if ($plat eq 'ig') {
+    return ('fatal', '这条 Instagram 只有图片，没有视频。现在只支持下 Instagram 的视频；图片请在手机上保存。', '')
+      if $e =~ /no video formats found|there is no video in this post|only images/;
+    return ('blocked', 'Instagram 不让这台服务器在不登录的情况下看这条（要求登录或请求太频繁）。', 'cookies')
+      if $e =~ /login required|rate.?limit|requested content is not available|main webpage is locked|log ?in|cookies/;
+  }
+  if ($plat eq 'tiktok') {
+    return ('blocked', 'TikTok 拦住了这台服务器的 IP。', 'cookies') if $e =~ /ip address is blocked|status code 10204|unable to find video in feed|10222/;
+    return ('fatal', '这条 TikTok 是私密的，或者已经被删除。', '') if $e =~ /private|status code 10216|video (is )?(not available|unavailable)/;
+  }
+  if ($plat eq 'douyin') {
+    return ('blocked', '抖音不给海外服务器看这条（要「新鲜的 cookies」）。', 'cookies') if $e =~ /fresh cookies|ytweb_need_cookies/;
+  }
+  if ($plat eq 'bili') {
+    return ('blocked', 'B 站的风控拦住了这台服务器（HTTP 412）。', 'cookies') if $e =~ /http error 412|precondition failed/;
+    return ('need_cookies', '这个 B 站视频要登录（或者大会员）才能看。', 'cookies') if $e =~ /premium|大会员|login|ytweb_need_cookies.*vip/;
+  }
+  return ('blocked', "$name 不让海外服务器在不登录的情况下看这条。", 'cookies') if $e =~ /ytweb_need_cookies/;
+  return ('fatal', "这个链接下载程序认不出来。请确认是单条视频/帖子的链接（在 App 里点「分享 → 复制链接」）。", '')
+    if $e =~ /unsupported url|is not a valid url/;
+  return ('fatal', "这条$name内容不存在或已被删除。", '') if $e =~ /http error 404|not found/ && $e !~ /ffmpeg|ffprobe/;
+  my ($class, $msg, $hint) = classify_base($out, $sig);
+  $msg =~ s/YouTube/$name/g;
+  $msg =~ s/（例如 https:\/\/www\.youtube\.com\/watch\?v=\.\.\.）//;
+  return ($class, $msg, $hint);
 }
 
 #----------------------------------------------------------------------
@@ -2850,8 +3447,14 @@ sub runner_stop {
 sub run_ytdlp {
   my ($id, $meta, $m, $n, $total) = @_;
   my $dir = job_dir($id);
-  my @cmd = ($C{ytdlp}, base_args($dir), quality_args($meta->{q} || 'mac'), @{ $m->{args} }, '--', $meta->{url});
-  append_log($dir, "\n===== 第 $n 种办法：$m->{label} =====\n" . join(' ', map { /\s/ ? "'$_'" : $_ } @cmd) . "\n");
+  my $plat = $meta->{plat} || platform_of($meta->{url});
+  my $pname = plat_name($plat);
+  # 交给插件的，网址写成 ytweb:平台:原链接；插件目录也要告诉 yt-dlp。
+  my $url = $m->{helper} ? "ytweb:$m->{helper}:$meta->{url}" : $meta->{url};
+  my @plug = ($m->{helper} && $C{plugins}) ? ('--plugin-dirs', $C{plugins}) : ();
+  my @cmd = ($C{ytdlp}, base_args($dir), quality_args($meta->{q} || 'mac', $plat), @plug, @{ $m->{args} }, '--', $url);
+  append_log($dir, "\n===== 第 $n 种办法：$m->{label}" . ($m->{ip} ? "，网络：$m->{ip}" : '') . " =====\n"
+    . join(' ', map { /\s/ ? "'$_'" : $_ } @cmd) . "\n");
   my $warp_pid;
   if ($m->{warp}) {
     set_stat($id, line => "正在打开 Cloudflare WARP 线路…");
@@ -2878,6 +3481,8 @@ sub run_ytdlp {
   $CUR_WARP = $warp_pid;
   my $sel = IO::Select->new($out);
   my ($buf, $tail, $file, $part, $lastb, $lastw, $lastout) = ('', '', '', 1, -1, 0, time);
+  my @files;
+  my $src = $plat eq 'youtube' ? 'YouTube' : $pname;
   my $label = $total > 1 ? "（第 $n 种办法：$m->{label}）" : '';
   my $cancel = 0;
   while (1) {
@@ -2899,7 +3504,7 @@ sub run_ytdlp {
         next if time - $lastw < 1;
         $lastw = time;
         my $pct = ($tot =~ /^\d/ && $tot > 0) ? int($got * 100 / $tot) : 0;
-        my $line = '正在从 YouTube 下载到服务器' . ($part > 1 ? '（声音部分）' : '') . "：$pct%";
+        my $line = "正在从 $src 下载到服务器" . (@files ? '（第 ' . (@files + 1) . ' 个文件）' : $part > 1 ? '（声音部分）' : '') . "：$pct%";
         $line .= '，' . human_size($spd) . '/秒' if $spd =~ /^\d/;
         $line .= '，还要 ' . human_secs($eta) if $eta =~ /^\d/;
         set_stat($id, line => $line . $label, pct => $pct);
@@ -2913,7 +3518,13 @@ sub run_ytdlp {
         next;
       }
       if ($l =~ /^TITLE (.*)$/) { set_stat($id, title => $1); next; }
-      if ($l =~ /^FILE (.*)$/)  { $file = $1; next; }
+      if ($l =~ /^FILE (.*)$/)  {
+        $file = $1;
+        my $b = (split m{/}, $1)[-1];
+        push @files, $b unless grep { $_ eq $b } @files;
+        $part = 1; $lastb = -1;
+        next;
+      }
       $tail .= "$l\n";
       append_log($dir, "$l\n");
       $tail = substr($tail, -20000) if length $tail > 40000;
@@ -2929,11 +3540,10 @@ sub run_ytdlp {
   my $sig = $st & 127;
   my $code = $st >> 8;
   append_log($dir, "结束：退出码 $code" . ($sig ? "，信号 $sig" : '') . "\n");
-  if ($code == 0 && !$sig && $file) {
-    my $base = (split m{/}, $file)[-1];
-    if (-f "$dir/$base" && -s "$dir/$base") {
-      return (1, $base, 0);
-    }
+  # 图文帖会有好几个文件（一张图一个），用换行连起来交回去。
+  my @have = grep { -f "$dir/$_" && -s "$dir/$_" } @files;
+  if (!$sig && @have && ($code == 0 || @have == @files)) {
+    return (1, join("\n", @have), 0);
   }
   if ($code == 0 && !$sig && $tail =~ /does not pass filter/) {
     return (0, "ERROR: this is a live event (is_live)\n$tail", 0);
@@ -2968,25 +3578,204 @@ sub fail_job {
   logline("任务 $id 失败：$msg");
 }
 
+#----------------------------------------------------------------------
+# 图文帖有好几张图：打成一个 zip（不压缩，图片本来就压缩过了）。Mac 上双击就能解开。
+# 只用 Perl 自带的东西，CRC32 自己算。
+#----------------------------------------------------------------------
+my @CRC_TABLE;
+sub crc32_update {
+  my ($crc, $data) = @_;
+  unless (@CRC_TABLE) {
+    for my $n (0 .. 255) {
+      my $c = $n;
+      for (1 .. 8) { $c = ($c & 1) ? (0xEDB88320 ^ ($c >> 1)) : ($c >> 1); }
+      $CRC_TABLE[$n] = $c;
+    }
+  }
+  $crc ^= 0xFFFFFFFF;
+  $crc = $CRC_TABLE[($crc ^ $_) & 0xFF] ^ ($crc >> 8) for unpack('C*', $data);
+  return $crc ^ 0xFFFFFFFF;
+}
+
+sub make_zip {
+  my ($zip, $dir, @names) = @_;
+  open(my $out, '>', $zip) or return 0;
+  binmode $out;
+  my ($off, $cd, $n) = (0, '', 0);
+  my @t = localtime;
+  my $dtime = ($t[2] << 11) | ($t[1] << 5) | int($t[0] / 2);
+  my $ddate = (($t[5] - 80) << 9) | (($t[4] + 1) << 5) | $t[3];
+  for my $name (@names) {
+    open(my $in, '<', "$dir/$name") or next;
+    binmode $in;
+    my ($crc, $size, $data) = (0, 0, '');
+    while (my $got = read($in, my $chunk, 65536)) { $crc = crc32_update($crc, $chunk); $size += $got; $data .= $chunk; }
+    close $in;
+    # 0x0800 = 文件名是 UTF-8（中文名不乱码）
+    my $h = pack('VvvvvvVVVvv', 0x04034b50, 20, 0x0800, 0, $dtime, $ddate, $crc, $size, $size, length($name), 0);
+    print $out $h, $name, $data;
+    $cd .= pack('VvvvvvvVVVvvvvvVV', 0x02014b50, 20, 20, 0x0800, 0, $dtime, $ddate, $crc, $size, $size,
+      length($name), 0, 0, 0, 0, 0, $off) . $name;
+    $off += length($h) + length($name) + $size;
+    $n++;
+  }
+  print $out $cd, pack('VvvvvVVv', 0x06054b50, 0, 0, $n, $n, length($cd), $off, 0);
+  close $out or return 0;
+  return $n;
+}
+
+#----------------------------------------------------------------------
+# 确保视频 Mac 自带播放器能放：H.264 画面 + AAC 声音的 mp4。
+#   本来就是：什么都不做
+#   画面是 H.264/HEVC、只是声音或封装不对：只换声音/封装，几秒钟
+#   画面是 VP9/AV1 等：转码成 H.264。1 核机器很慢，先按视频长度估个时间告诉你
+# 只在选了「Mac 能直接播放」或「720p」时做。「最高画质」保留原格式。
+#----------------------------------------------------------------------
+sub ffprobe_path {
+  return '' unless $C{ffmpeg} && -x $C{ffmpeg};
+  (my $p = $C{ffmpeg}) =~ s{[^/]*$}{ffprobe};
+  return -x $p ? $p : '';
+}
+
+sub probe_media {
+  my ($path) = @_;
+  my $fp = ffprobe_path() or return undef;
+  my ($o) = run_cmd_capture(60, $fp, '-v', 'error', '-show_entries', 'stream=codec_type,codec_name,height:format=duration',
+    '-of', 'compact=p=0:nk=0', $path);
+  my %r = (v => '', a => '', h => 0, dur => 0);
+  for my $l (split /\n/, $o || '') {
+    my %f = map { split /=/, $_, 2 } grep { /=/ } split /\|/, $l;
+    if (($f{codec_type} || '') eq 'video' && !$r{v} && ($f{codec_name} || '') !~ /^(mjpeg|png|bmp|gif|webp)$/) {
+      $r{v} = $f{codec_name} || '';
+      $r{h} = $f{height} || 0 if ($f{height} || '') =~ /^\d+$/;
+    }
+    $r{a} = $f{codec_name} || '' if ($f{codec_type} || '') eq 'audio' && !$r{a};
+    $r{dur} = $f{duration} if defined $f{duration} && $f{duration} =~ /^[\d.]+$/;
+  }
+  return \%r;
+}
+
+# 按视频长度和清晰度估转码要几秒（1 核、veryfast 档）。
+sub transcode_estimate {
+  my ($dur, $h) = @_;
+  my $f = $h <= 480 ? 0.6 : $h <= 720 ? 1.2 : $h <= 1080 ? 2.5 : 5;
+  my $s = int(($dur || 60) * $f) + 10;
+  return $s;
+}
+
+sub run_ffmpeg {
+  my ($id, $dir, $dur, $line, @cmd) = @_;
+  append_log($dir, "\n===== 转换格式 =====\n" . join(' ', map { /\s/ ? "'$_'" : $_ } @cmd) . "\n");
+  my $pid = open(my $out, '-|');
+  return 0 unless defined $pid;
+  if ($pid == 0) {
+    setpgrp(0, 0);
+    child_env();
+    chdir $dir;
+    open(STDERR, '>>', "$dir/log");
+    eval { setpriority(0, 0, 10) };
+    exec { $cmd[0] } @cmd or POSIX::_exit(127);
+  }
+  $CUR_CHILD = $pid;
+  my $sel = IO::Select->new($out);
+  my ($buf, $lastw, $lastout, $cancel) = ('', 0, time, 0);
+  while (1) {
+    if (-e "$dir/cancel") { $cancel = 1; kill 'KILL', -$pid; last; }
+    if (time - $lastout > 900) { kill 'KILL', -$pid; last; }
+    next unless $sel->can_read(1);
+    my $n = sysread($out, $buf, 65536, length $buf);
+    last unless $n;
+    $lastout = time;
+    while ($buf =~ s/^([^\n]*)\n//) {
+      my $l = $1;
+      next unless $l =~ /^out_time_(?:us|ms)=(\d+)/;
+      next if time - $lastw < 2 || !$dur;
+      $lastw = time;
+      my $pct = int($1 / 1e6 * 100 / $dur);
+      $pct = 99 if $pct > 99;
+      set_stat($id, line => "$line（$pct%）", pct => $pct);
+    }
+  }
+  close $out;
+  my $st = $?;
+  waitpid($pid, 0);
+  $CUR_CHILD = 0;
+  return -1 if $cancel;
+  return $st == 0 ? 1 : 0;
+}
+
+# 返回：(新文件名, 备注)。新文件名是 'CANCEL' 表示你取消了。
+sub mac_fix {
+  my ($id, $file, $q) = @_;
+  my $dir = job_dir($id);
+  return ($file, '') unless $q eq 'mac' || $q eq 'p720';
+  return ($file, '') unless $file =~ /\.(mp4|mkv|webm|mov|flv|m4v)$/i;
+  my $info = probe_media("$dir/$file") or return ($file, '');
+  return ($file, '') unless $info->{v};
+  my $v = lc $info->{v};
+  my $a = lc $info->{a};
+  my $aok = ($a eq '' || $a eq 'aac' || $a eq 'mp3');
+  return ($file, '') if $v eq 'h264' && $aok && $file =~ /\.mp4$/i;
+  (my $base = $file) =~ s/\.[^.]+$//;
+  my $new = "$base.mac.mp4";
+  my @in = ($C{ffmpeg}, '-hide_banner', '-nostdin', '-y', '-loglevel', 'error', '-progress', 'pipe:1', '-i', $file);
+  my @audio = $aok && $a ne '' ? ('-c:a', 'copy') : ('-c:a', 'aac', '-b:a', '160k');
+  my ($ok, $note);
+  if ($v eq 'h264' || $v eq 'hevc') {
+    # 画面不用动，只换声音/封装。HEVC 加上 hvc1 标记，QuickTime 才认。
+    my @tag = $v eq 'hevc' ? ('-tag:v', 'hvc1') : ();
+    set_stat($id, line => '正在整理成 Mac 能直接播放的 mp4…', pct => 100);
+    $ok = run_ffmpeg($id, $dir, $info->{dur}, '正在整理成 Mac 能直接播放的 mp4',
+      @in, '-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'copy', @tag, @audio, '-movflags', '+faststart', $new);
+  } else {
+    my $est = transcode_estimate($info->{dur}, $info->{h});
+    my $vname = uc($v eq 'vp9' ? 'VP9' : $v eq 'av1' ? 'AV1' : $v);
+    my $line = "这个视频只有 $vname 格式，Mac 自带播放器放不了，正在转换成 H.264。这台机器转码比较慢，预计要 " . human_secs($est)
+      . '（不想等可以取消，改选「最高画质」直接下原格式，用 IINA/VLC 播放）';
+    set_stat($id, line => $line, pct => 0);
+    logline("任务 $id 转码 $vname -> H.264，预计 ${est} 秒");
+    my @scale = $info->{h} > 1080 ? ('-vf', 'scale=-2:1080') : ();
+    $ok = run_ffmpeg($id, $dir, $info->{dur}, $line,
+      @in, '-map', '0:v:0', '-map', '0:a:0?', @scale, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
+      '-threads', '1', @audio, '-movflags', '+faststart', $new);
+    $note = "原视频是 $vname，已转成 H.264";
+  }
+  return ('CANCEL', '') if $ok < 0;
+  if ($ok && -s "$dir/$new") {
+    unlink "$dir/$file";
+    (my $final = $new) =~ s/\.mac\.mp4$/.mp4/;
+    rename("$dir/$new", "$dir/$final") or $final = $new;
+    return ($final, $note || '');
+  }
+  unlink "$dir/$new";
+  append_log($dir, "转换失败，保留原文件\n");
+  return ($file, '转换成 Mac 格式没成功，保留了原格式（用 IINA 或 VLC 能放）');
+}
+
 sub run_job {
   my ($id) = @_;
   $0 = 'ytdlp-web-job';
   my $dir = job_dir($id);
   my $meta = job_meta($id);
+  my $plat = $meta->{plat} || platform_of($meta->{url});
+  my $pname = plat_name($plat);
   set_stat($id, state => 'running', line => '准备中…', pct => 0, started => time);
   update_ytdlp('每天一次') if update_due($C{update_hours});
   my $free = disk_free_mb($DATA);
   if ($free >= 0 && $free < $C{min_free_mb}) {
     return fail_job($id, "服务器硬盘只剩 ${free}MB，放不下视频。等旧文件自动删掉，或者清一清 VPS 的硬盘。", '');
   }
-  my @ms = method_order();
+  my @ms = method_order($plat);
   my $updated = 0;
   my ($last_msg, $last_hint, $used_cookies) = ('', '', 0);
   my $i = 0;
+  my $src = $plat eq 'youtube' ? 'YouTube' : $pname;
+  my @tried;
   while ($i < @ms) {
     my $m = $ms[$i];
     $i++;
-    set_stat($id, line => @ms > 1 && $i > 1 ? "上一种办法不行，换第 $i 种办法：$m->{label}…" : '正在向 YouTube 要视频信息…', pct => 0);
+    push @tried, $m->{ip} if $m->{ip} && !$m->{cookies} && !grep { $_ eq $m->{ip} } @tried;
+    set_stat($id, line => @ms > 1 && $i > 1 ? "上一种办法不行，换第 $i 种办法：$m->{label}…" : "正在向 $src 要视频信息…", pct => 0);
     clean_media($dir);
     my ($ok, $res, $sig) = run_ytdlp($id, $meta, $m, $i, scalar @ms);
     if ($res eq 'CANCEL') {
@@ -2995,6 +3784,44 @@ sub run_job {
       return;
     }
     if ($ok) {
+      my @files = split /\n/, $res;
+      my $note = '';
+      my $q = $meta->{q} || 'mac';
+      if (@files > 1) {
+        # 一条帖子里有好几个文件（多图，或者 Instagram/推特一条里好几段视频）：视频先各自确保 Mac 能放，再一起打包。
+        my ($nv, $ni) = (0, 0);
+        for my $k (0 .. $#files) {
+          if ($files[$k] =~ /\.(jpe?g|png|webp|gif|heic)$/i) { $ni++; next; }
+          $nv++;
+          my ($nf) = mac_fix($id, $files[$k], $q);
+          if ($nf eq 'CANCEL') { remove_tree($dir); logline("任务 $id 已取消"); return; }
+          $files[$k] = $nf;
+        }
+        set_stat($id, line => '正在把 ' . scalar(@files) . ' 个文件打成一个 zip…', pct => 100);
+        my $title = job_stat($id)->{title} || 'images';
+        $title =~ s{[/\\:*?"<>|\x00-\x1f]+}{_}g;
+        $title =~ s/\s+\d+$//;
+        $title = substr($title, 0, 120) || 'images';
+        my $zip = "$title.zip";
+        if (make_zip("$dir/$zip", $dir, @files)) {
+          unlink "$dir/$_" for @files;
+          $note = '这条里有 ' . join('、', ($ni ? "$ni 张图片" : ()), ($nv ? "$nv 段视频" : ())) . '，打包成了一个 zip，在 Mac 上双击就能解开';
+          @files = ($zip);
+        } else {
+          return fail_job($id, '图片打包失败（服务器写不了文件）。', '');
+        }
+      } elsif ($files[0] =~ /\.(jpe?g|png|webp|gif|heic)$/i) {
+        $note = '这条是图片，没有视频';
+      } else {
+        my ($nf, $n2) = mac_fix($id, $files[0], $q);
+        if ($nf eq 'CANCEL') {
+          remove_tree($dir);
+          logline("任务 $id 已取消");
+          return;
+        }
+        ($files[0], $note) = ($nf, $n2);
+      }
+      $res = $files[0];
       my $size = -s "$dir/$res";
       opendir(my $dh, $dir);
       for my $f (readdir $dh) {
@@ -3003,24 +3830,33 @@ sub run_job {
         if (-d $p) { remove_tree($p); } else { unlink $p; }
       }
       closedir $dh;
-      set_stat($id, state => 'done', file => $res, size => $size, done_at => time, line => '', pct => 100, method => $m->{label});
-      kv_write("$STATE/sticky", { key => $m->{key}, at => time });
-      unlink "$STATE/cookies-bad" if $m->{cookies};
-      logline("任务 $id 下好了（$m->{label}）：$res " . human_size($size));
+      set_stat($id, state => 'done', file => $res, size => $size, done_at => time, line => '', pct => 100,
+        method => $m->{label}, note => $note);
+      kv_write(sticky_file($plat), { key => $m->{key}, at => time });
+      unlink cookies_bad_file($plat) if $m->{cookies};
+      logline("任务 $id 下好了（$m->{label}" . ($m->{ip} ? "，网络 $m->{ip}" : '') . "）：$res " . human_size($size));
       return;
     }
-    my ($class, $msg, $hint) = classify($res, $sig);
+    my ($class, $msg, $hint) = classify($res, $sig, $plat);
     append_log($dir, "判断：$class / $msg\n");
     $used_cookies = 1 if $m->{cookies};
     ($last_msg, $last_hint) = ($msg, $hint);
     return fail_job($id, $msg, $hint) if $class eq 'fatal';
+    if ($class eq 'no_video') {
+      # 推特：没有视频，多半是图片帖。剩下的办法换成「下图片」。
+      my @img = image_methods($plat);
+      return fail_job($id, '这条推文里没有视频。下载图片要用到插件，在 VPS 上运行 ytdlp-web 回车更新一次就有了。', '') unless @img;
+      next if $m->{helper} && $m->{helper} eq 'ximg';
+      @ms = (@ms[0 .. $i - 1], @img);
+      next;
+    }
     if ($class eq 'cookies_bad') {
-      if (open(my $bf, '>', "$STATE/cookies-bad")) { close $bf; }
+      if (open(my $bf, '>', cookies_bad_file($plat))) { close $bf; }
       return fail_job($id, $msg, 'cookies');
     }
     if ($class eq 'need_cookies') {
       my @ck = grep { $_->{cookies} } @ms[$i .. $#ms];
-      return fail_job($id, $msg . ' 上传方法在网页下面的「被 YouTube 拦住了？」里。', 'cookies') unless @ck;
+      return fail_job($id, $msg . " 请上传 $pname 的 cookies，方法在网页下面的「被拦住了？上传 cookies」里。", 'cookies') unless @ck;
       @ms = (@ms[0 .. $i - 1], @ck);
       next;
     }
@@ -3028,15 +3864,18 @@ sub run_job {
     if (!$updated && update_due(1)) {
       $updated = 1;
       set_stat($id, line => '先把 yt-dlp 更新到最新版本…');
-      update_ytdlp('被 YouTube 拦了');
+      update_ytdlp("被 $src 拦了");
     }
   }
-  my $has_ck = -s $C{cookies} ? 1 : 0;
+  my $has_ck = has_cookies($plat);
   my $tail;
   if ($used_cookies) {
-    $tail = '所有办法（包括你上传的 cookies）都试过了。cookies 可能过期了，请重新导出一份上传；也可能这台 VPS 的 IP 被 YouTube 拉黑得比较严重，过几个小时再试。';
+    $tail = "所有办法（包括你上传的 cookies）都试过了。cookies 可能过期了，请重新导出一份上传；也可能这台 VPS 的 IP 被 $src 拉黑得比较严重，过几个小时再试。";
   } elsif (!$has_ck && $last_hint eq 'cookies') {
-    $tail = '不用账号的办法都试过了。最后一招：上传一个 YouTube 小号的 cookies（步骤见网页下面的「被 YouTube 拦住了？」）。';
+    $tail = $plat eq 'youtube'
+      ? '不用账号的办法都试过了。最后一招：上传一个 YouTube 小号的 cookies（步骤见网页下面的「被拦住了？上传 cookies」）。'
+      : '不用账号的办法都试过了' . (@tried ? '（' . join('、', @tried) . '）' : '') . "。$pname 对海外服务器限制很严，"
+        . "请上传 $pname 的 cookies 再试（步骤见网页下面的「被拦住了？上传 cookies」，建议用小号）。";
   } else {
     $tail = '能试的办法都试过了，过一会儿再试一次。';
   }
@@ -3078,9 +3917,10 @@ sub sweep {
         if (!$busy && $size && delivered_bytes($id, $size) >= $size) {
           my $sent_at = (stat("$dir/sent"))[9] || $now;
           if ($now - $sent_at >= $C{grace}) {
-            unlink $path;
-            set_stat($id, gone => '已经传到你的 Mac，服务器上的文件已删除');
-            logline("已送达，删除服务器文件 $id");
+            # 送达了：文件和这条任务记录一起删掉，网页上也不会再出现。
+            remove_tree($dir);
+            logline("已送达，删除服务器文件和任务记录 $id");
+            next;
           }
         } elsif (!$busy && $now - ($st->{done_at} || $created) > $C{keep_hours} * 3600) {
           unlink $path;
@@ -3125,6 +3965,8 @@ button.gray,.btn.gray{background:#e5e5ea;color:#1d1d1f}button.red{background:#ff
 .bar i{display:block;height:100%;background:#34c759;width:0}.err{background:#fff4f4;border-left:4px solid #ff3b30;padding:10px;border-radius:6px;margin:8px 0;white-space:pre-wrap}
 .small{font-size:13px;color:#666}details{margin:14px 0}summary{cursor:pointer;font-weight:600;padding:6px 0}ol{padding-left:22px}code{background:#eee;padding:1px 5px;border-radius:4px}
 .top{display:flex;justify-content:space-between;align-items:center}.top a{color:#666;font-size:14px}
+textarea.big{font:17px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;height:auto;min-height:56px;resize:vertical}
+.okline{color:#1b7f3b;font-weight:600}button.tiny{font-size:13px;padding:4px 10px;margin:2px 4px}
 CSS
 
 sub page_simple {
@@ -3139,8 +3981,8 @@ sub page_login {
   my $m = $msg ? '<div class="msg bad">' . html_esc($msg) . '</div>' : '';
   return <<"HTML";
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>登录 · 存 YouTube 视频到 Mac</title><style>$CSS</style></head><body><main>
-<h1>存 YouTube 视频到 Mac</h1><p class="sub">先登录。名字和密码是安装时屏幕上显示的那一对。</p>
+<title>登录 · 存视频到 Mac</title><style>$CSS</style></head><body><main>
+<h1>存视频到 Mac</h1><p class="sub">先登录。名字和密码是安装时屏幕上显示的那一对。</p>
 <form class="card" method="post" action="/login">$m
 <p>登录名字<br><input type="text" name="user" value="admin" autocomplete="username" autocapitalize="off"></p>
 <p>密码<br><input type="password" name="pass" autocomplete="current-password" autofocus></p>
@@ -3153,14 +3995,15 @@ HTML
 sub page_app {
   return <<"HTML" . <<'JS';
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>存 YouTube 视频到 Mac</title><style>$CSS</style></head><body><main>
-<div class="top"><h1>存 YouTube 视频到 Mac</h1><a href="/logout">退出登录</a></div>
-<p class="sub">贴链接 → 点「开始」→ 视频自动存进 Mac 的「下载」文件夹。传完以后，服务器上的文件会自动删掉。</p>
+<title>存视频到 Mac</title><style>$CSS</style></head><body><main>
+<div class="top"><h1>存视频到 Mac</h1><a href="/logout">退出登录</a></div>
+<p class="sub">贴链接 → 点「开始」→ 视频（或图片）自动存进 Mac 的「下载」文件夹，传完服务器上的文件自动删掉。<br>
+支持 YouTube、抖音、小红书、B站、TikTok、推特/X、Instagram。App 里「分享 → 复制链接」得到的<b>整段文字</b>直接粘贴就行。</p>
 <form class="card" id="f">
-<input type="text" id="url" placeholder="在这里粘贴 YouTube 视频链接" autocomplete="off" autofocus>
+<textarea id="url" class="big" rows="2" placeholder="在这里粘贴视频链接，或整段分享文字（例如「6.99 复制打开抖音…… https://v.douyin.com/……」）" autocomplete="off" autofocus></textarea>
 <div class="qs" style="margin-top:10px">
-<label><input type="radio" name="q" value="mac" checked> Mac 能直接播放的最高画质（推荐，一般是 1080p MP4）</label>
-<label><input type="radio" name="q" value="best"> 最高画质（4K/8K，文件大，QuickTime 可能放不了，用 IINA 或 VLC）</label>
+<label><input type="radio" name="q" value="mac" checked> Mac 能直接播放的最高画质（推荐。H.264 的 MP4；YouTube 一般 1080p。少数只有 VP9/AV1 的视频会自动转码，比较慢，网页会告诉你大概要等多久）</label>
+<label><input type="radio" name="q" value="best"> 最高画质（4K/8K，原格式不转码，文件大。常是 VP9/AV1，Mac 自带播放器可能放不了，要装免费的 IINA 或 VLC）</label>
 <label><input type="radio" name="q" value="p720"> 720p（文件小，下得快）</label>
 <label><input type="radio" name="q" value="m4a"> 只要声音（m4a，Mac 的「音乐」能直接放）</label>
 <label><input type="radio" name="q" value="mp3"> 只要声音（mp3）</label>
@@ -3169,10 +4012,14 @@ sub page_app {
 <div class="msg" id="msg"></div>
 </form>
 <div id="jobs"></div>
-<details class="card" id="ck"><summary>被 YouTube 拦住了？（上传 cookies，最后一招）</summary>
+<details class="card" id="ck"><summary>被拦住了？上传 cookies（最后一招）</summary>
 <div id="ckstate" class="small"></div>
-<p>VPS 是机房 IP，YouTube 有时会说「请登录，确认你不是机器人」。网页会先自动换几种<b>不用账号</b>的办法；都不行时，才需要你上传一个 YouTube 账号的 cookies（登录记录）。</p>
-<p><b>请用小号，不要用主号</b>：YouTube 发现账号被程序用，可能会限制甚至封号。cookies 过几周到几个月会失效，失效时网页会提醒你重新上传。</p>
+<p>VPS 是海外机房的 IP，各平台都会提防。网页会先自动换几种<b>不用账号</b>的办法（换 IPv6/IPv4、换线路……）；都不行时，才需要你上传那个平台的 cookies（浏览器里的登录记录）。</p>
+<p><b>请用小号，不要用主号</b>：平台发现账号被程序用，可能会限制甚至封号。cookies 过几周到几个月会失效，失效时网页会提醒你重新上传。
+可以分几次上传不同平台的，互不覆盖。</p>
+<p><b>大概什么时候要 cookies：</b>TikTok、推特、Instagram 的公开内容一般不用；YouTube 偶尔要；<b>抖音、小红书、B站</b>对海外服务器管得严，网页办法拿不到时就要。
+YouTube 年龄限制、会员视频，推特敏感内容，B站大会员视频，一定要登录过的 cookies。</p>
+<p><b>YouTube</b>（步骤特别一点，这样 cookies 不容易失效）：</p>
 <ol>
 <li>Mac 上用 <b>Chrome</b>（或 Firefox）。Safari 没有好用的导出工具。</li>
 <li>Chrome 网上应用店搜索并安装扩展 <b>Get cookies.txt LOCALLY</b>（Firefox 装 <b>cookies.txt</b>）。在扩展的「详情」里打开「在无痕模式下启用」。</li>
@@ -3182,15 +4029,25 @@ sub page_app {
 <li>直接关掉这个无痕窗口，以后别再打开它（这样 cookies 不会被 YouTube 换掉）。</li>
 <li>回到这里，点下面「选择文件」选刚才那个 txt（或者把文件内容粘贴进框里），再点「保存 cookies」。</li>
 </ol>
+<p><b>抖音 / 小红书 / B站 / TikTok / 推特 / Instagram</b>：</p>
+<ol>
+<li>同样在 Chrome 装好 <b>Get cookies.txt LOCALLY</b>。</li>
+<li>普通窗口打开对应网站：抖音 <code>https://www.douyin.com/</code>、小红书 <code>https://www.xiaohongshu.com/explore</code>、B站 <code>https://www.bilibili.com/</code>、TikTok <code>https://www.tiktok.com/</code>、推特 <code>https://x.com/</code>、Instagram <code>https://www.instagram.com/</code>。</li>
+<li>登录你的<b>小号</b>（抖音可以先不登录：打开首页随便刷几个视频再导出，不行再登录）。</li>
+<li>就在这个网站的页面上点扩展图标 → <b>Export</b>（Netscape 格式），得到一个 <code>xxx_cookies.txt</code>。</li>
+<li>回到这里选文件 → 「保存 cookies」。以后这个平台被拦时，点任务上的「再试一次」就会用上。</li>
+</ol>
 <input type="file" id="ckfile" accept=".txt,text/plain">
 <textarea id="cktext" placeholder="也可以把 cookies.txt 的内容整个粘贴到这里"></textarea>
-<div class="row"><button type="button" id="cksave">保存 cookies</button><button type="button" class="gray" id="ckdel">删除已上传的 cookies</button></div>
+<div class="row"><button type="button" id="cksave">保存 cookies</button><button type="button" class="gray" id="ckdel">删除全部 cookies</button></div>
 <div class="msg" id="ckmsg"></div>
 </details>
 <details class="card"><summary>常见问题</summary>
-<p><b>视频存在哪？</b> Mac 的「下载」文件夹（访达左边的「下载」）。Safari、Chrome 默认都存到这里。</p>
+<p><b>视频存在哪？</b> Mac 的「下载」文件夹（访达左边的「下载」）。Safari、Chrome 默认都存到这里。存好以后，网页上的那一条会显示 ✅ 然后自己消失。</p>
+<p><b>图片帖（小红书图文、推特图片）？</b> 一张图直接存成图片；好几张会打成一个 zip，在 Mac 上双击就解开。纯文字的帖子没有东西可下，网页会告诉你。</p>
 <p><b>点了开始，下好了却没有保存？</b> Safari 第一次会问「是否允许在此网站上下载」，点「允许」。Chrome 如果问「此网站想下载多个文件」，点「允许」。也可以点任务里的「保存到 Mac」按钮。</p>
 <p><b>下载到一半网断了？</b> 在浏览器的下载列表里点「继续/恢复」，会接着下，不用从头来。服务器上的文件会等你拿完再删（最多留几个小时）。</p>
+<p><b>为什么有的要「转码」，等很久？</b> Mac 自带播放器只认 H.264。网页总是先找现成的 H.264；只有原视频只有 VP9/AV1 时才转码。这台 VPS 只有 1 核，转码大约和视频一样长甚至更久。不想等就选「最高画质」，用 IINA/VLC 播放。</p>
 <p><b>4K 视频 QuickTime 打不开？</b> 4K 一般是 VP9/AV1 格式，装一个免费的 IINA 或 VLC 就能放。想直接用 QuickTime，就选第一项。</p>
 <p><b>可以关掉网页吗？</b> 服务器下载时可以关，下好后重新打开网页，在任务里点「保存到 Mac」。</p>
 </details>
@@ -3200,25 +4057,30 @@ HTML
 <script>
 const $=s=>document.querySelector(s);
 const load=k=>{try{return new Set(JSON.parse(localStorage.getItem(k)||'[]'))}catch(e){return new Set()}};
-const mine=load('ytw_mine'),got=load('ytw_got');
+const mine=load('ytw_mine'),got=load('ytw_got'),closing=new Set();
 function keep(){localStorage.setItem('ytw_mine',JSON.stringify([...mine].slice(-60)));localStorage.setItem('ytw_got',JSON.stringify([...got].slice(-60)));}
 async function api(p,data){const o={headers:{'X-YTW':'1'},cache:'no-store'};if(data){o.method='POST';o.body=new URLSearchParams(data);}
  const r=await fetch(p,o);if(r.status===401){location.href='/';throw new Error('login');}return r.json();}
 function say(el,t,bad){el.textContent=t;el.className='msg '+(bad?'bad':'ok');}
 const lastQ=localStorage.getItem('ytw_q');if(lastQ){const x=document.querySelector('input[name=q][value="'+lastQ+'"]');if(x)x.checked=true;}
+$('#url').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#f').requestSubmit();}});
 $('#f').onsubmit=async e=>{e.preventDefault();const url=$('#url').value.trim();
- if(!url){say($('#msg'),'先把 YouTube 视频链接粘贴到上面的框里。',1);return;}
+ if(!url){say($('#msg'),'先把视频链接（或整段分享文字）粘贴到上面的框里。',1);return;}
  const q=document.querySelector('input[name=q]:checked').value;localStorage.setItem('ytw_q',q);$('#go').disabled=true;
  try{const r=await api('/api/add',{url,q});if(r.error){say($('#msg'),r.error,1);}else{mine.add(r.id);keep();$('#url').value='';
   say($('#msg'),'收到了！下面能看到进度。下好以后会自动存到 Mac，不用一直盯着。');tick();}}
  catch(err){say($('#msg'),'连不上服务器，请检查网络后再试。',1);}finally{$('#go').disabled=false;}};
 function saveFile(id){const a=document.createElement('a');a.href='/dl/'+id;a.download='';document.body.appendChild(a);a.click();a.remove();}
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
+// 已经存到 Mac 的：亮 1.5 秒 ✅，然后告诉服务器收起来，卡片消失。
+function dismiss(id){if(closing.has(id))return;closing.add(id);setTimeout(async()=>{try{await api('/api/dismiss',{id});}catch(e){}tick();},1500);}
 function render(d){const box=$('#jobs');box.textContent='';
  for(const j of d.jobs){const c=el('div','card job');c.appendChild(el('div','t',j.title||j.url));
-  c.appendChild(el('div','small',j.quality+(j.size?' · '+j.size:'')));
+  c.appendChild(el('div','small',(j.plat?j.plat+' · ':'')+j.quality+(j.size?' · '+j.size:'')));
   if(j.state==='error'){c.appendChild(el('div','err',j.error));}
-  else{c.appendChild(el('div','l',j.line));if(j.state==='running'||j.state==='queued'){const b=el('div','bar');const i=el('i');i.style.width=(j.pct||0)+'%';b.appendChild(i);c.appendChild(b);}}
+  else{c.appendChild(el('div','l'+(j.delivered?' okline':''),j.line));if(j.note)c.appendChild(el('div','small',j.note));
+   if(j.state==='running'||j.state==='queued'){const b=el('div','bar');const i=el('i');i.style.width=(j.pct||0)+'%';b.appendChild(i);c.appendChild(b);}}
+  if(j.delivered){box.appendChild(c);dismiss(j.id);continue;}
   const row=el('div','row');
   if(j.has_file){const b=el('button',null,'保存到 Mac');b.onclick=()=>{got.add(j.id);keep();saveFile(j.id);};row.appendChild(b);}
   if(j.hint==='cookies'){const b=el('button','gray','去上传 cookies');b.onclick=()=>{$('#ck').open=true;$('#ck').scrollIntoView({behavior:'smooth'});};row.appendChild(b);}
@@ -3227,17 +4089,22 @@ function render(d){const box=$('#jobs');box.textContent='';
   c.appendChild(row);box.appendChild(c);
   if(j.state==='done'&&j.has_file&&mine.has(j.id)&&!got.has(j.id)){got.add(j.id);keep();saveFile(j.id);}}
  const i=d.info;let f='yt-dlp '+(i.ytdlp||'?')+(i.updated?'（'+i.updated+' 检查过更新，每天自动更新）':'（每天自动更新）');
- if(i.method)f+=' · 上次成功的办法：'+i.method;f+=' · 被拦时会依次试：'+i.methods.join(' → ');
+ if(i.method)f+=' · YouTube 上次成功的办法：'+i.method;f+=' · YouTube 被拦时会依次试：'+i.methods.join(' → ');
  f+=' · 传到 Mac 后约 '+i.grace_min+' 分钟删除服务器文件，没人拿的 '+i.keep_hours+' 小时后删除';if(i.free)f+=' · 服务器硬盘剩 '+i.free;
  $('#foot').textContent=f;
- $('#ckstate').textContent=i.cookies?('已上传 cookies（'+i.cookies_at+'）'+(i.cookies_bad?'，但已经失效了，请重新上传。':'。只有前面的办法都不行时才会用。')):'还没有上传 cookies。大多数时候不需要。';
+ const st=$('#ckstate');st.textContent='';
+ if(!i.cookie_sites.length){st.textContent='还没有上传任何 cookies。大多数时候不需要。';}
+ else{st.appendChild(el('span',null,'已上传（'+i.cookies_at+' 更新）：'));
+  for(const s of i.cookie_sites){const b=el('button','gray tiny',s.name+(s.bad?'（已失效，请重新上传）':'')+' ✕');b.title='删除 '+s.name+' 的 cookies';
+   b.onclick=async()=>{await api('/api/cookies/delete',{plat:s.key});say($('#ckmsg'),'已删除 '+s.name+' 的 cookies。');tick();};st.appendChild(b);}
+  st.appendChild(el('span',null,' 只有前面的办法都不行时才会用。'));}
  if(i.cookies_bad)$('#ck').open=true;
- return d.jobs.some(j=>j.state==='queued'||j.state==='running'||(j.state==='done'&&j.has_file&&!j.delivered));}
+ return d.jobs.some(j=>j.state==='queued'||j.state==='running'||(j.state==='done'&&(j.has_file||j.delivered)));}
 let timer=null;
 async function tick(){clearTimeout(timer);let busy=false;try{busy=render(await api('/api/jobs'));}catch(e){}timer=setTimeout(tick,busy?1500:8000);}
 $('#ckfile').onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{$('#cktext').value=r.result;};r.readAsText(f);};
-$('#cksave').onclick=async()=>{const r=await api('/api/cookies',{text:$('#cktext').value});if(r.error)say($('#ckmsg'),r.error,1);else{say($('#ckmsg'),'保存好了。被拦的视频点「再试一次」就会用上。');$('#cktext').value='';tick();}};
-$('#ckdel').onclick=async()=>{await api('/api/cookies/delete',{});say($('#ckmsg'),'已删除服务器上的 cookies。');tick();};
+$('#cksave').onclick=async()=>{const r=await api('/api/cookies',{text:$('#cktext').value});if(r.error)say($('#ckmsg'),r.error,1);else{say($('#ckmsg'),'保存好了（'+(r.sites||[]).join('、')+'）。被拦的任务点「再试一次」就会用上。');$('#cktext').value='';$('#ckfile').value='';tick();}};
+$('#ckdel').onclick=async()=>{await api('/api/cookies/delete',{});say($('#ckmsg'),'已删除服务器上的全部 cookies。');tick();};
 tick();
 </script></body></html>
 JS
@@ -4353,6 +5220,7 @@ do_install() {
   stop_service
   [ "$MIGRATE" = 1 ] && stop_old_service
   write_server
+  write_plugin
   mkdir -p "$CONF_DIR" "$DATA"
   chmod 700 "$CONF_DIR"
   ff=$(command -v ffmpeg 2>/dev/null || true)
