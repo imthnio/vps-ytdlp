@@ -32,7 +32,7 @@
 #   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=2.0.0
+VERSION=2.0.1
 # ytdlp-onekey-begin
 
 #----------------------------------------------------------------------
@@ -76,6 +76,100 @@ SWAP_FILE=/ytdlp-web.swap
 # 旧版（1.x，用 yt-dlp-web-ui 的那种）放东西的地方。升级时读它的端口和密码，然后清掉。
 OLD_CONF=${YTD_OLD_CONF:-/etc/yt-dlp-webui/config.yml}
 OLD_NOTE=${YTD_OLD_NOTE:-/etc/yt-dlp-webui/install.txt}
+
+#----------------------------------------------------------------------
+# 同一时间只能跑一份：两份一起装，会抢软件源的锁、互相覆盖文件。
+# 做法：mkdir 建一个锁目录（建目录这一步要么成功要么失败，不会两个人同时成功），
+# 里面写上自己的进程号。别人来了看到目录在、进程还活着，就提示后退出。
+# 进程已经不在了（比如上次被强行关掉），就当作残留，自动清掉。
+# 退出、出错、按 Ctrl+C 都会删掉锁。只看不改的 --status、--log 不加锁。
+#----------------------------------------------------------------------
+lock_dir_default() {
+  for d in /run /var/run /tmp; do
+    if [ -d "$d" ] && [ -w "$d" ]; then
+      printf '%s\n' "$d/ytdlp-web.lock"
+      return 0
+    fi
+  done
+  printf '%s\n' /tmp/ytdlp-web.lock
+}
+LOCK_DIR=${YTD_LOCK_DIR:-$(lock_dir_default)}
+LOCK_HELD=0
+
+pid_alive() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$1" 2>/dev/null && return 0
+  # 没权限发信号时，看 /proc 里还有没有这个进程。
+  [ -d "/proc/$1" ]
+}
+
+lock_owner() {
+  sed -n '1p' "$LOCK_DIR/pid" 2>/dev/null | tr -cd '0-9'
+}
+
+# 成功拿到锁返回 0；已经有一份在跑返回 1，并把它的进程号放在 LOCK_OTHER。
+lock_try() {
+  LOCK_OTHER=
+  tries=0
+  while [ "$tries" -lt 5 ]; do
+    tries=$((tries + 1))
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_DIR/pid"
+      LOCK_HELD=1
+      return 0
+    fi
+    owner=$(lock_owner)
+    # 自动更新时脚本会用 exec 换成新版本，进程号不变，锁本来就是自己的。
+    if [ "$owner" = "$$" ]; then
+      LOCK_HELD=1
+      return 0
+    fi
+    if [ -z "$owner" ]; then
+      # 别人刚建好目录、还没来得及写进程号。等一秒再看。
+      sleep 1
+      owner=$(lock_owner)
+      if [ -z "$owner" ] && [ "$tries" -lt 3 ]; then
+        continue
+      fi
+    fi
+    if [ -n "$owner" ] && pid_alive "$owner"; then
+      LOCK_OTHER=$owner
+      return 1
+    fi
+    # 残留的锁：先改名再删。改名只有一个人能成功，免得两个人同时清理、同时拿到锁。
+    stale="$LOCK_DIR.stale.$$"
+    if mv "$LOCK_DIR" "$stale" 2>/dev/null; then
+      if [ "$(sed -n '1p' "$stale/pid" 2>/dev/null | tr -cd '0-9')" = "$owner" ]; then
+        rm -rf "$stale"
+      else
+        # 改名的瞬间别人已经换上了新锁，还给它。
+        mv "$stale" "$LOCK_DIR" 2>/dev/null || rm -rf "$stale"
+      fi
+    fi
+  done
+  LOCK_OTHER=$(lock_owner)
+  return 1
+}
+
+lock_release() {
+  [ "$LOCK_HELD" = 1 ] || return 0
+  if [ "$(lock_owner)" = "$$" ]; then
+    rm -rf "$LOCK_DIR"
+  fi
+  LOCK_HELD=0
+}
+
+lock_or_quit() {
+  if ! lock_try; then
+    die "已经有一个安装在进行（进程号 ${LOCK_OTHER:-未知}），等它结束再运行。"
+  fi
+  trap 'lock_release' EXIT
+  trap 'lock_release; exit 129' HUP
+  trap 'lock_release; printf "\n"; exit 130' INT
+  trap 'lock_release; exit 143' TERM
+}
 
 #----------------------------------------------------------------------
 # 版本号比较。用来判断网上的脚本是不是更新。
@@ -848,12 +942,61 @@ need_tool() {
   esac
 }
 
+# apt 的锁被别的程序占着时（比如系统在自动更新 unattended-upgrades），先等它，最多 3 分钟。
+# 看 /proc 里有没有 apt、dpkg 这类进程在跑。
+apt_busy_pid() {
+  procdir=${YTD_PROC_DIR:-/proc}
+  for f in "$procdir"/[0-9]*/comm; do
+    [ -r "$f" ] || continue
+    pid=${f%/comm}
+    pid=${pid##*/}
+    [ "$pid" = "$$" ] && continue
+    case "$(cat "$f" 2>/dev/null)" in
+      apt|apt-get|aptitude|dpkg)
+        printf '%s\n' "$pid"
+        return 0
+        ;;
+      unattended-upgr*)
+        # Ubuntu 上一直挂着一个 unattended-upgrade-shutdown 等关机信号，它不占锁，不用等它。
+        if ! tr '\0' ' ' < "${f%/comm}/cmdline" 2>/dev/null | grep -q 'shutdown'; then
+          printf '%s\n' "$pid"
+          return 0
+        fi
+        ;;
+    esac
+  done
+  return 1
+}
+
+wait_apt_free() {
+  limit=${YTD_APT_WAIT:-180}
+  step=${YTD_APT_STEP:-3}
+  waited=0
+  told=0
+  while busy=$(apt_busy_pid); do
+    if [ "$waited" -ge "$limit" ]; then
+      say_warn "等了 ${limit} 秒，系统的软件更新（进程号 ${busy}）还没结束。先试着装，装不上会换别的办法。"
+      return 1
+    fi
+    if [ "$told" = 0 ]; then
+      say_info "系统正在自己安装或更新软件（进程号 ${busy}），先等它结束，最多等 $((limit / 60)) 分钟…"
+      told=1
+    fi
+    sleep "$step"
+    waited=$((waited + step))
+  done
+  [ "$told" = 1 ] && say_ok "系统的软件更新结束了，继续"
+  return 0
+}
+
 pm_update() {
   [ "${PM_UPDATED:-}" = 1 ] && return 0
   say_info "正在更新软件源（$PM）…"
   case "$PM" in
     apt)
-      DEBIAN_FRONTEND=noninteractive apt-get update -qq || DEBIAN_FRONTEND=noninteractive apt-get update
+      wait_apt_free || true
+      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update -qq \
+        || DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update
       ;;
     apk) apk update ;;
     dnf) dnf makecache -y >/dev/null 2>&1 || true ;;
@@ -873,7 +1016,9 @@ pm_install_body() {
   # shellcheck disable=SC2086
   case "$PM" in
     apt)
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkg
+      wait_apt_free || true
+      # DPkg::Lock::Timeout：新一点的 apt 自己也会等锁，再多一道保险。老 apt 不认识这个设置，会忽略。
+      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends $pkg
       rm -f /var/cache/apt/archives/*.deb 2>/dev/null || true
       ;;
     apk) apk add --no-cache $pkg ;;
@@ -4303,6 +4448,8 @@ main() {
     status) print_status; exit 0 ;;
     log) print_log 80; exit 0 ;;
   esac
+  # 下面这些会改系统，同一时间只能跑一份。
+  lock_or_quit
   prepare_stdin
   maybe_self_update "$@"
   case "$action" in
