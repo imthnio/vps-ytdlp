@@ -206,13 +206,13 @@ check old-path "$(old_config_get download_path "$tmpd/old.yml")" /var/lib/yt-dlp
 ) || fail=1
 
 # 全自动模式：PORT=端口 就不再提问
-check auto-off "$(PORT= YTD_PORT= YTD_AUTO= ; yes_no x auto_mode)" no
+check auto-off "$(PORT='' YTD_PORT='' YTD_AUTO=''; yes_no x auto_mode)" no
 check auto-port "$(PORT=15346; yes_no x auto_mode)" yes
 check yes-value "$(yes_value no 1)$(yes_value 1 0)$(yes_value '' 1)" 011
 (
   CONF_FILE=$tmpd/none.conf NOTE_FILE=$tmpd/none OLD_CONF=$tmpd/none OLD_NOTE=$tmpd/none MIGRATE=0
   port_taken_by_other() { return 1; }
-  PORT=15346 WEB_USER= WEB_PASS= OPEN= WARP=0
+  PORT=15346 WEB_USER='' WEB_PASS='' OPEN='' WARP=0
   load_auto_choices >/dev/null
   check auto-load-port "$PORT_CHOSEN" 15346
   check auto-load-user "$USER_CHOSEN" admin
@@ -226,6 +226,77 @@ check yes-value "$(yes_value no 1)$(yes_value 1 0)$(yes_value '' 1)" 011
   check auto-warp-default "$WARP_CHOSEN" 1
 ) || fail=1
 check auto-bad-port "$(PORT=22; CONF_FILE=$tmpd/none.conf OLD_CONF=$tmpd/none; (load_auto_choices) >/dev/null 2>&1 && echo yes || echo no)" no
+
+# 同一时间只能跑一份：mkdir 锁 + 进程号
+LOCK_DIR=$tmpd/lock
+if lock_try; then got=yes; else got=no; fi
+check lock-get "$got" yes
+check lock-pid "$(cat "$LOCK_DIR/pid")" "$$"
+check lock-again-self "$(yes_no x lock_try)" yes
+other=$(YTD_TEST=1 YTD_LOCK_DIR=$LOCK_DIR sh -c '. ./install.sh; if lock_try; then echo got; else echo "busy $LOCK_OTHER"; fi')
+check lock-other-busy "$other" "busy $$"
+msg=$(YTD_TEST=1 YTD_LOCK_DIR=$LOCK_DIR sh -c '. ./install.sh; lock_or_quit; echo should-not-run' 2>&1)
+has_msg=no
+case "$msg" in *"已经有一个安装在进行（进程号 $$），等它结束再运行"*) has_msg=yes ;; esac
+check lock-quit-msg "$has_msg" yes
+check lock-quit-norun "$(printf '%s' "$msg" | grep -c should-not-run)" 0
+lock_release
+check lock-release "$(yes_no x test -d "$LOCK_DIR")" no
+# 残留：锁里的进程已经不在了，自动清掉
+mkdir "$LOCK_DIR" && printf '999999\n' > "$LOCK_DIR/pid"
+if lock_try; then got=yes; else got=no; fi
+check lock-stale "$got" yes
+check lock-stale-pid "$(cat "$LOCK_DIR/pid")" "$$"
+lock_release
+# 残留：锁目录里没有进程号
+mkdir "$LOCK_DIR"
+if lock_try; then got=yes; else got=no; fi
+check lock-empty "$got" yes
+lock_release
+check lock-empty-free "$(yes_no x test -d "$LOCK_DIR")" no
+# 正常退出、出错退出、Ctrl+C 都会删锁
+YTD_TEST=1 YTD_LOCK_DIR=$LOCK_DIR sh -c '. ./install.sh; lock_or_quit; [ -d "$LOCK_DIR" ] && exit 0; exit 5'
+check lock-exit-code "$?" 0
+check lock-exit-free "$(yes_no x test -d "$LOCK_DIR")" no
+YTD_TEST=1 YTD_LOCK_DIR=$LOCK_DIR sh -c '. ./install.sh; lock_or_quit; die "出错了"' 2>/dev/null
+check lock-die-free "$(yes_no x test -d "$LOCK_DIR")" no
+YTD_TEST=1 YTD_LOCK_DIR=$LOCK_DIR sh -c '. ./install.sh; lock_or_quit; kill -INT $$; sleep 5; exit 0' >/dev/null 2>&1
+check lock-ctrlc-code "$?" 130
+check lock-ctrlc-free "$(yes_no x test -d "$LOCK_DIR")" no
+YTD_TEST=1 YTD_LOCK_DIR=$LOCK_DIR sh -c '. ./install.sh; lock_or_quit; kill -TERM $$; sleep 5; exit 0' >/dev/null 2>&1
+check lock-term-free "$(yes_no x test -d "$LOCK_DIR")" no
+# 8 份同时抢锁，只能有 1 份拿到
+for i in 1 2 3 4 5 6 7 8; do
+  YTD_TEST=1 YTD_LOCK_DIR=$LOCK_DIR sh -c '. ./install.sh; if lock_try; then echo got; sleep 2; lock_release; fi' >> "$tmpd/race" 2>/dev/null &
+done
+wait
+check lock-race "$(grep -c got "$tmpd/race")" 1
+check lock-race-free "$(yes_no x test -d "$LOCK_DIR")" no
+# 只读的 --status / --log 不拿锁（main 里在它们之后才加锁）
+check lock-after-readonly "$(sed -n '/^main() {/,/^}/p' install.sh | awk '/print_log 80/{a=NR} /lock_or_quit/{b=NR} END{print (a && b && a < b) ? "yes" : "no"}')" yes
+
+# apt 被别的程序占着时先等
+fp=$tmpd/proc
+mkdir -p "$fp/100" "$fp/200"
+printf 'bash\n' > "$fp/100/comm"
+printf 'unattended-upgr\n' > "$fp/200/comm"
+printf '/usr/bin/python3\000/usr/share/unattended-upgrades/unattended-upgrade-shutdown\000--wait-for-signal\000' > "$fp/200/cmdline"
+check apt-free "$(YTD_PROC_DIR=$fp; yes_no x apt_busy_pid)" no
+mkdir -p "$fp/300"
+printf 'dpkg\n' > "$fp/300/comm"
+check apt-busy-dpkg "$(YTD_PROC_DIR=$fp apt_busy_pid)" 300
+rm -rf "$fp/300"
+mkdir -p "$fp/400"
+printf 'unattended-upgr\n' > "$fp/400/comm"
+printf '/usr/bin/python3\000/usr/bin/unattended-upgrade\000' > "$fp/400/cmdline"
+check apt-busy-uu "$(YTD_PROC_DIR=$fp apt_busy_pid)" 400
+out=$(YTD_PROC_DIR=$fp YTD_APT_WAIT=2 YTD_APT_STEP=1 wait_apt_free; echo "rc=$?")
+check apt-wait-timeout "$(printf '%s' "$out" | grep -c '等了 2 秒')$(printf '%s' "$out" | grep -o 'rc=[0-9]')" "1rc=1"
+( sleep 1; rm -rf "$fp/400" ) &
+out=$(YTD_PROC_DIR=$fp YTD_APT_WAIT=10 YTD_APT_STEP=1 wait_apt_free; echo "rc=$?")
+wait
+check apt-wait-done "$(printf '%s' "$out" | grep -c '先等它结束')$(printf '%s' "$out" | grep -c '结束了，继续')$(printf '%s' "$out" | grep -o 'rc=[0-9]')" "11rc=0"
+check apt-wait-none "$(YTD_PROC_DIR=$fp YTD_APT_WAIT=10 wait_apt_free; echo "rc=$?")" "rc=0"
 
 # 加一行、删一行 fstab
 ft=$tmpd/fstab

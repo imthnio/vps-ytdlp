@@ -82,7 +82,7 @@ has playlist "$(add 'https://www.youtube.com/playlist?list=PL123')" '播放列�
 id=$(add 'https://www.youtube.com/watch?v=okokokokoko' | job_id)
 [ -n "$id" ] && ok add || bad add
 js=$(wait_job "$id")
-has done "$js" '"state":"done"'
+has 'done' "$js" '"state":"done"'
 has has-file "$js" '"has_file":true'
 (cd "$T/mac" && $C -b "$J" -D "$T/headers" -OJ "$B/dl/$id")
 f=$(ls "$T/mac")
