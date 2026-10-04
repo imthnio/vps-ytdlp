@@ -33,7 +33,7 @@
 #   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=2.1.1
+VERSION=2.1.2
 # ytdlp-onekey-begin
 
 #----------------------------------------------------------------------
@@ -168,10 +168,169 @@ lock_or_quit() {
   if ! lock_try; then
     die "已经有一个安装在进行（进程号 ${LOCK_OTHER:-未知}），等它结束再运行。"
   fi
-  trap 'lock_release' EXIT
-  trap 'lock_release; exit 129' HUP
-  trap 'lock_release; printf "\n"; exit 130' INT
-  trap 'lock_release; exit 143' TERM
+  set_quit_traps
+}
+
+# 安装脚本退出时（正常结束、出错、按 Ctrl+C）都要做的收尾：撤掉「正在升级」的牌子，放开锁。
+quit_cleanup() {
+  upgrade_flag_clear
+  lock_release
+}
+
+set_quit_traps() {
+  trap 'quit_cleanup' EXIT
+  trap 'quit_cleanup; exit 129' HUP
+  trap 'quit_cleanup; printf "\n"; exit 130' INT
+  trap 'quit_cleanup; exit 143' TERM
+}
+
+#----------------------------------------------------------------------
+# 升级时不打断正在下的视频。
+#   做法：先在 $DATA/state/upgrading 挂一块「正在升级」的牌子（里面写安装脚本的进程号），
+#   网页服务看到牌子就不再开始新的任务（排队的先等着，重启后自动接着下；新贴的链接照收），
+#   脚本等「正在下载的」和「正在传给浏览器的」都结束了，才停掉网页服务、换新版本、再启动。
+#   已经下好、还没传到 Mac 的文件记在硬盘上，重启以后照样在，浏览器会接着自动保存。
+#   安装脚本中途退出时，牌子会被撤掉；就算没撤掉，网页服务发现那个进程号已经不在了，也会当它不存在。
+#----------------------------------------------------------------------
+UPGRADE_FLAG=
+
+upgrade_data_dir() {
+  d=$(config_get data 2>/dev/null || true)
+  [ -n "$d" ] || d=${DATA:-/var/lib/ytdlp-web}
+  printf '%s\n' "$d"
+}
+
+upgrade_flag_set() {
+  dd=$(upgrade_data_dir)
+  [ -d "$dd/state" ] || return 0
+  UPGRADE_FLAG=$dd/state/upgrading
+  printf '%s\n' "$$" > "$UPGRADE_FLAG" 2>/dev/null || UPGRADE_FLAG=
+}
+
+upgrade_flag_clear() {
+  if [ -n "${UPGRADE_FLAG:-}" ]; then
+    rm -f "$UPGRADE_FLAG"
+    UPGRADE_FLAG=
+  fi
+}
+
+# 网页服务在不在跑（看它自己记下的进程号）。
+web_running() {
+  dd=${1:-$(upgrade_data_dir)}
+  [ -f "$dd/state/server.pid" ] || return 1
+  pid=$(tr -cd '0-9' < "$dd/state/server.pid")
+  pid_alive "$pid"
+}
+
+# 数一数网页服务手上的活。打印四个数：
+#   正在下载的  排队的  正在传给浏览器的  刚下好、浏览器马上就会来拿的
+# 「刚下好」指下好不到 FRESH_SECS 秒（默认 45 秒）、一个字节都还没传的：网页开着的话，
+# 1～2 秒内浏览器就会来拿，等一下免得刚好在重启那一刻来拿、浏览器报「下载失败」。
+# 下好很久都没人拿的（网页没开），不用等：文件在硬盘上，重启后照样在，打开网页会接着自动保存。
+count_busy() {
+  jd=${1:-$(upgrade_data_dir)/jobs}
+  nr=0
+  nq=0
+  ns=0
+  nf=0
+  now=$(date +%s)
+  for d in "$jd"/*; do
+    [ -d "$d" ] || continue
+    st=$(sed -n 's/^state=//p' "$d/status" 2>/dev/null | head -n 1)
+    case "$st" in
+      running) nr=$((nr + 1)) ;;
+      queued|'') nq=$((nq + 1)) ;;
+      done)
+        da=$(sed -n 's/^done_at=//p' "$d/status" | head -n 1 | tr -cd '0-9')
+        if [ -n "$da" ] && [ $((now - da)) -lt "${FRESH_SECS:-45}" ] && [ ! -s "$d/sent" ] &&
+          [ -n "$(sed -n 's/^file=//p' "$d/status" | head -n 1)" ]; then
+          nf=$((nf + 1))
+        fi
+        ;;
+    esac
+    for a in "$d"/active.*; do
+      [ -e "$a" ] || continue
+      pid_alive "${a##*.}" && ns=$((ns + 1))
+    done
+  done
+  printf '%s %s %s %s\n' "$nr" "$nq" "$ns" "$nf"
+}
+
+# 正在下载的那几个，一行一个：标题（进度）
+busy_lines() {
+  jd=${1:-$(upgrade_data_dir)/jobs}
+  for d in "$jd"/*; do
+    [ -f "$d/status" ] || continue
+    [ "$(sed -n 's/^state=//p' "$d/status" | head -n 1)" = running ] || continue
+    t=$(sed -n 's/^title=//p' "$d/status" | head -n 1)
+    [ -n "$t" ] || t=$(sed -n 's/^url=//p' "$d/meta" 2>/dev/null | head -n 1)
+    p=$(sed -n 's/^pct=//p' "$d/status" | head -n 1)
+    printf '    %s（%s%%）\n' "$(printf '%s' "$t" | cut -c1-60)" "${p:-0}"
+  done
+}
+
+# 等网页服务手上的活干完。最多等 WAIT_MAX_SECS 秒（默认 30 分钟）。
+# 不想等：FORCE_RESTART=1，或者等的时候按 Ctrl+C（只是不等了，安装会接着做完）。
+wait_for_idle() {
+  dd=$(upgrade_data_dir)
+  [ -d "$dd/jobs" ] || return 0
+  web_running "$dd" || return 0
+  if [ "${FORCE_RESTART:-0}" = 1 ]; then
+    say_warn "FORCE_RESTART=1：不等正在下载的视频，直接重启（正在下的会被打断，重启后点「再试一次」）。"
+    return 0
+  fi
+  upgrade_flag_set
+  # 网页服务每秒看一次牌子。等它看到，免得刚好又开始一个新任务。
+  sleep "${WAIT_SETTLE_SECS:-2}"
+  max=${WAIT_MAX_SECS:-1800}
+  step=${WAIT_STEP_SECS:-5}
+  waited=0
+  shown=0
+  SKIP_WAIT=0
+  while :; do
+    # shellcheck disable=SC2046
+    set -- $(count_busy "$dd/jobs")
+    nr=$1 nq=$2 ns=$3 nf=$4
+    if [ "$nr" -eq 0 ] && [ "$ns" -eq 0 ] && [ "$nf" -eq 0 ]; then
+      [ "$shown" = 1 ] && say_ok "都下完了，现在重启网页服务。"
+      break
+    fi
+    if [ "$shown" = 0 ]; then
+      shown=1
+      trap 'SKIP_WAIT=1' INT
+      if [ "$nr" -gt 0 ]; then
+        say_step "有 ${nr} 个视频正在下载，等它们下完再重启……"
+      elif [ "$ns" -gt 0 ]; then
+        say_step "有 ${ns} 个文件正在传到 Mac，等传完再重启……"
+      else
+        say_step "有 ${nf} 个视频刚下好，等浏览器拿走再重启……"
+      fi
+      [ "$nq" -gt 0 ] && printf '%s\n' "另外 ${nq} 个排队的先等着，重启后会自动接着下。"
+      printf '%s\n' "最多等 $((max / 60)) 分钟。不想等、马上重启（正在下的会被打断）：按 Ctrl+C。"
+      printf '%s\n' "以后想不等直接升级：FORCE_RESTART=1 ytdlp-web"
+    fi
+    if [ "$SKIP_WAIT" = 1 ]; then
+      printf '\n'
+      say_warn "不等了，马上重启。被打断的视频，重启后在网页上点「再试一次」。"
+      break
+    fi
+    if ! web_running "$dd"; then
+      say_warn "网页服务自己停了，不用再等。"
+      break
+    fi
+    if [ "$waited" -ge "$max" ]; then
+      say_warn "等了 $((max / 60)) 分钟还没下完，先重启。被打断的视频，重启后在网页上点「再试一次」。"
+      break
+    fi
+    if [ $((waited % 30)) -eq 0 ]; then
+      printf '%s\n' "  已经等了 $((waited / 60)) 分 $((waited % 60)) 秒：正在下 ${nr} 个，正在传到 Mac ${ns} 个"
+      busy_lines "$dd/jobs"
+    fi
+    sleep "$step" || true
+    waited=$((waited + step))
+  done
+  if [ "$LOCK_HELD" = 1 ]; then set_quit_traps; else trap - INT; fi
+  return 0
 }
 
 #----------------------------------------------------------------------
@@ -1320,9 +1479,9 @@ install_static_ffmpeg() {
     rm -rf "$dir"
     return 1
   fi
-  cp "$ff" /usr/local/bin/ffmpeg
-  cp "$fp" /usr/local/bin/ffprobe
-  chmod 755 /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+  # 先拷成新文件再改名替换：正在下载的任务还在用旧的 ffmpeg 也不怕（直接覆盖会报「文件忙」）。
+  place_elf "$ff" /usr/local/bin/ffmpeg || { rm -rf "$dir"; return 1; }
+  place_elf "$fp" /usr/local/bin/ffprobe || { rm -rf "$dir"; return 1; }
   mkdir -p "$CONF_DIR"
   printf '%s\n' static > "$CONF_DIR/ffmpeg-static"
   rm -rf "$dir"
@@ -1489,8 +1648,7 @@ install_qjs() {
   placed=$(place_and_test_qjs "$tmp" "$errf" || true)
   rm -f "$tmp"
   if [ -n "$placed" ]; then
-    if [ "$placed" != /usr/local/bin/qjs ] && cp "$placed" /usr/local/bin/qjs 2>/dev/null; then
-      chmod 755 /usr/local/bin/qjs 2>/dev/null || true
+    if [ "$placed" != /usr/local/bin/qjs ] && place_elf "$placed" /usr/local/bin/qjs 2>/dev/null; then
       if qjs_eval_ok /usr/local/bin/qjs; then
         placed=/usr/local/bin/qjs
       fi
@@ -2167,7 +2325,7 @@ use POSIX qw(:sys_wait_h setsid strftime setlocale LC_ALL);
 use Fcntl qw(:flock O_WRONLY O_CREAT O_APPEND);
 use File::Path qw(make_path remove_tree);
 
-my $VERSION = '2.1.1';
+my $VERSION = '2.1.2';
 setlocale(LC_ALL, 'C');
 $SIG{PIPE} = 'IGNORE';
 
@@ -2738,7 +2896,7 @@ sub job_view {
   my $sent_at = $delivered ? ((stat(job_dir($id) . '/sent'))[9] || 0) : 0;
   my $hidden = $st->{dismissed} || ($delivered && time - $sent_at > 15) ? 1 : 0;
   if ($state eq 'queued') {
-    $line = '排队中，前面的下完就轮到它';
+    $line = upgrading() ? '服务器正在升级，等一会儿会自动开始' : '排队中，前面的下完就轮到它';
   } elsif ($state eq 'done') {
     if ($delivered) {
       $line = '✅ 已存到 Mac 的「下载」文件夹';
@@ -2798,6 +2956,18 @@ sub check_url {
     return (undef, '这是小红书个人主页的链接。请点进某一篇笔记，再「分享 → 复制链接」。');
   }
   return (clean_link($u), '');
+}
+
+# 安装脚本升级时会挂一块牌子 $STATE/upgrading（里面是安装脚本的进程号）。
+# 牌子在、那个进程也还活着，就先不开始新任务，也不做每天的 yt-dlp 更新：
+# 正在下的照常下完，安装脚本等它下完才重启。新贴的链接照收，排着队，重启后自动开始。
+# 安装脚本早就退出了（进程号不在了）或者牌子挂了 3 小时以上，就当没有这块牌子。
+sub upgrading {
+  my $f = "$STATE/upgrading";
+  my @s = stat($f) or return 0;
+  my $pid = ((slurp($f) || '') =~ /(\d+)/) ? $1 : 0;
+  return 0 unless $pid && time - $s[9] < 3 * 3600;
+  return (kill(0, $pid) || $!{EPERM}) ? 1 : 0;
 }
 
 sub add_job {
@@ -3063,7 +3233,9 @@ sub handle {
     my $f = parse_form($r->{body});
     if ($p eq '/api/add') {
       my ($id, $why) = add_job($f->{url}, $f->{q});
-      return respond_json($c, $r, 200, $id ? { ok => bool(1), id => $id } : { error => $why });
+      my %ok = (ok => bool(1), id => $id);
+      $ok{note} = '收到了。服务器正在升级，等正在下的视频下完会自动重启，这个会在重启后自动开始下载，不用管。' if $id && upgrading();
+      return respond_json($c, $r, 200, $id ? \%ok : { error => $why });
     }
     if ($p eq '/api/delete') {
       my $id = $f->{id};
@@ -3126,6 +3298,7 @@ sub server_info {
     grace_min  => num(int(($C{grace} + 59) / 60)),
     free       => disk_free_mb($DATA) >= 0 ? human_size(disk_free_mb($DATA) * 1048576) : '',
     version    => $VERSION,
+    upgrading  => bool(upgrading()),
   };
 }
 
@@ -3574,6 +3747,8 @@ sub run_ytdlp {
 }
 
 # yt-dlp 每天自己更新一次。YouTube 经常改，旧版本很快就不能用。
+# yt-dlp 自己的 -U 是先下好新文件再改名换上，正在跑的旧 yt-dlp 不受影响。
+# 而且它只在「跑腿」进程里、没有视频在下的时候做（见主循环和 run_job 开头）。
 sub update_ytdlp {
   my ($why) = @_;
   logline("检查 yt-dlp 更新（$why）");
@@ -4033,6 +4208,7 @@ sub page_app {
 <div class="row"><button type="submit" id="go">开始</button><span class="small">第一次自动保存时，Safari 会问「是否允许下载」，请点「允许」。</span></div>
 <div class="msg" id="msg"></div>
 </form>
+<div class="msg" id="upg"></div>
 <div id="jobs"></div>
 <details class="card" id="ck"><summary>被拦住了？上传 cookies（最后一招）</summary>
 <div id="ckstate" class="small"></div>
@@ -4090,13 +4266,15 @@ $('#f').onsubmit=async e=>{e.preventDefault();const url=$('#url').value.trim();
  if(!url){say($('#msg'),'先把视频链接（或整段分享文字）粘贴到上面的框里。',1);return;}
  const q=document.querySelector('input[name=q]:checked').value;localStorage.setItem('ytw_q',q);$('#go').disabled=true;
  try{const r=await api('/api/add',{url,q});if(r.error){say($('#msg'),r.error,1);}else{mine.add(r.id);keep();$('#url').value='';
-  say($('#msg'),'收到了！下面能看到进度。下好以后会自动存到 Mac，不用一直盯着。');tick();}}
- catch(err){say($('#msg'),'连不上服务器，请检查网络后再试。',1);}finally{$('#go').disabled=false;}};
+  say($('#msg'),r.note||'收到了！下面能看到进度。下好以后会自动存到 Mac，不用一直盯着。');tick();}}
+ catch(err){say($('#msg'),'暂时连不上服务器。可能正在升级重启，等半分钟再点一次「开始」；一直不行再检查网络。',1);}finally{$('#go').disabled=false;}};
 function saveFile(id){const a=document.createElement('a');a.href='/dl/'+id;a.download='';document.body.appendChild(a);a.click();a.remove();}
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
 // 已经存到 Mac 的：亮 1.5 秒 ✅，然后告诉服务器收起来，卡片消失。
 function dismiss(id){if(closing.has(id))return;closing.add(id);setTimeout(async()=>{try{await api('/api/dismiss',{id});}catch(e){}tick();},1500);}
+// 服务器升级时显示一句安心的话；连不上（正在重启那几秒）时不报错，过一会儿自动接着刷新。
 function render(d){const box=$('#jobs');box.textContent='';
+ const u=$('#upg');if(d.info&&d.info.upgrading)say(u,'服务器正在升级：正在下载的会先下完，然后自动重启，排队的重启后自动接着下。不用管，也不用刷新网页。');else{u.className='msg';u.textContent='';}
  for(const j of d.jobs){const c=el('div','card job');c.appendChild(el('div','t',j.title||j.url));
   c.appendChild(el('div','small',(j.plat?j.plat+' · ':'')+j.quality+(j.size?' · '+j.size:'')));
   if(j.state==='error'){c.appendChild(el('div','err',j.error));}
@@ -4192,7 +4370,10 @@ sub main {
       delete $handlers{$k};
       if ($k == $runner) { $runner = 0; $runner_job = ''; }
     }
-    if (!$runner) {
+    # 每天的 yt-dlp 更新也在这里排队：和下载是同一个「跑腿」进程一件一件做，
+    # 所以更新时一定没有视频在下，不会把 yt-dlp 换掉在正在下的任务脚下。
+    # 安装脚本在升级（挂了牌子）时，什么新活都先不派。
+    if (!$runner && !upgrading()) {
       my ($next) = grep { (job_stat($_)->{state} || 'queued') eq 'queued' } list_jobs();
       my $task = $next ? "job:$next" : (update_due($C{update_hours}) ? 'update' : '');
       if ($task) {
@@ -5240,6 +5421,8 @@ do_install() {
   fi
 
   say_step "放好网页服务"
+  # 有视频正在下载时，先等它下完再重启，不打断。
+  wait_for_idle
   stop_service
   [ "$MIGRATE" = 1 ] && stop_old_service
   write_server
@@ -5267,6 +5450,7 @@ do_install() {
   fi
 
   say_step "启动"
+  upgrade_flag_clear
   start_service || true
   if ! health_ok "$port"; then
     show_fail_log
@@ -5299,8 +5483,11 @@ reset_password_only() {
   chmod 600 "$tmp"
   mv "$tmp" "$CONF_FILE"
   write_install_note "$USER_CHOSEN" "$pass" "$PORT_CHOSEN"
+  # 先等正在下的视频下完（等的时候网页还能用），再让旧登录失效、重启。
+  wait_for_idle
   rm -f "$DATA/state/sessions"
   stop_service
+  upgrade_flag_clear
   start_service || true
   health_ok "$PORT_CHOSEN" || { show_fail_log; die "网页没能重新启动。"; }
   say_ok "密码换好了。登录名字：${USER_CHOSEN}    新密码：${pass}"

@@ -106,7 +106,7 @@ check newer "$(yes_no x version_newer 2.0.1 2.0.0)" yes
 check newer-equal "$(yes_no x version_newer 2.0.0 2.0.0)" no
 check newer-major "$(yes_no x version_newer 2.0.0 1.9.9)" yes
 check ver-file "$(version_from_file ./install.sh)" "$VERSION"
-check ver-211 "$VERSION" 2.1.1
+check ver-212 "$VERSION" 2.1.2
 check newer-211 "$(yes_no x version_newer 2.1.1 2.1.0)" yes
 # 网页服务里的版本号要和脚本一致（网页 /health 会显示它）
 check ver-server "$(sed -n "s/^my \$VERSION = '\(.*\)';/\1/p" install.sh)" "$VERSION"
@@ -345,6 +345,107 @@ if command -v perl >/dev/null 2>&1; then
   done
   printf 'ok server-modules (%s)\n' "$mods"
 fi
+
+# 升级时等正在下载的视频下完再重启
+wd=$tmpd/wait
+mkjob() {
+  mkdir -p "$wd/jobs/$1"
+  printf '%s\n' "$2" > "$wd/jobs/$1/status"
+}
+mkdir -p "$wd/state"
+mkjob a 'state=running
+title=长视频
+pct=42'
+mkjob b 'state=queued'
+mkdir -p "$wd/jobs/c"
+mkjob d 'state=error'
+mkjob e "state=done
+file=x.mp4
+done_at=$(date +%s)"
+mkjob f "state=done
+file=y.mp4
+done_at=$(( $(date +%s) - 3600 ))"
+mkjob g "state=done
+file=z.mp4
+done_at=$(date +%s)"
+printf '0 10\n' > "$wd/jobs/g/sent"
+sleep 30 &
+live=$!
+: > "$wd/jobs/f/active.$live"
+: > "$wd/jobs/d/active.999999"
+check busy-count "$(count_busy "$wd/jobs")" "1 2 1 1"
+check busy-lines "$(busy_lines "$wd/jobs")" "    长视频（42%）"
+check busy-empty "$(count_busy "$tmpd/nojobs")" "0 0 0 0"
+check busy-fresh-old "$(FRESH_SECS=0 count_busy "$wd/jobs")" "1 2 1 0"
+kill "$live" 2>/dev/null
+wait "$live" 2>/dev/null
+check busy-dead-transfer "$(count_busy "$wd/jobs")" "1 2 0 1"
+rm -rf "$wd/jobs/e" "$wd/jobs/f" "$wd/jobs/g" "$wd/jobs/d"
+
+# 网页服务没在跑：不用等
+waitrun() {
+  YTD_TEST=1 CONF_FILE=$tmpd/none.conf DATA=$wd WAIT_SETTLE_SECS=0 WAIT_STEP_SECS=1 "$@"
+}
+out=$(waitrun sh -c '. ./install.sh; wait_for_idle; echo end' 2>&1)
+check wait-no-server "$out" end
+# 网页服务在跑，正在下的 2 秒后下完：要等，要说人话，要挂牌子，等完撤牌子
+# 假的网页服务：一个不是本脚本子进程的 sleep（停掉以后不会留下僵尸进程）
+srv=$(sh -c 'sleep 60 >/dev/null 2>&1 & echo $!')
+printf '%s\n' "$srv" > "$wd/state/server.pid"
+( sleep 2; printf 'state=done\nfile=x.mp4\ndone_at=1\n' > "$wd/jobs/a/status" ) &
+flip=$!
+out=$(waitrun sh -c '. ./install.sh; wait_for_idle; [ -f "$DATA/state/upgrading" ] && echo flag=$(cat "$DATA/state/upgrading") me=$$; upgrade_flag_clear; [ -f "$DATA/state/upgrading" ] || echo cleared' 2>&1)
+wait "$flip"
+case "$out" in *'有 1 个视频正在下载，等它们下完再重启……'*) w=yes ;; *) w=no ;; esac
+check wait-msg "$w" yes
+case "$out" in *'另外 2 个排队的先等着'*) w=yes ;; *) w=no ;; esac
+check wait-queued-msg "$w" yes
+case "$out" in *'长视频（42%）'*) w=yes ;; *) w=no ;; esac
+check wait-progress "$w" yes
+case "$out" in *'按 Ctrl+C'*'FORCE_RESTART=1'*) w=yes ;; *) w=no ;; esac
+check wait-skip-hint "$w" yes
+case "$out" in *'都下完了'*) w=yes ;; *) w=no ;; esac
+check wait-done "$w" yes
+check wait-flag-pid "$(printf '%s\n' "$out" | sed -n 's/^flag=\([0-9]*\) me=\([0-9]*\)$/\1=\2/p' | awk -F= '{print ($1 == $2) ? "same" : "diff"}')" same
+case "$out" in *cleared*) w=yes ;; *) w=no ;; esac
+check wait-flag-cleared "$w" yes
+# 退出时（包括出错退出）自动撤牌子
+printf 'state=running\n' > "$wd/jobs/a/status"
+YTD_LOCK_DIR=$tmpd/lk FORCE_RESTART=0 WAIT_MAX_SECS=0 waitrun sh -c '. ./install.sh; lock_or_quit; wait_for_idle; die "出错了"' >/dev/null 2>&1
+check wait-flag-exit "$(yes_no x test -e "$wd/state/upgrading")" no
+check wait-lock-exit "$(yes_no x test -e "$tmpd/lk")" no
+# 一直下不完：等到上限就不等了
+start=$(date +%s)
+out=$(WAIT_MAX_SECS=2 waitrun sh -c '. ./install.sh; wait_for_idle; echo end' 2>&1)
+case "$out" in *'还没下完，先重启'*end) w=yes ;; *) w=no ;; esac
+check wait-timeout "$w" yes
+check wait-timeout-fast "$(( $(date +%s) - start < 10 ))" 1
+rm -f "$wd/state/upgrading"
+# FORCE_RESTART=1：完全不等，也不挂牌子
+out=$(FORCE_RESTART=1 waitrun sh -c '. ./install.sh; wait_for_idle; echo end' 2>&1)
+case "$out" in *FORCE_RESTART=1*end) w=yes ;; *) w=no ;; esac
+check wait-force "$w" yes
+check wait-force-noflag "$(yes_no x test -e "$wd/state/upgrading")" no
+# 等的时候按 Ctrl+C：不等了，安装接着往下做（不是整个退出）
+out=$(YTD_LOCK_DIR=$tmpd/lk2 WAIT_MAX_SECS=60 waitrun sh -c '. ./install.sh; lock_or_quit; ( sleep 2; kill -INT $$ ) & wait_for_idle; echo after-wait; kill -INT $$; sleep 3; echo not-here' 2>&1)
+case "$out" in *'不等了，马上重启'*after-wait*) w=yes ;; *) w=no ;; esac
+check wait-ctrl-c "$w" yes
+case "$out" in *not-here*) w=no ;; *) w=yes ;; esac
+check wait-ctrl-c-restores-trap "$w" yes
+check wait-ctrl-c-lock "$(yes_no x test -e "$tmpd/lk2")" no
+# 网页服务在等的时候自己停了：不再等
+( sleep 2; kill "$srv" ) &
+flip=$!
+out=$(WAIT_MAX_SECS=60 waitrun sh -c '. ./install.sh; wait_for_idle; echo end' 2>&1)
+wait "$flip"
+case "$out" in *'网页服务自己停了'*end) w=yes ;; *) w=no ;; esac
+check wait-server-gone "$w" yes
+# 升级流程里，先等再停服务；改密码重启也一样
+check wait-before-stop "$(sed -n '/^do_install() {/,/^}/p' install.sh | awk '/wait_for_idle/{a=NR} /stop_service/{if(!b)b=NR} END{print (a && b && a < b) ? "yes" : "no"}')" yes
+check wait-before-stop-pw "$(sed -n '/^reset_password_only() {/,/^}/p' install.sh | awk '/wait_for_idle/{a=NR} /stop_service/{if(!b)b=NR} END{print (a && b && a < b) ? "yes" : "no"}')" yes
+check flag-clear-before-start "$(sed -n '/^do_install() {/,/^}/p' install.sh | awk '/upgrade_flag_clear/{a=NR} /start_service/{if(!b)b=NR} END{print (a && b && a < b) ? "yes" : "no"}')" yes
+# 换 ffmpeg / qjs 时先拷新文件再改名，不直接覆盖正在用的
+check ffmpeg-atomic "$(grep -c 'cp "$ff" /usr/local/bin/ffmpeg\|cp "$placed" /usr/local/bin/qjs' install.sh)" 0
 
 rm -rf "$tmpd"
 if [ "$fail" -ne 0 ]; then
