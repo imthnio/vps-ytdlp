@@ -112,7 +112,7 @@ if version_newer 1.0.0 1.0.0; then
 else
   printf 'ok version-equal\n'
 fi
-check ver-file "$(version_from_file ./install.sh)" 1.0.2
+check ver-file "$(version_from_file ./install.sh)" 1.0.3
 if remote_script_ok ./install.sh; then
   printf 'ok script-marker\n'
 else
@@ -217,6 +217,64 @@ ask_menu ASK_MENU 1 2 <<EOF
 2
 EOF
 check ask-menu "$ASK_MENU" 2
+
+check queue-keep-big "$(queue_choice_for 2 2048)" 2
+check queue-keep-small "$(queue_choice_for 2 64)" 1
+check queue-keep-one "$(queue_choice_for 1 2048)" 1
+check queue-keep-empty "$(queue_choice_for '' 2048)" 1
+
+ready_dir=$(mktemp -d)
+ready_bin=$ready_dir/yt-dlp-webui
+ready_cfg=$ready_dir/config.yml
+printf '#!/bin/sh\nexit 0\n' > "$ready_bin"
+chmod 755 "$ready_bin"
+write_config "$ready_cfg" 8080 admin '$2y$05$abc/DEF.ghi' /usr/local/bin/yt-dlp-one 'quickjs:/usr/local/bin/qjs' 1 /var/lib/yt-dlp-webui /root/youtube /usr/local/share/yt-dlp-webui
+if grep -q 'frontend_path: "/usr/local/share/yt-dlp-webui"' "$ready_cfg"; then
+  printf 'ok cfg-frontend\n'
+else
+  printf 'FAIL cfg-frontend\n' >&2
+  fail=1
+fi
+YTD_CONFIG_FILE=$ready_cfg
+YTD_WEBUI_BIN=$ready_bin
+if install_ready; then
+  printf 'ok install-ready\n'
+else
+  printf 'FAIL install-ready\n' >&2
+  fail=1
+fi
+MEM_MB=2048
+if load_saved_choices; then
+  printf 'ok load-saved\n'
+else
+  printf 'FAIL load-saved\n' >&2
+  fail=1
+fi
+check saved-port "$PORT_CHOSEN" 8080
+check saved-user "$USER_CHOSEN" admin
+check saved-dir "$DIR_CHOSEN" /root/youtube
+check saved-queue "$QUEUE_CHOSEN" 1
+check saved-open "$OPEN_CHOSEN" 0
+MEM_MB=64
+load_saved_choices
+check saved-queue-small "$QUEUE_CHOSEN" 1
+# 密码哈希不是 bcrypt 时，不算已经装好，要重新问。
+write_config "$ready_cfg" 8080 admin 'not-a-hash' /usr/local/bin/yt-dlp-one 'quickjs:/usr/local/bin/qjs' 2 /var/lib/yt-dlp-webui /root/youtube
+if install_ready; then
+  printf 'FAIL install-ready-bad-hash should fail\n' >&2
+  fail=1
+else
+  printf 'ok install-ready-bad-hash\n'
+fi
+rm -f "$ready_bin"
+if install_ready; then
+  printf 'FAIL install-ready-no-bin should fail\n' >&2
+  fail=1
+else
+  printf 'ok install-ready-no-bin\n'
+fi
+unset YTD_CONFIG_FILE YTD_WEBUI_BIN MEM_MB
+rm -rf "$ready_dir"
 
 if [ "$fail" -eq 0 ]; then
   printf '全部通过\n'

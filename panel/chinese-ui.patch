@@ -1,0 +1,437 @@
+diff --git a/frontend/index.html b/frontend/index.html
+index c543246..886fb80 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -1,12 +1,12 @@
+ <!DOCTYPE html>
+-<html lang="en">
++<html lang="zh-CN">
+ 
+ <head>
+     <meta charset="UTF-8">
+     <meta http-equiv="X-UA-Compatible" content="IE=edge">
+     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+     <link rel="icon" type="image/x-icon" href="./src/assets/favicon.ico">
+-    <title>yt-dlp Web UI</title>
++    <title>视频下载</title>
+ </head>
+ 
+ <body>
+diff --git a/frontend/src/Layout.tsx b/frontend/src/Layout.tsx
+index 61055e0..0d42c62 100644
+--- a/frontend/src/Layout.tsx
++++ b/frontend/src/Layout.tsx
+@@ -20,11 +20,12 @@ import Typography from '@mui/material/Typography'
+ import { grey } from '@mui/material/colors'
+ import { useAtomValue } from 'jotai'
+ import { useMemo, useState } from 'react'
+-import { Link, Outlet } from 'react-router-dom'
++import { Link, Navigate, Outlet, useLocation } from 'react-router-dom'
+ import { settingsState } from './atoms/settings'
+ import AppBar from './components/AppBar'
+ import Drawer from './components/Drawer'
+ import Footer from './components/Footer'
++import LanguageSwitcher from './components/LanguageSwitcher'
+ import Logout from './components/Logout'
+ import SocketSubscriber from './components/SocketSubscriber'
+ import ThemeToggler from './components/ThemeToggler'
+@@ -56,6 +57,8 @@ export default function Layout() {
+   const toggleDrawer = () => setOpen(state => !state)
+ 
+   const { i18n } = useI18n()
++  const location = useLocation()
++  const loggedIn = Boolean(localStorage.getItem('token'))
+ 
+   return (
+     <ThemeProvider theme={theme}>
+@@ -86,6 +89,7 @@ export default function Layout() {
+             >
+               {settings.appTitle}
+             </Typography>
++            <LanguageSwitcher />
+           </Toolbar>
+         </AppBar>
+         <Drawer variant="permanent" open={open}>
+@@ -220,7 +224,9 @@ export default function Layout() {
+           }}
+         >
+           <Toolbar />
+-          <Outlet />
++          {!loggedIn && location.pathname !== '/login'
++            ? <Navigate to="/login" replace />
++            : <Outlet />}
+         </Box>
+       </Box>
+       <Footer />
+diff --git a/frontend/src/assets/i18n/en_US.yaml b/frontend/src/assets/i18n/en_US.yaml
+index 0a20c08..b81fb59 100644
+--- a/frontend/src/assets/i18n/en_US.yaml
++++ b/frontend/src/assets/i18n/en_US.yaml
+@@ -83,4 +83,15 @@ keys:
+   clearCompletedButton: 'Clear completed'
+   twitchIntegrationInfo: |
+     To enable monitoring Twitch streams follow this wiki page.
+-    https://github.com/marcopiovanello/yt-dlp-web-ui/wiki/Twitch-integration
+\ No newline at end of file
++    https://github.com/marcopiovanello/yt-dlp-web-ui/wiki/Twitch-integration
++  notConnectedText: Not connected
++  loginTitle: Sign in
++  loginHint: Use the username and password from the install.
++  loginUsername: Username
++  loginPassword: Password
++  loginSubmit: Sign in
++  loginOpenId: Or use another way
++  errorTitle: Something went wrong
++  errorHint: Sign in first. If it still fails after that, open settings.
++  errorLogin: Sign in
++  errorSettings: Settings
+\ No newline at end of file
+diff --git a/frontend/src/assets/i18n/zh_CN.yaml b/frontend/src/assets/i18n/zh_CN.yaml
+index 8d17445..753c5de 100644
+--- a/frontend/src/assets/i18n/zh_CN.yaml
++++ b/frontend/src/assets/i18n/zh_CN.yaml
+@@ -49,34 +49,45 @@ keys:
+   logsTitle: '日志'
+   awaitingLogs: '正在等待日志…'
+   bulkDownload: '下载 zip 压缩包中的文件'
+-  templatesReloadInfo: To register a new template it might need a page reload.
++  templatesReloadInfo: 新模板可能要刷新页面才看得到。
+   livestreamURLInput: 直播 URL
+   livestreamStatusWaiting: 等待直播开始
+   livestreamStatusDownloading: 下载中
+   livestreamStatusCompleted: 已完成
+   livestreamStatusErrored: 发生错误
+   livestreamStatusUnknown: 未知
+-  livestreamNoMonitoring: No livestreams monitored
++  livestreamNoMonitoring: 没有正在监视的直播
+   livestreamDownloadInfo: |
+     本功能将会监控即将开始的直播流，每个进程都会传入参数：--wait-for-video 10 （重试间隔10秒）
+     如果直播已经开始，那么依然可以下载，但是不会记录下载进度。
+     直播开始后，将会转移到下载页面
+   livestreamExperimentalWarning: 实验性功能，可能存在未知Bug，请谨慎使用
+-  accentSelect: 'Accent'
+-  urlBase: URL base, for reverse proxy support (subdir), defaults to empty
+-  rpcPollingTimeTitle: RPC polling time
+-  rpcPollingTimeDescription: A lower interval results in higher CPU usage (server and client side)
+-  generalDownloadSettings: 'General Download Settings'
+-  deleteCookies: Delete Cookies
+-  noFilesFound: 'No Files Found'
+-  tableView: 'Table View'
+-  deleteSelected: 'Delete selected'
+-  subscriptionsButtonLabel: 'Subscriptions'
+-  subscriptionsEmptyLabel: 'No subscriptions'
+-  subscriptionsURLInput: 'Channel URL'
++  accentSelect: 强调色
++  urlBase: 子目录地址。用反向代理时才填，一般留空
++  rpcPollingTimeTitle: 刷新间隔
++  rpcPollingTimeDescription: 间隔越短，电脑和这台鸡越忙
++  generalDownloadSettings: 下载设置
++  deleteCookies: 删除 Cookies
++  noFilesFound: 还没有文件
++  tableView: 表格视图
++  deleteSelected: 删除选中的
++  subscriptionsButtonLabel: 订阅
++  subscriptionsEmptyLabel: 还没有订阅
++  subscriptionsURLInput: 频道地址
+   subscriptionsInfo: |
+-    Subscribes to a defined channel. Only the last video will be downloaded.
+-    The monitor job will be scheduled/triggered by a defined cron expression (defaults to every 5 minutes if left blank).
+-  cronExpressionLabel: 'Cron expression'
+-  editButtonLabel: 'Edit'
+-  newSubscriptionButton: New subscription
+\ No newline at end of file
++    订阅一个频道后，只下载最新的一个视频。
++    检查时间用 cron 表达式。留空则大约每 5 分钟看一次。
++  cronExpressionLabel: 检查时间
++  editButtonLabel: 编辑
++  newSubscriptionButton: 新建订阅
++  notConnectedText: 还没连上
++  loginTitle: 登录
++  loginHint: 用安装时记下的用户名和密码。
++  loginUsername: 用户名
++  loginPassword: 密码
++  loginSubmit: 登录
++  loginOpenId: 或者用其他方式
++  errorTitle: 页面出错了
++  errorHint: 请先登录。登录以后如果还是打不开，再去设置里看。
++  errorLogin: 去登录
++  errorSettings: 去设置
+\ No newline at end of file
+diff --git a/frontend/src/atoms/settings.ts b/frontend/src/atoms/settings.ts
+index 1e87a4f..5b0333a 100644
+--- a/frontend/src/atoms/settings.ts
++++ b/frontend/src/atoms/settings.ts
+@@ -49,8 +49,8 @@ export interface SettingsState {
+ }
+ 
+ export const languageState = atomWithStorage<Language>(
+-  'language',
+-  localStorage.getItem('language') as Language || 'english'
++  'panel-language',
++  'chinese'
+ )
+ 
+ export const themeState = atomWithStorage<Theme>(
+@@ -114,8 +114,8 @@ export const servedFromReverseProxySubDirState = atomWithStorage<string>(
+ )
+ 
+ export const appTitleState = atomWithStorage(
+-  'appTitle',
+-  localStorage.getItem('appTitle') ?? 'yt-dlp Web UI'
++  'panel-title',
++  '视频下载'
+ )
+ 
+ export const serverAddressAndPortState = atom((get) => {
+diff --git a/frontend/src/components/ErrorBoundary.tsx b/frontend/src/components/ErrorBoundary.tsx
+index 2bcee42..6024e2f 100644
+--- a/frontend/src/components/ErrorBoundary.tsx
++++ b/frontend/src/components/ErrorBoundary.tsx
+@@ -1,6 +1,8 @@
+ import ErrorIcon from '@mui/icons-material/Error'
+ import { Button, Container, SvgIcon, Typography, styled } from '@mui/material'
+-import { Link } from 'react-router-dom'
++import { useEffect } from 'react'
++import { Link, useNavigate } from 'react-router-dom'
++import { useI18n } from '../hooks/useI18n'
+ 
+ const FlexContainer = styled(Container)({
+   display: 'flex',
+@@ -20,6 +22,15 @@ const Title = styled(Typography)({
+ })
+ 
+ const ErrorBoundary: React.FC = () => {
++  const { i18n } = useI18n()
++  const navigate = useNavigate()
++
++  useEffect(() => {
++    if (!localStorage.getItem('token')) {
++      navigate('/login', { replace: true })
++    }
++  }, [navigate])
++
+   return (
+     <FlexContainer>
+       <Title fontWeight={'500'} fontSize={72} color={'gray'}>
+@@ -28,22 +39,19 @@ const ErrorBoundary: React.FC = () => {
+         </SvgIcon>
+       </Title>
+       <Title fontWeight={'500'} fontSize={36} color={'gray'}>
+-        An error occurred :\
++        {i18n.t('errorTitle')}
+       </Title>
+-      <Title fontWeight={'400'} fontSize={28} color={'gray'}>
+-        Check your settings!
++      <Title fontWeight={'400'} fontSize={22} color={'gray'}>
++        {i18n.t('errorHint')}
+       </Title>
+-      <Link to={'/settings'} >
++      <Link to={'/login'} >
+         <Button variant='contained' sx={{ mt: 2 }}>
+-          Goto Settings
++          {i18n.t('errorLogin')}
+         </Button>
+       </Link>
+-      <Typography sx={{ mt: 2 }} color={'gray'} fontWeight={500}>
+-        Or login if authentification is enabled
+-      </Typography>
+-      <Link to={'/login'} >
+-        <Button variant='contained' sx={{ mt: 2 }}>
+-          login
++      <Link to={'/settings'} >
++        <Button variant='text' sx={{ mt: 1 }}>
++          {i18n.t('errorSettings')}
+         </Button>
+       </Link>
+     </FlexContainer>
+diff --git a/frontend/src/components/SocketSubscriber.tsx b/frontend/src/components/SocketSubscriber.tsx
+index 7504383..9308fa2 100644
+--- a/frontend/src/components/SocketSubscriber.tsx
++++ b/frontend/src/components/SocketSubscriber.tsx
+@@ -1,7 +1,7 @@
+ import * as O from 'fp-ts/Option'
+ import { useEffect, useMemo } from 'react'
+ import { useNavigate } from 'react-router-dom'
+-import { take, timer } from 'rxjs'
++import { EMPTY, take, timer } from 'rxjs'
+ import { downloadsState } from '../atoms/downloads'
+ import { rpcPollingTimeState } from '../atoms/rpc'
+ import { serverAddressAndPortState } from '../atoms/settings'
+@@ -27,23 +27,32 @@ const SocketSubscriber: React.FC<Props> = () => {
+   const { pushMessage } = useToast()
+ 
+   const navigate = useNavigate()
++  const token = localStorage.getItem('token') ?? ''
+ 
+   const socketOnce$ = useMemo(() => client.socket$.pipe(take(1)), [])
+ 
+   useEffect(() => {
+-    if (!connected) {
+-      socketOnce$.subscribe(() => {
+-        setIsConnected(true)
+-        pushMessage(
+-          `${i18n.t('toastConnected')} (${serverAddressAndPort})`,
+-          "success"
+-        )
+-      })
++    if (!token && !window.location.hash.startsWith('#/login')) {
++      navigate('/login')
++    }
++  }, [navigate, token])
++
++  useEffect(() => {
++    if (!token || connected) {
++      return
+     }
+-  }, [connected])
++    const sub = socketOnce$.subscribe(() => {
++      setIsConnected(true)
++      pushMessage(
++        `${i18n.t('toastConnected')} (${serverAddressAndPort})`,
++        "success"
++      )
++    })
++    return () => sub.unsubscribe()
++  }, [connected, token])
+ 
+   useSubscription(
+-    client.socket$,
++    token ? client.socket$ : EMPTY,
+     event => {
+       if (!isRPCResponse(event)) { return }
+       if (!Array.isArray(event.result)) { return }
+@@ -62,11 +71,16 @@ const SocketSubscriber: React.FC<Props> = () => {
+     },
+     err => {
+       console.error(err)
++      if (!localStorage.getItem('token')) {
++        if (!window.location.hash.startsWith('#/login')) {
++          navigate('/login')
++        }
++        return
++      }
+       pushMessage(
+         `${i18n.t('rpcConnErr')} (${serverAddressAndPort})`,
+         "error"
+-      ),
+-        navigate(`/error`)
++      )
+     }
+   )
+ 
+diff --git a/frontend/src/index.tsx b/frontend/src/index.tsx
+index 9ec9b09..6e607d9 100644
+--- a/frontend/src/index.tsx
++++ b/frontend/src/index.tsx
+@@ -1,6 +1,7 @@
+ import { StrictMode } from 'react'
+ import { createRoot } from 'react-dom/client'
+ import { App } from './App'
++import Translator from './lib/i18n'
+ 
+ import '@fontsource/roboto/300.css'
+ import '@fontsource/roboto/400.css'
+@@ -9,10 +10,14 @@ import '@fontsource/roboto/700.css'
+ 
+ import '@fontsource/roboto-mono'
+ 
+-const root = createRoot(document.getElementById('root')!)
++async function boot() {
++  const i18n = Translator.instance
++  await i18n.setLanguage(i18n.getLanguage())
++  createRoot(document.getElementById('root')!).render(
++    <StrictMode>
++      <App />
++    </StrictMode>
++  )
++}
+ 
+-root.render(
+-  <StrictMode>
+-    <App />
+-  </StrictMode>
+-)
++void boot()
+diff --git a/frontend/src/lib/i18n.ts b/frontend/src/lib/i18n.ts
+index b9ac5a6..09ee5de 100644
+--- a/frontend/src/lib/i18n.ts
++++ b/frontend/src/lib/i18n.ts
+@@ -10,7 +10,9 @@ export default class Translator {
+   private current: string[] = []
+ 
+   constructor() {
+-    this.language = localStorage.getItem('language')?.replaceAll('"', '') ?? 'english'
++    // 不用官方的 language 键。旧面板一打开就会把 english 写进去，即使用户没选过。
++    const saved = localStorage.getItem('panel-language')?.replaceAll('"', '')
++    this.language = saved || 'chinese'
+     this.setLanguage(this.language)
+   }
+ 
+diff --git a/frontend/src/views/Login.tsx b/frontend/src/views/Login.tsx
+index d7b23a0..b514db3 100644
+--- a/frontend/src/views/Login.tsx
++++ b/frontend/src/views/Login.tsx
+@@ -18,6 +18,7 @@ import { useState } from 'react'
+ import { useNavigate } from 'react-router-dom'
+ import { serverURL } from '../atoms/settings'
+ import { useToast } from '../hooks/toast'
++import { useI18n } from '../hooks/useI18n'
+ import { ffetch } from '../lib/httpClient'
+ import { useAtomValue } from 'jotai'
+ 
+@@ -48,6 +49,7 @@ export default function Login() {
+   const navigate = useNavigate()
+ 
+   const { pushMessage } = useToast()
++  const { i18n } = useI18n()
+ 
+   const navigateAndReload = () => {
+     navigate('/')
+@@ -89,38 +91,37 @@ export default function Login() {
+       <Paper sx={{ padding: '1.5rem', minWidth: '25%' }}>
+         <Stack direction="column" spacing={2}>
+           <Title fontWeight={'700'} fontSize={32} color={'primary'}>
+-            yt-dlp WebUI
++            {i18n.t('loginTitle')}
+           </Title>
+           <Title fontWeight={'500'} fontSize={16} color={'gray'}>
+-            To configure authentication check the&nbsp;
+-            <a href='https://github.com/marcopiovanello/yt-dlp-web-ui/wiki/Authentication-methods'>wiki</a>.
++            {i18n.t('loginHint')}
+           </Title>
+           <TextField
+-            label="Username"
++            label={i18n.t('loginUsername')}
+             type="text"
+-            autoComplete="yt-dlp-webui-username"
++            autoComplete="username"
+             error={formHasError}
+             onChange={e => setUsername(e.currentTarget.value)}
+           />
+           <TextField
+-            label="Password"
++            label={i18n.t('loginPassword')}
+             type="password"
+-            autoComplete="yt-dlp-webui-password"
++            autoComplete="current-password"
+             error={formHasError}
+             onChange={e => setPassword(e.currentTarget.value)}
+           />
+           <Button variant="contained" size="large" onClick={() => login()}>
+-            Submit
++            {i18n.t('loginSubmit')}
+           </Button>
+ 
+           <Divider>
+             <Typography color={'gray'}>
+-              or use your authentication provider
++              {i18n.t('loginOpenId')}
+             </Typography>
+           </Divider>
+ 
+           <Button variant="contained" size="large" onClick={loginWithOpenId}>
+-            Login with OpenID
++            OpenID
+           </Button>
+         </Stack>
+       </Paper>
