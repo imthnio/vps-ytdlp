@@ -1,5 +1,0 @@
-中文面板基于 marcopiovanello/yt-dlp-web-ui v4.0.0 的 frontend（GPL-3.0-only）。
-改动在 chinese-ui.patch，对照该标签的 frontend 目录。
-打包后的页面是仓库里的 ui.tar.gz。安装脚本把它放到 /usr/local/share/yt-dlp-webui，并用 frontend_path 盖过程序自带的英文页面。
-
-默认中文。右上角可以换语言。还没登录时先打开登录页，不再进英文报错页。

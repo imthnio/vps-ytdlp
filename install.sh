@@ -1,26 +1,43 @@
 #!/bin/sh
 #======================================================================
-# yt-dlp 网页一键脚本
+# yt-dlp 一键脚本：在 Mac 浏览器里贴 YouTube 链接，视频自动存进 Mac
 #----------------------------------------------------------------------
-# 在 Linux 小鸡上装好 yt-dlp 的网页，Mac 浏览器打开就能下 YouTube。
-# 自动认出系统、架构、内存和硬盘，缺的组件从这台机器自己的软件源装。
-# 软件源里没有的，再下官方静态程序。
+# 在 Linux VPS（小鸡）上装好一个小网页。Mac 浏览器打开它，贴链接、点开始，
+# VPS 帮你从 YouTube 下好，马上让浏览器存进 Mac 的「下载」文件夹，
+# 传完以后自动把 VPS 上的文件删掉。VPS 上不留视频。
 #
-# 不用 Docker。Docker 自己就占满 64MB，小小鸡起不来。
-# 64MB 会先做一块硬盘上的虚拟内存，并让下载一个接一个跑，避免内存被打爆。
+# 64MB 内存也能装：不用 Docker，网页是一个只用系统自带 Perl 的小程序，
+# 内存小的机器会先做一块硬盘上的虚拟内存，下载一个接一个来。
 #
-# 安装时会用大白话问端口、登录、一次下几个、Mac 怎么打开、视频放哪。
-# 第一次除了端口，直接回车就是推荐项。已经装过再运行，直接回车就是更新到最新版本。
+#   sh install.sh                    第一次：问 5 个问题再安装。装过：回车就是更新
+#   sh install.sh --status           看看装得怎么样、密码是什么
+#   sh install.sh --log              看最近的运行记录（排查问题用）
+#   sh install.sh --reset-password   换一把登录密码
+#   sh install.sh --uninstall        卸载
 #
-#   sh install.sh
-#   sh install.sh --status
-#   sh install.sh --reset-password
-#   sh install.sh --uninstall
+# 名词小词典（看不懂下面的注释时查这里）
+#   VPS / 小鸡     你租的那台 Linux 服务器
+#   网页服务       一直在 VPS 上跑的小网页程序（server.pl），Mac 浏览器打开的就是它
+#   端口           网页地址里冒号后面的数字，例如 http://1.2.3.4:15346 里的 15346
+#   yt-dlp         真正去 YouTube 下视频的程序。YouTube 经常改，它每天自动更新
+#   ffmpeg         把画面和声音合成一个文件的程序
+#   QuickJS        很小的 JavaScript 程序。YouTube 现在要算一道 JavaScript 题才给视频
+#   PO 令牌        YouTube 用来确认“你是真浏览器”的一串码。bgutil-pot 程序会自动算
+#   WARP           Cloudflare 的免费线路。被 YouTube 拦时，换一个不被拦的出口 IP
+#   wireproxy      不用改系统网络就能连 WARP 的小程序（容器里也能用）
+#   cookies        浏览器里的登录记录。实在被拦时上传一份，yt-dlp 就像登录了你的小号
+#   虚拟内存 swap  拿一块硬盘当内存用。慢，但小内存机器不会因为内存不够被杀掉
+#   软件源         系统自带的装软件的地方（apt、apk、dnf 这些）
+#   init/启动方式  开机时负责把程序拉起来的系统部件（systemd、OpenRC 等）
+#   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=1.0.3
+VERSION=2.0.0
 # ytdlp-onekey-begin
 
+#----------------------------------------------------------------------
+# 屏幕上的颜色和几种说话方式。终端不支持颜色时就不加颜色。
+#----------------------------------------------------------------------
 if [ -t 1 ]; then
   C_RED=$(printf '\033[0;31m')
   C_GREEN=$(printf '\033[0;32m')
@@ -43,9 +60,26 @@ say_step() { printf '\n%s\n' "${C_YELLOW}>>> $*${C_NC}"; }
 die()      { say_err "$*"; exit 1; }
 
 #----------------------------------------------------------------------
-# 纯判断。测试会直接调用这些函数。
+# 东西放在哪。测试时可以用环境变量换掉。
 #----------------------------------------------------------------------
+CONF_DIR=/etc/ytdlp-web
+CONF_FILE=${YTD_CONFIG_FILE:-$CONF_DIR/web.conf}
+NOTE_FILE=$CONF_DIR/install.txt
+LIB_DIR=/usr/local/lib/ytdlp-web
+SERVER_FILE=${YTD_SERVER_FILE:-$LIB_DIR/server.pl}
+POT_PLUGIN_DIR=$LIB_DIR/pot-plugins
+WARP_DIR=$CONF_DIR/warp
+RUNNER=/usr/local/sbin/ytdlp-web-run
+CLI_FILE=/usr/local/sbin/ytdlp-web
+LOG_FILE=/var/log/ytdlp-web.log
+SWAP_FILE=/ytdlp-web.swap
+# 旧版（1.x，用 yt-dlp-web-ui 的那种）放东西的地方。升级时读它的端口和密码，然后清掉。
+OLD_CONF=${YTD_OLD_CONF:-/etc/yt-dlp-webui/config.yml}
+OLD_NOTE=${YTD_OLD_NOTE:-/etc/yt-dlp-webui/install.txt}
 
+#----------------------------------------------------------------------
+# 版本号比较。用来判断网上的脚本是不是更新。
+#----------------------------------------------------------------------
 version_ge() {
   a=$(printf '%s\n' "$1" | sed 's/[^0-9.].*$//')
   b=$(printf '%s\n' "$2" | sed 's/[^0-9.].*$//')
@@ -75,6 +109,7 @@ version_from_file() {
   sed -n 's/^VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' "$1" | head -n 1
 }
 
+# 网上下来的脚本要像样：第一行对、有版本号、有记号、语法没错，才肯用它。
 remote_script_ok() {
   file=$1
   [ -s "$file" ] || return 1
@@ -85,6 +120,9 @@ remote_script_ok() {
   sh -n "$file" >/dev/null 2>&1
 }
 
+#----------------------------------------------------------------------
+# 架构、系统库对应的下载文件名。测试会直接调用这些函数。
+#----------------------------------------------------------------------
 arch_from_uname() {
   case "$1" in
     x86_64|amd64) printf '%s\n' amd64 ;;
@@ -93,16 +131,6 @@ arch_from_uname() {
     armv6l|armv6) printf '%s\n' armv6 ;;
     i386|i686|x86) printf '%s\n' 386 ;;
     *) printf '%s\n' unknown; return 1 ;;
-  esac
-}
-
-webui_asset() {
-  case "$1" in
-    amd64) printf '%s\n' yt-dlp-webui_linux-amd64 ;;
-    arm64) printf '%s\n' yt-dlp-webui_linux-arm64 ;;
-    armv7) printf '%s\n' yt-dlp-webui_linux-armv7 ;;
-    armv6) printf '%s\n' yt-dlp-webui_linux-armv6 ;;
-    *) return 1 ;;
   esac
 }
 
@@ -127,6 +155,48 @@ qjs_asset() {
   esac
 }
 
+# PO 令牌程序只有 64 位 x86 和 ARM 的版本，而且要 glibc。
+pot_asset() {
+  case "$1:$2" in
+    amd64:glibc) printf '%s\n' bgutil-pot-linux-x86_64 ;;
+    arm64:glibc) printf '%s\n' bgutil-pot-linux-aarch64 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 算 PO 令牌时大约要 70MB 内存。内存加虚拟内存不到 300MB 就不装，免得把小鸡拖死。
+pot_wanted() {
+  arch=$1
+  libc=$2
+  mem=$3
+  swap=$4
+  pot_asset "$arch" "$libc" >/dev/null || return 1
+  case "$mem$swap" in ''|*[!0-9]*) return 1 ;; esac
+  [ $((mem + swap)) -ge 300 ]
+}
+
+wgcf_asset() {
+  ver=$1
+  case "$2" in
+    amd64) printf 'wgcf_%s_linux_amd64\n' "$ver" ;;
+    arm64) printf 'wgcf_%s_linux_arm64\n' "$ver" ;;
+    armv7) printf 'wgcf_%s_linux_armv7\n' "$ver" ;;
+    armv6) printf 'wgcf_%s_linux_armv6\n' "$ver" ;;
+    386) printf 'wgcf_%s_linux_386\n' "$ver" ;;
+    *) return 1 ;;
+  esac
+}
+
+wireproxy_asset() {
+  case "$1" in
+    amd64) printf '%s\n' wireproxy_linux_amd64.tar.gz ;;
+    arm64) printf '%s\n' wireproxy_linux_arm64.tar.gz ;;
+    armv7|armv6) printf '%s\n' wireproxy_linux_arm.tar.gz ;;
+    386) printf '%s\n' wireproxy_linux_386.tar.gz ;;
+    *) return 1 ;;
+  esac
+}
+
 other_libc() {
   case "$1" in
     glibc) printf '%s\n' musl ;;
@@ -135,8 +205,23 @@ other_libc() {
   esac
 }
 
+libc_from_text() {
+  printf '%s\n' "$1" | grep -q -i musl && { printf '%s\n' musl; return 0; }
+  printf '%s\n' glibc
+}
+
+js_runtime_value() {
+  kind=$1
+  path=$2
+  [ -n "$kind" ] && [ -n "$path" ] || return 1
+  printf '%s:%s\n' "$kind" "$path"
+}
+
+#----------------------------------------------------------------------
+# 内存小的机器怎么办。
 # 目标是凑够大约 768MB 可用内存，yt-dlp 解一个视频才不会被杀掉。
 # 硬盘要留下 160MB 给程序本身。算出来的大小按 64MB 对齐。
+#----------------------------------------------------------------------
 swap_plan_mb() {
   ram=$1
   swap=$2
@@ -170,61 +255,36 @@ swap_plan_mb() {
   printf '%s\n' "$need"
 }
 
-queue_for() {
-  ram=$1
-  if [ -n "$ram" ] && [ "$ram" -lt 768 ]; then
-    printf '%s\n' 1
-  else
-    printf '%s\n' 2
-  fi
-}
-
-# 更新时沿用配置里的同时下载数。小内存机器仍然强制一个一个下。
-queue_choice_for() {
-  saved=$1
-  mem=$2
-  if [ -n "$mem" ] && [ "$mem" -lt 768 ]; then
-    printf '%s\n' 1
-    return 0
-  fi
-  if [ "$saved" = 2 ]; then
-    printf '%s\n' 2
-    return 0
-  fi
-  printf '%s\n' 1
-}
-
-downloader_for() {
-  ram=$1
-  if [ -n "$ram" ] && [ "$ram" -lt 768 ]; then
-    printf '%s\n' /usr/local/bin/yt-dlp-one
-  else
-    printf '%s\n' /usr/local/bin/yt-dlp
-  fi
-}
-
-gomem_for() {
-  ram=$1
-  if [ -z "$ram" ]; then
-    printf '\n'
-    return 0
-  fi
-  if [ "$ram" -le 128 ]; then
-    printf '%s\n' 48MiB
-  elif [ "$ram" -le 512 ]; then
-    printf '%s\n' 64MiB
-  else
-    printf '\n'
-  fi
-}
-
+# /var 在内存盘上时，数据改放到根目录，免得视频把内存盘写满。
 data_dir_for() {
   case "$1" in
-    tmpfs|devtmpfs) printf '%s\n' /yt-dlp-webui-data ;;
-    *) printf '%s\n' /var/lib/yt-dlp-webui ;;
+    tmpfs|devtmpfs) printf '%s\n' /ytdlp-web-data ;;
+    *) printf '%s\n' /var/lib/ytdlp-web ;;
   esac
 }
 
+# 64MB 小鸡的 /tmp 经常是一块很小的内存盘，40MB 的 yt-dlp 放不进去。
+workdir_for() {
+  kind=$1
+  free=$2
+  case "$free" in
+    ''|*[!0-9]*) free=0 ;;
+  esac
+  case "$kind" in
+    tmpfs|devtmpfs) printf '%s\n' /ytdlp-web-work ;;
+    *)
+      if [ "$free" -lt 120 ]; then
+        printf '%s\n' /ytdlp-web-work
+      else
+        printf '%s\n' /tmp/ytdlp-web-work
+      fi
+      ;;
+  esac
+}
+
+#----------------------------------------------------------------------
+# 认系统：看 /etc/os-release 里的名字，决定用哪个软件源命令。
+#----------------------------------------------------------------------
 pm_from_release() {
   blob=$(printf '%s %s' "$1" "$2" | tr 'A-Z' 'a-z')
   case "$blob" in
@@ -239,25 +299,28 @@ pm_from_release() {
   esac
 }
 
+# 同一个工具，在不同系统的软件源里叫不同的名字。
 pkg_name() {
   case "$1:$2" in
-    apt:curl|apk:curl|dnf:curl|yum:curl|pacman:curl|zypper:curl|opkg:curl|xbps:curl) printf '%s\n' curl ;;
-    apt:ca|apk:ca|dnf:ca|yum:ca|pacman:ca|zypper:ca|opkg:ca|xbps:ca) printf '%s\n' ca-certificates ;;
-    apt:tar|apk:tar|dnf:tar|yum:tar|pacman:tar|zypper:tar|opkg:tar|xbps:tar) printf '%s\n' tar ;;
+    *:curl) printf '%s\n' curl ;;
+    *:ca) printf '%s\n' ca-certificates ;;
+    *:tar) printf '%s\n' tar ;;
     apt:xz) printf '%s\n' xz-utils ;;
-    apk:xz|dnf:xz|yum:xz|pacman:xz|zypper:xz|opkg:xz|xbps:xz) printf '%s\n' xz ;;
-    apt:unzip|apk:unzip|dnf:unzip|yum:unzip|pacman:unzip|zypper:unzip|opkg:unzip|xbps:unzip) printf '%s\n' unzip ;;
-    apt:ffmpeg|apk:ffmpeg|dnf:ffmpeg|yum:ffmpeg|pacman:ffmpeg|zypper:ffmpeg|opkg:ffmpeg|xbps:ffmpeg) printf '%s\n' ffmpeg ;;
-    apt:htpasswd|apk:htpasswd|zypper:htpasswd) printf '%s\n' apache2-utils ;;
-    dnf:htpasswd|yum:htpasswd) printf '%s\n' httpd-tools ;;
-    pacman:htpasswd) printf '%s\n' apache ;;
-    apt:flock|apk:flock|dnf:flock|yum:flock|pacman:flock|zypper:flock|xbps:flock) printf '%s\n' util-linux ;;
-    apt:python3|apk:python3|dnf:python3|yum:python3|zypper:python3|opkg:python3|xbps:python3) printf '%s\n' python3 ;;
+    *:xz) printf '%s\n' xz ;;
+    *:unzip) printf '%s\n' unzip ;;
+    *:ffmpeg) printf '%s\n' ffmpeg ;;
     pacman:python3) printf '%s\n' python ;;
+    *:python3) printf '%s\n' python3 ;;
+    apt:perl) printf '%s\n' perl-base ;;
+    opkg:perl) printf '%s\n' 'perl perlbase-essential perlbase-io perlbase-posix perlbase-socket perlbase-file perlbase-fcntl perlbase-errno perlbase-select perlbase-symbol perlbase-selectsaver' ;;
+    *:perl) printf '%s\n' perl ;;
     *) return 1 ;;
   esac
 }
 
+#----------------------------------------------------------------------
+# IP 地址判断：公网、内网、IPv6。决定告诉你用哪个地址打开网页。
+#----------------------------------------------------------------------
 is_ipv4() {
   ip=${1%%/*}
   oldifs=$IFS
@@ -311,55 +374,69 @@ is_global_ipv6() {
   esac
 }
 
-libc_from_text() {
-  printf '%s\n' "$1" | grep -q -i musl && { printf '%s\n' musl; return 0; }
-  printf '%s\n' glibc
+#----------------------------------------------------------------------
+# 配置文件：一行一个 key=value。网页服务和这个脚本都读它。
+#----------------------------------------------------------------------
+config_get() {
+  key=$1
+  file=${2:-$CONF_FILE}
+  [ -f "$file" ] || return 1
+  val=$(sed -n "s/^${key}=//p" "$file" | head -n 1)
+  [ -n "$val" ] || return 1
+  printf '%s\n' "$val"
 }
 
-js_runtime_value() {
-  kind=$1
-  path=$2
-  [ -n "$kind" ] && [ -n "$path" ] || return 1
-  printf '%s:%s\n' "$kind" "$path"
+# 旧版配置是 YAML，样子是“  port: 3033”。
+old_config_get() {
+  key=$1
+  file=${2:-$OLD_CONF}
+  [ -f "$file" ] || return 1
+  val=$(sed -n "s/^  ${key}: //p" "$file" | head -n 1 | sed 's/^"//; s/"$//')
+  [ -n "$val" ] || return 1
+  printf '%s\n' "$val"
 }
 
+# 参数依次是：文件 端口 监听地址 名字 密码哈希 数据目录 yt-dlp JS运行时 ffmpeg
+#            PO令牌程序 WARP配置 WARP端口 打开方式 是否要WARP
 write_config() {
   file=$1
-  port=$2
-  user=$3
-  hash=$4
-  dl=$5
-  js=$6
-  queue=$7
-  data=$8
-  down=$9
-  front=${10:-}
-  [ -n "$file" ] && [ -n "$port" ] && [ -n "$user" ] && [ -n "$hash" ] || return 1
-  [ -n "$down" ] || down="$data/downloads"
+  [ -n "$file" ] && [ -n "$2" ] && [ -n "$4" ] && [ -n "$5" ] || return 1
   {
-    printf '%s\n' 'server:'
-    printf '%s\n' '  host: "0.0.0.0"'
-    printf '  port: %s\n' "$port"
-    printf '  queue_size: %s\n' "$queue"
-    printf '%s\n' 'paths:'
-    printf '  download_path: "%s"\n' "$down"
-    printf '  downloader_path: "%s"\n' "$dl"
-    printf '  local_database_path: "%s"\n' "$data"
-    printf '  js_runtime_path: "%s"\n' "$js"
-    printf '%s\n' 'authentication:'
-    printf '%s\n' '  require_auth: true'
-    printf '  username: "%s"\n' "$user"
-    printf '  password_hash: "%s"\n' "$hash"
-    printf '%s\n' 'logging:'
-    printf '%s\n' '  enable_file_logging: true'
-    printf '  log_path: "%s"\n' '/var/log/yt-dlp-webui.log'
-    if [ -n "$front" ]; then
-      printf 'frontend_path: "%s"\n' "$front"
+    printf '%s\n' '# ytdlp-web 的设置。install.sh 写的，网页服务读它。改完要重启网页服务。'
+    printf 'port=%s\n' "$2"
+    printf 'listen=%s\n' "$3"
+    printf 'user=%s\n' "$4"
+    printf 'pass_hash=%s\n' "$5"
+    printf 'data=%s\n' "$6"
+    printf 'ytdlp=%s\n' "$7"
+    printf 'js=%s\n' "$8"
+    printf 'ffmpeg=%s\n' "$9"
+    shift 9
+    printf 'pot=%s\n' "$1"
+    if [ -n "$1" ]; then
+      printf 'pot_plugins=%s\n' "$POT_PLUGIN_DIR"
+    else
+      printf 'pot_plugins=\n'
     fi
+    printf 'warp_conf=%s\n' "$2"
+    if [ -n "$2" ]; then
+      printf 'wireproxy=%s\n' /usr/local/bin/wireproxy
+    else
+      printf 'wireproxy=\n'
+    fi
+    printf 'warp_port=%s\n' "${3:-40000}"
+    printf 'open_mode=%s\n' "${4:-1}"
+    printf 'warp=%s\n' "${5:-0}"
+    printf 'cookies=%s\n' "$CONF_DIR/cookies.txt"
+    printf 'keep_hours=%s\n' 6
+    printf 'grace=%s\n' 120
+    printf 'log=%s\n' "$LOG_FILE"
   } > "$file"
 }
 
-# 下面几个只判断输入对不对，不读键盘。
+#----------------------------------------------------------------------
+# 检查你输入的东西对不对。只判断，不读键盘。
+#----------------------------------------------------------------------
 normalize_port() {
   case "$1" in
     ''|*[!0-9]*) return 1 ;;
@@ -371,7 +448,7 @@ normalize_port() {
 
 port_text_problem() {
   p=$(normalize_port "$1") || { printf '%s\n' nan; return 0; }
-  if [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
+  if [ "${#p}" -gt 5 ] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
     printf '%s\n' range
     return 0
   fi
@@ -387,37 +464,6 @@ port_prompt_default() {
   saved=$(normalize_port "$1" 2>/dev/null) || return 1
   [ "$(port_text_problem "$saved")" = ok ] || return 1
   printf '%s\n' "$saved"
-}
-
-# 配置、密码哈希和网页程序都在，才算已经装过。坏掉的记录会重新问。
-install_ready() {
-  bin=${YTD_WEBUI_BIN:-/usr/local/bin/yt-dlp-webui}
-  [ -x "$bin" ] || return 1
-  port=$(config_get port) || return 1
-  [ "$(port_text_problem "$port")" = ok ] || return 1
-  user=$(config_get username) || return 1
-  [ "$(user_text_problem "$user")" = ok ] || return 1
-  hash=$(config_get password_hash) || return 1
-  case "$hash" in
-    \$2a\$*|\$2b\$*|\$2y\$*) return 0 ;;
-  esac
-  return 1
-}
-
-# 更新时读回端口、账号和文件夹。打不开防火墙这一项，避免把上次关掉的端口又放开。
-load_saved_choices() {
-  PORT_CHOSEN=$(config_get port) || return 1
-  [ "$(port_text_problem "$PORT_CHOSEN")" = ok ] || return 1
-  USER_CHOSEN=$(config_get username) || return 1
-  [ "$(user_text_problem "$USER_CHOSEN")" = ok ] || return 1
-  PASS_MODE=keep
-  PASS_CHOSEN=$(read_saved_password 2>/dev/null || true)
-  DIR_CHOSEN=$(config_get download_path) || return 1
-  [ "$(dir_text_problem "$DIR_CHOSEN")" = ok ] || return 1
-  saved_q=$(config_get queue_size 2>/dev/null || true)
-  QUEUE_CHOSEN=$(queue_choice_for "$saved_q" "${MEM_MB:-}")
-  OPEN_CHOSEN=0
-  return 0
 }
 
 user_text_problem() {
@@ -445,29 +491,6 @@ pass_text_problem() {
   printf '%s\n' ok
 }
 
-dir_text_problem() {
-  d=$1
-  case "$d" in
-    /*) ;;
-    *) printf '%s\n' relative; return 0 ;;
-  esac
-  case "$d" in
-    *[[:space:]]*) printf '%s\n' space; return 0 ;;
-    *..*) printf '%s\n' dotdot; return 0 ;;
-  esac
-  if printf '%s' "$d" | grep -q '["\\]'; then
-    printf '%s\n' symbol
-    return 0
-  fi
-  case "$d" in
-    /|/tmp|/tmp/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/run|/run/*)
-      printf '%s\n' system
-      return 0
-      ;;
-  esac
-  printf '%s\n' ok
-}
-
 # 空答案用默认。不在 1 到 max 之间时打印 bad。
 menu_answer() {
   a=$1
@@ -487,14 +510,17 @@ menu_answer() {
   fi
 }
 
-downloader_for_choice() {
+listen_for_open() {
   if [ "$1" = 2 ]; then
-    printf '%s\n' /usr/local/bin/yt-dlp
+    printf '%s\n' 127.0.0.1
   else
-    printf '%s\n' /usr/local/bin/yt-dlp-one
+    printf '%s\n' 0.0.0.0
   fi
 }
 
+#----------------------------------------------------------------------
+# 往 /etc/fstab 这类文件里加一行、删一行。上一行没换行时也不会粘在一起。
+#----------------------------------------------------------------------
 fstab_append_line() {
   file=$1
   line=$2
@@ -549,6 +575,7 @@ fstab_remove_line() {
   rm -f "$tmp"
 }
 
+# ytdlp-web 这个命令放在哪个目录，才能直接敲名字就用。
 shortcut_link_dir() {
   path=$1
   case ":$path:" in
@@ -569,11 +596,76 @@ shortcut_link_dir() {
 }
 
 #----------------------------------------------------------------------
-# 下面开始碰这台机器。
+# 装过没有：配置、密码哈希和网页程序都在，才算装过。坏掉的记录会重新问。
 #----------------------------------------------------------------------
+install_ready() {
+  [ -f "$SERVER_FILE" ] || return 1
+  port=$(config_get port) || return 1
+  [ "$(port_text_problem "$port")" = ok ] || return 1
+  user=$(config_get user) || return 1
+  [ "$(user_text_problem "$user")" = ok ] || return 1
+  hash=$(config_get pass_hash) || return 1
+  case "$hash" in
+    \$*\$*) return 0 ;;
+  esac
+  return 1
+}
+
+old_install_present() {
+  [ -f "$OLD_CONF" ] || [ -x /usr/local/bin/yt-dlp-webui ]
+}
+
+read_saved_password() {
+  f=${1:-$NOTE_FILE}
+  [ -f "$f" ] || return 1
+  pw=$(sed -n 's/^password=//p' "$f" | head -n 1)
+  [ -n "$pw" ] || return 1
+  printf '%s\n' "$pw"
+}
+
+# 更新时读回原来的端口、名字、打开方式和 WARP 选择。
+load_saved_choices() {
+  PORT_CHOSEN=$(config_get port) || return 1
+  [ "$(port_text_problem "$PORT_CHOSEN")" = ok ] || return 1
+  USER_CHOSEN=$(config_get user) || return 1
+  [ "$(user_text_problem "$USER_CHOSEN")" = ok ] || return 1
+  PASS_MODE=keep
+  PASS_CHOSEN=$(read_saved_password 2>/dev/null || true)
+  OPEN_CHOSEN=$(config_get open_mode 2>/dev/null || true)
+  [ "$OPEN_CHOSEN" = 2 ] || OPEN_CHOSEN=1
+  WARP_CHOSEN=$(config_get warp 2>/dev/null || true)
+  [ "$WARP_CHOSEN" = 1 ] || WARP_CHOSEN=0
+  return 0
+}
+
+# 从旧版（1.x）读端口、名字和密码原文。密码原文没有时，装的时候重新随机一把。
+load_old_choices() {
+  PORT_CHOSEN=$(old_config_get port 2>/dev/null) || return 1
+  PORT_CHOSEN=$(normalize_port "$PORT_CHOSEN" 2>/dev/null) || return 1
+  [ "$(port_text_problem "$PORT_CHOSEN")" = ok ] || return 1
+  USER_CHOSEN=$(old_config_get username 2>/dev/null || true)
+  [ "$(user_text_problem "$USER_CHOSEN")" = ok ] || USER_CHOSEN="admin"
+  PASS_CHOSEN=$(read_saved_password "$OLD_NOTE" 2>/dev/null || true)
+  if [ -n "$PASS_CHOSEN" ] && [ "$(pass_text_problem "$PASS_CHOSEN")" = ok ]; then
+    PASS_MODE=custom
+  else
+    PASS_MODE=random
+    PASS_CHOSEN=
+  fi
+  OPEN_CHOSEN=1
+  WARP_CHOSEN=1
+  return 0
+}
+
+#======================================================================
+# 下面开始碰这台机器。
+#======================================================================
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+#----------------------------------------------------------------------
+# 看内存、硬盘。容器里的内存上限写在 cgroup 里，比 /proc/meminfo 更准。
+#----------------------------------------------------------------------
 read_meminfo_kb() {
   awk -v k="$1" '$1==k {print $2; exit}' /proc/meminfo 2>/dev/null
 }
@@ -594,7 +686,12 @@ cgroup_mem_mb() {
 }
 
 disk_free_mb() {
-  df -Pk "$1" 2>/dev/null | awk 'NR==2 {print int($4/1024)}'
+  got=$(df -Pk "$1" 2>/dev/null | awk 'NR==2 {print int($4/1024)}')
+  # 有些容器里 df 找不到挂载点，改问 stat。
+  if [ -z "$got" ] && have stat; then
+    got=$(stat -f -c '%a %S' "$1" 2>/dev/null | awk '{print int($1 * $2 / 1048576)}')
+  fi
+  printf '%s\n' "${got:-0}"
 }
 
 fstype_of() {
@@ -608,6 +705,9 @@ drop_page_cache() {
   fi
 }
 
+#----------------------------------------------------------------------
+# 认出这是什么系统、用什么装软件、什么架构、什么启动方式。
+#----------------------------------------------------------------------
 load_os() {
   OS_ID=unknown
   OS_VER=
@@ -615,7 +715,7 @@ load_os() {
   OS_PRETTY=Linux
   if [ -f /etc/os-release ]; then
     # 用函数里的 local，避免发行版文件里的变量漏到外面。
-    # shellcheck disable=SC2039
+    # shellcheck disable=SC2039,SC3043
     local ID VERSION_ID ID_LIKE PRETTY_NAME
     ID=
     VERSION_ID=
@@ -624,6 +724,7 @@ load_os() {
     # shellcheck disable=SC1091
     . /etc/os-release
     [ -n "$ID" ] && OS_ID=$ID
+    # shellcheck disable=SC2034
     OS_VER=$VERSION_ID
     OS_LIKE=$ID_LIKE
     [ -n "$PRETTY_NAME" ] && OS_PRETTY=$PRETTY_NAME
@@ -672,12 +773,13 @@ detect_libc() {
   LIBC=$(libc_from_text "$probe")
 }
 
+# 只认“真的在跑”的启动方式。装了 OpenRC 却没用它开机（很多容器这样），就当普通 SysV。
 detect_init() {
   if [ -d /run/systemd/system ] && have systemctl; then
     INIT=systemd
     return 0
   fi
-  if have rc-service || [ -d /run/openrc ]; then
+  if [ -d /run/openrc ] && have rc-service; then
     INIT=openrc
     return 0
   fi
@@ -705,6 +807,10 @@ detect_machine() {
       MEM_MB=$cg_mb
     fi
   fi
+  # 测试时可以假装成小内存机器。
+  if [ -n "${YTD_MEM_MB:-}" ]; then
+    MEM_MB=$YTD_MEM_MB
+  fi
   SWAP_MB=0
   swap_kb=$(read_meminfo_kb "SwapTotal:")
   if [ -n "$swap_kb" ]; then
@@ -717,8 +823,15 @@ detect_machine() {
     ''|*[!0-9]*) NCPU=1 ;;
   esac
   DATA=$(data_dir_for "$(fstype_of /var)")
+  saved_data=$(config_get data 2>/dev/null || true)
+  case "$saved_data" in
+    /var/lib/ytdlp-web|/ytdlp-web-data) DATA=$saved_data ;;
+  esac
 }
 
+#----------------------------------------------------------------------
+# 缺什么装什么。先看有没有，没有才用系统软件源装。
+#----------------------------------------------------------------------
 need_tool() {
   case "$1" in
     curl) have curl || have wget ;;
@@ -729,15 +842,14 @@ need_tool() {
     xz) have xz || have unxz ;;
     unzip) have unzip ;;
     ffmpeg) have ffmpeg && have ffprobe ;;
-    htpasswd) have htpasswd ;;
-    flock) have flock ;;
     python3) have python3 ;;
+    perl) have perl && perl -MIO::Socket::INET -MIO::Select -MPOSIX -MFcntl -MFile::Path -e 1 >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }
 
 pm_update() {
-  [ "$PM_UPDATED" = 1 ] && return 0
+  [ "${PM_UPDATED:-}" = 1 ] && return 0
   say_info "正在更新软件源（$PM）…"
   case "$PM" in
     apt)
@@ -755,20 +867,22 @@ pm_update() {
   PM_UPDATED=1
 }
 
+# 包名有时是好几个（OpenWrt 的 perl），所以这里不加引号，让它拆开。
 pm_install_body() {
   pkg=$1
+  # shellcheck disable=SC2086
   case "$PM" in
     apt)
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$pkg"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkg
       rm -f /var/cache/apt/archives/*.deb 2>/dev/null || true
       ;;
-    apk) apk add --no-cache "$pkg" ;;
-    dnf) dnf install -y "$pkg" ;;
-    yum) yum install -y "$pkg" ;;
-    pacman) pacman -S --noconfirm --needed "$pkg" ;;
-    zypper) zypper --non-interactive install --no-recommends "$pkg" ;;
-    opkg) opkg install "$pkg" ;;
-    xbps) xbps-install -y "$pkg" ;;
+    apk) apk add --no-cache $pkg ;;
+    dnf) dnf install -y $pkg ;;
+    yum) yum install -y $pkg ;;
+    pacman) pacman -S --noconfirm --needed $pkg ;;
+    zypper) zypper --non-interactive install --no-recommends $pkg ;;
+    opkg) opkg install $pkg ;;
+    xbps) xbps-install -y $pkg ;;
     *) return 1 ;;
   esac
 }
@@ -806,9 +920,12 @@ low_mem() {
   [ -n "${MEM_MB:-}" ] && [ "$MEM_MB" -le 256 ]
 }
 
+#----------------------------------------------------------------------
+# 虚拟内存（swap）：内存不到 768MB 时，拿一块硬盘当内存用。
+#----------------------------------------------------------------------
 # 先用一小块试。容器经常禁止 swapon，没必要先写几百 MB 再失败。
 swap_can_enable() {
-  probe=/yt-dlp-webui.swap.probe
+  probe=/ytdlp-web.swap.probe
   swapoff "$probe" >/dev/null 2>&1 || true
   rm -f "$probe"
   write_swap_file "$probe" 8 || {
@@ -854,18 +971,14 @@ write_swap_file() {
 }
 
 prepare_memory() {
-  LOW_MEM=0
   if [ -n "$MEM_MB" ] && [ "$MEM_MB" -le 512 ]; then
-    LOW_MEM=1
-  fi
-  if [ "$LOW_MEM" = 1 ]; then
     oc=$(tr -d ' \r\n' < /proc/sys/vm/overcommit_memory 2>/dev/null || true)
     if [ "$oc" != 1 ]; then
       # 很多容器的 /proc/sys 是只读的。[ -w ] 仍会说能写，直接重定向还会把报错打到屏幕上。
       if sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 \
         || { printf '1\n' > /proc/sys/vm/overcommit_memory; } 2>/dev/null; then
         mkdir -p /etc/sysctl.d 2>/dev/null || true
-        { printf 'vm.overcommit_memory=1\n' > /etc/sysctl.d/99-yt-dlp-webui-overcommit.conf; } 2>/dev/null || true
+        { printf 'vm.overcommit_memory=1\n' > /etc/sysctl.d/99-ytdlp-web-overcommit.conf; } 2>/dev/null || true
         say_ok "小内存机器已放开内存申请限制"
       fi
     fi
@@ -885,39 +998,40 @@ prepare_memory() {
       ;;
   esac
   if ! swap_can_enable; then
-    say_warn "这台机器不允许打开虚拟内存。安装会继续，下载时会尽量省内存。"
+    say_warn "这台机器不允许打开虚拟内存（容器里很常见）。安装会继续，下载时会尽量省内存。"
     return 0
   fi
-  swapf=/yt-dlp-webui.swap
-  if [ -f "$swapf" ]; then
-    swapoff "$swapf" >/dev/null 2>&1 || true
-    rm -f "$swapf"
+  if [ -f "$SWAP_FILE" ]; then
+    swapoff "$SWAP_FILE" >/dev/null 2>&1 || true
+    rm -f "$SWAP_FILE"
   fi
   say_info "内存大约 ${MEM_MB:-很少}MB。正在做 ${plan}MB 虚拟内存，下载视频时用得上…"
   # 一次写完几百 MB，64MB 的鸡会把内存缓存撑满，终端直接断开。改成一小段一小段写。
-  if ! write_swap_file "$swapf" "$plan"; then
-    rm -f "$swapf"
+  if ! write_swap_file "$SWAP_FILE" "$plan"; then
+    rm -f "$SWAP_FILE"
     say_warn "虚拟内存文件没写成，继续安装"
     return 0
   fi
-  chmod 600 "$swapf" 2>/dev/null || true
-  if mkswap "$swapf" >/dev/null 2>&1 && swapon "$swapf" >/dev/null 2>&1; then
-    fstab_append_line /etc/fstab "$swapf none swap sw 0 0"
-    mkdir -p /etc/yt-dlp-webui
-    printf '%s\n' "$plan" > /etc/yt-dlp-webui/swap.size
+  chmod 600 "$SWAP_FILE" 2>/dev/null || true
+  if mkswap "$SWAP_FILE" >/dev/null 2>&1 && swapon "$SWAP_FILE" >/dev/null 2>&1; then
+    fstab_append_line /etc/fstab "$SWAP_FILE none swap sw 0 0"
+    mkdir -p "$CONF_DIR"
+    printf '%s\n' "$plan" > "$CONF_DIR/swap.size"
     SWAP_MB=$((SWAP_MB + plan))
     DISK_MB=$(disk_free_mb /)
     say_ok "虚拟内存已打开（${plan}MB），重启后也会自动挂上"
   else
-    rm -f "$swapf"
+    rm -f "$SWAP_FILE"
     say_warn "这台机器不允许打开虚拟内存。安装会继续，下载时会尽量省内存。"
   fi
 }
 
+#----------------------------------------------------------------------
+# 下载文件。GitHub 打不开时换镜像。小内存机器限速，免得页缓存把内存撑爆。
+#----------------------------------------------------------------------
 fetch_first() {
   dest=$1
   shift
-  # 小内存鸡一下灌进几十 MB，页缓存来不及丢掉，系统会把安装进程杀掉。
   rate=
   if low_mem; then
     rate=1M
@@ -929,11 +1043,12 @@ fetch_first() {
     if have curl; then
       if [ -n "$rate" ]; then
         curl -fL --retry 2 --connect-timeout 20 --max-time 900 --limit-rate "$rate" -o "$dest" "$url" && [ -s "$dest" ] && ok=1
-      elif curl -fL --retry 2 --connect-timeout 20 --max-time 300 -o "$dest" "$url" && [ -s "$dest" ]; then
+      elif curl -fL --retry 2 --connect-timeout 20 --max-time 600 -o "$dest" "$url" && [ -s "$dest" ]; then
         ok=1
       fi
     elif have wget; then
-      if [ -n "$rate" ]; then
+      # BusyBox 自带的 wget 不认 --limit-rate，只有完整版 wget 才限速。
+      if [ -n "$rate" ] && wget --help 2>&1 | grep -q -- '--limit-rate'; then
         wget -O "$dest" --limit-rate="$rate" "$url" && [ -s "$dest" ] && ok=1
       elif wget -O "$dest" "$url" && [ -s "$dest" ]; then
         ok=1
@@ -964,6 +1079,7 @@ file_magic() {
 
 is_elf() { [ "$(file_magic "$1")" = "7f454c46" ]; }
 is_zip() { [ "$(file_magic "$1")" = "504b0304" ]; }
+is_gzip() { case "$(file_magic "$1")" in 1f8b*) return 0 ;; esac; return 1; }
 
 rand_hex() {
   n=$1
@@ -985,25 +1101,6 @@ latest_tag() {
   printf '%s\n' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
 }
 
-# 64MB 小鸡的 /tmp 经常是一块很小的内存盘，40MB 的 yt-dlp 放不进去。
-workdir_for() {
-  kind=$1
-  free=$2
-  case "$free" in
-    ''|*[!0-9]*) free=0 ;;
-  esac
-  case "$kind" in
-    tmpfs|devtmpfs) printf '%s\n' /yt-dlp-webui-work ;;
-    *)
-      if [ "$free" -lt 120 ]; then
-        printf '%s\n' /yt-dlp-webui-work
-      else
-        printf '%s\n' /tmp/yt-dlp-webui-work
-      fi
-      ;;
-  esac
-}
-
 prepare_workdir() {
   WORK=$(workdir_for "$(fstype_of /tmp)" "$(disk_free_mb /tmp)")
   rm -rf "$WORK"
@@ -1017,6 +1114,23 @@ prepare_workdir() {
   export TMPDIR HOME XDG_CACHE_HOME TMP TEMP
 }
 
+# 解压 zip：有 unzip 用 unzip，没有就试 busybox。
+unzip_to() {
+  zipf=$1
+  dir=$2
+  mkdir -p "$dir"
+  if have unzip; then
+    unzip -o -q "$zipf" -d "$dir" && return 0
+  fi
+  if have busybox && busybox unzip -o -q "$zipf" -d "$dir" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+#----------------------------------------------------------------------
+# ffmpeg：合并画面和声音要用。先用软件源的，不行再下静态版本。
+#----------------------------------------------------------------------
 install_static_ffmpeg() {
   case "$ARCH" in
     amd64) name=ffmpeg-release-amd64-static.tar.xz ;;
@@ -1050,10 +1164,6 @@ install_static_ffmpeg() {
     rm -rf "$dir" "$tmp"
     return 1
   fi
-  if ! find "$dir" -type f -name ffmpeg | grep -q .; then
-    rm -rf "$dir" "$tmp"
-    return 1
-  fi
   rm -f "$tmp"
   ff=$(find "$dir" -type f -name ffmpeg | head -n 1)
   fp=$(find "$dir" -type f -name ffprobe | head -n 1)
@@ -1064,8 +1174,8 @@ install_static_ffmpeg() {
   cp "$ff" /usr/local/bin/ffmpeg
   cp "$fp" /usr/local/bin/ffprobe
   chmod 755 /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
-  mkdir -p /etc/yt-dlp-webui
-  printf '%s\n' static > /etc/yt-dlp-webui/ffmpeg-static
+  mkdir -p "$CONF_DIR"
+  printf '%s\n' static > "$CONF_DIR/ffmpeg-static"
   rm -rf "$dir"
   need_tool ffmpeg
 }
@@ -1098,13 +1208,12 @@ ensure_ffmpeg() {
   fi
   say_step "安装 ffmpeg（合并视频和音频要用）"
   # 一次装一百个包，64MB 的鸡会被杀掉。Alpine 上改成一个一个装。
-  # 一个一个也失败时，不要再整包重试，那一下会把安装进程杀掉。
   if low_mem && [ "$PM" = apk ]; then
     if install_apk_ffmpeg_onebyone; then
       say_ok "ffmpeg 已从系统软件源装上"
       return 0
     fi
-    say_warn "内存大约 ${MEM_MB}MB，ffmpeg 没装完。高画质合并会失败，标清还能下。"
+    say_warn "内存大约 ${MEM_MB}MB，ffmpeg 没装完。高画质合并会失败。"
     return 0
   fi
   if ensure_tool ffmpeg; then
@@ -1113,7 +1222,7 @@ ensure_ffmpeg() {
   fi
   # 40MB 的静态包在 128MB 及以下会把后面的安装一起打死。
   if [ -n "${MEM_MB:-}" ] && [ "$MEM_MB" -le 128 ]; then
-    say_warn "内存大约 ${MEM_MB}MB，软件源里的 ffmpeg 没装上。高画质合并会失败，标清还能下。"
+    say_warn "内存大约 ${MEM_MB}MB，软件源里的 ffmpeg 没装上。高画质合并会失败。"
     return 0
   fi
   say_info "软件源里的 ffmpeg 没装上，改下静态版本"
@@ -1121,10 +1230,13 @@ ensure_ffmpeg() {
     say_ok "已装上静态 ffmpeg"
     return 0
   fi
-  say_warn "ffmpeg 没装上。只能下那些不用合并的画质，高画质会失败。"
+  say_warn "ffmpeg 没装上。YouTube 的高画质要合并，会下载失败。"
   return 0
 }
 
+#----------------------------------------------------------------------
+# QuickJS：YouTube 现在要算一道 JavaScript 题。这个程序只有 2MB，64MB 的鸡跑得动。
+#----------------------------------------------------------------------
 place_elf() {
   src=$1
   dest=$2
@@ -1192,7 +1304,7 @@ try_distro_js() {
 }
 
 install_qjs() {
-  say_step "安装 QuickJS（YouTube 现在要它来算签名）"
+  say_step "安装 QuickJS（YouTube 现在要它来算一道 JavaScript 题）"
   # 第一次装过就能用就跳过。更新时要换成最新的，旧的先留着，新的跑起来再替换。
   if [ "${UPDATE_MODE:-}" != 1 ] && qjs_eval_ok /usr/local/bin/qjs; then
     JS_RUNTIME=$(js_runtime_value quickjs /usr/local/bin/qjs)
@@ -1235,7 +1347,7 @@ install_qjs() {
       fi
     fi
     JS_RUNTIME=$(js_runtime_value quickjs "$placed")
-    say_ok "QuickJS 已放好"
+    say_ok "QuickJS 已放好（$tag）"
     return 0
   fi
   if qjs_eval_ok /usr/local/bin/qjs; then
@@ -1251,6 +1363,9 @@ install_qjs() {
   die "QuickJS 在这台鸡上跑不起来。${why}"
 }
 
+#----------------------------------------------------------------------
+# yt-dlp：去 YouTube 下视频的主角。装官方版本，网页服务每天自己更新它。
+#----------------------------------------------------------------------
 ytdlp_runs() {
   [ -x /usr/local/bin/yt-dlp ] || return 1
   /usr/local/bin/yt-dlp --version >/dev/null 2>&1
@@ -1262,11 +1377,10 @@ ytdlp_try_asset() {
   # shellcheck disable=SC2046
   fetch_first "$tmp" $(github_urls "yt-dlp/yt-dlp/releases/latest/download/$asset") || return 1
   if is_zip "$tmp"; then
-    ensure_tool unzip || die "这个架构的 yt-dlp 是压缩包，但这台鸡装不上 unzip。"
+    ensure_tool unzip || true
     unpack=$WORK/yt-dlp-unpack
     rm -rf "$unpack"
-    mkdir -p "$unpack"
-    unzip -o -q "$tmp" -d "$unpack" || return 1
+    unzip_to "$tmp" "$unpack" || return 1
     rm -f "$tmp"
     found=$(find "$unpack" -type f -name 'yt-dlp*' | head -n 1)
     [ -n "$found" ] || return 1
@@ -1286,6 +1400,7 @@ ytdlp_try_asset() {
   return 0
 }
 
+# 小内存机器用 3MB 的 Python 版。要先有 python3（3.10 或更新）。
 install_ytdlp_zipapp() {
   if ! ensure_tool python3; then
     return 1
@@ -1315,7 +1430,7 @@ install_ytdlp_zipapp() {
 
 install_ytdlp() {
   say_step "安装 yt-dlp"
-  # 官方那个独立程序有 40MB，一运行会先把自己解压到内存里。64MB 的鸡会被直接打死。
+  # 官方那个独立程序有 40MB，一运行会先把自己解压出来。64MB 的鸡会被直接打死。
   if low_mem; then
     say_info "内存大约 ${MEM_MB}MB，改用小的 yt-dlp（要有 Python）"
     if install_ytdlp_zipapp; then
@@ -1325,7 +1440,10 @@ install_ytdlp() {
       say_warn "新的 yt-dlp 没换上，继续用现在的"
       return 0
     fi
-    die "小的 yt-dlp 没跑起来。内存大约 ${MEM_MB}MB，不能再试那个会撑死小鸡的大程序。"
+    if [ $((MEM_MB + SWAP_MB)) -lt 384 ]; then
+      die "小的 yt-dlp 没跑起来（系统里的 Python 太旧或装不上）。内存大约 ${MEM_MB}MB，不能再试那个会撑死小鸡的大程序。"
+    fi
+    say_warn "小的 yt-dlp 没跑起来。有虚拟内存撑着，改试官方独立程序"
   fi
   asset=$(ytdlp_asset "$ARCH" "$LIBC" 2>/dev/null || true)
   [ -n "$asset" ] || die "没有适合这台鸡的 yt-dlp（架构 $ARCH，库 $LIBC）。"
@@ -1349,243 +1467,1867 @@ install_ytdlp() {
   die "yt-dlp 跑不起来。架构 $ARCH，系统库 $LIBC，内存大约 ${MEM_MB:-未知}MB。"
 }
 
-install_webui() {
-  say_step "安装网页程序"
-  asset=$(webui_asset "$ARCH") || die "这个网页程序没有 $ARCH 版本。32 位小鸡装不了。"
-  tag=$(latest_tag marcopiovanello/yt-dlp-web-ui)
-  [ -n "$tag" ] || tag=v4.0.0
-  tmp=$WORK/yt-dlp-webui.new
-  # shellcheck disable=SC2046
-  if ! fetch_first "$tmp" $(github_urls "marcopiovanello/yt-dlp-web-ui/releases/download/$tag/$asset"); then
-    if [ "$tag" != v4.0.0 ]; then
-      # shellcheck disable=SC2046
-      fetch_first "$tmp" $(github_urls "marcopiovanello/yt-dlp-web-ui/releases/download/v4.0.0/$asset") || true
-    fi
+#----------------------------------------------------------------------
+# PO 令牌程序（bgutil-pot，Rust 写的单个程序）和它的 yt-dlp 插件。
+# 平时不用，被 YouTube 拦时网页服务才请它出来算令牌。装不上也不影响别的。
+#----------------------------------------------------------------------
+install_pot() {
+  POT_BIN=
+  if ! pot_wanted "$ARCH" "$LIBC" "${MEM_MB:-0}" "${SWAP_MB:-0}"; then
+    say_info "这台机器（$ARCH / $LIBC / 内存 ${MEM_MB:-?}MB）不装 PO 令牌程序，被拦时跳过这一招。"
+    rm -f /usr/local/bin/bgutil-pot
+    rm -rf "$POT_PLUGIN_DIR"
+    return 0
   fi
-  if ! is_elf "$tmp"; then
+  say_step "安装 PO 令牌程序（被 YouTube 拦时自动算令牌用）"
+  free_now=$(disk_free_mb /)
+  if [ -n "$free_now" ] && [ "$free_now" -lt 400 ]; then
+    say_warn "磁盘只剩 ${free_now}MB，先不装 PO 令牌程序"
+    return 0
+  fi
+  asset=$(pot_asset "$ARCH" "$LIBC")
+  tag=$(latest_tag jim60105/bgutil-ytdlp-pot-provider-rs)
+  [ -n "$tag" ] || tag=v0.8.1
+  if [ "${UPDATE_MODE:-}" = 1 ] && [ -x /usr/local/bin/bgutil-pot ] && [ -d "$POT_PLUGIN_DIR/bgutil-pot" ] \
+    && [ "$(cat "$CONF_DIR/pot.version" 2>/dev/null)" = "$tag" ] && /usr/local/bin/bgutil-pot --version >/dev/null 2>&1; then
+    POT_BIN=/usr/local/bin/bgutil-pot
+    say_ok "PO 令牌程序已经是最新（$tag）"
+    return 0
+  fi
+  tmp=$WORK/bgutil-pot
+  zipf=$WORK/pot-plugin.zip
+  # shellcheck disable=SC2046
+  if ! fetch_first "$tmp" $(github_urls "jim60105/bgutil-ytdlp-pot-provider-rs/releases/download/$tag/$asset") \
+    || ! is_elf "$tmp"; then
     rm -f "$tmp"
-    if [ -x /usr/local/bin/yt-dlp-webui ] && is_elf /usr/local/bin/yt-dlp-webui; then
-      say_warn "新的网页程序没下下来，继续用现在的"
+    say_warn "PO 令牌程序没下下来，被拦时跳过这一招"
+    [ -x /usr/local/bin/bgutil-pot ] && POT_BIN=/usr/local/bin/bgutil-pot
+    return 0
+  fi
+  chmod 755 "$tmp"
+  if ! "$tmp" --version >/dev/null 2>&1; then
+    rm -f "$tmp"
+    say_warn "PO 令牌程序在这台机器上跑不起来（可能缺 libssl3），被拦时跳过这一招"
+    return 0
+  fi
+  # shellcheck disable=SC2046
+  if ! fetch_first "$zipf" $(github_urls "jim60105/bgutil-ytdlp-pot-provider-rs/releases/download/$tag/bgutil-ytdlp-pot-provider-rs.zip") \
+    || ! is_zip "$zipf"; then
+    rm -f "$tmp" "$zipf"
+    say_warn "PO 令牌插件没下下来，被拦时跳过这一招"
+    return 0
+  fi
+  ensure_tool unzip >/dev/null 2>&1 || true
+  rm -rf "$POT_PLUGIN_DIR.new"
+  if ! unzip_to "$zipf" "$POT_PLUGIN_DIR.new/bgutil-pot" \
+    || [ ! -f "$POT_PLUGIN_DIR.new/bgutil-pot/yt_dlp_plugins/extractor/getpot_bgutil_cli.py" ]; then
+    rm -rf "$POT_PLUGIN_DIR.new" "$tmp" "$zipf"
+    say_warn "PO 令牌插件解压不了（缺 unzip），被拦时跳过这一招"
+    return 0
+  fi
+  # 只用“现算现用”的方式，不开常驻服务，省内存。另一种方式的文件删掉，免得每次报警告。
+  rm -f "$POT_PLUGIN_DIR.new/bgutil-pot/yt_dlp_plugins/extractor/getpot_bgutil_http.py"
+  rm -rf "$POT_PLUGIN_DIR"
+  mv "$POT_PLUGIN_DIR.new" "$POT_PLUGIN_DIR"
+  place_elf "$tmp" /usr/local/bin/bgutil-pot
+  rm -f "$tmp" "$zipf"
+  mkdir -p "$CONF_DIR"
+  printf '%s\n' "$tag" > "$CONF_DIR/pot.version"
+  POT_BIN=/usr/local/bin/bgutil-pot
+  say_ok "PO 令牌程序已放好（$tag）"
+}
+
+#----------------------------------------------------------------------
+# Cloudflare WARP：被拦时换一个出口 IP。用 wireproxy，在程序里连 WARP，
+# 不改系统网络，没有 TUN 的容器也能用。平时不开，网页服务要用时才临时打开。
+#----------------------------------------------------------------------
+pick_warp_port() {
+  for p in 40000 40001 40002 40003 40010 40020; do
+    if ! port_busy "$p"; then
+      printf '%s\n' "$p"
       return 0
     fi
-    die "网页程序下载失败。请检查这台鸡能不能打开 GitHub。"
-  fi
-  place_elf "$tmp" /usr/local/bin/yt-dlp-webui
-  rm -f "$tmp"
-  say_ok "网页程序已放好（$tag）"
+  done
+  printf '%s\n' 40000
 }
 
-# 官方程序里的面板是英文，而且没登录时会直接弹出报错页。
-# 这里换成我们改过的面板：默认中文，右上角可以换语言，没登录先去登录页。
-install_panel() {
-  UI_DIR=/usr/local/share/yt-dlp-webui
-  say_step "安装中文面板"
-  tmp=$WORK/ui.tar.gz
-  dest=$WORK/ui-new
-  rm -rf "$dest"
-  mkdir -p "$dest"
-  rm -f "$tmp"
-  if [ -n "${YTD_UI_FILE:-}" ] && [ -s "$YTD_UI_FILE" ]; then
-    cp "$YTD_UI_FILE" "$tmp" || true
-  fi
-  if [ ! -s "$tmp" ]; then
-    fetch_first "$tmp" \
-      "https://github.com/imthnio/vps-ytdlp/releases/download/v${VERSION}/ui.tar.gz" \
-      "https://raw.githubusercontent.com/imthnio/vps-ytdlp/main/ui.tar.gz" \
-      "https://cdn.jsdelivr.net/gh/imthnio/vps-ytdlp@main/ui.tar.gz" || true
-  fi
-  if [ -s "$tmp" ] && tar -xzf "$tmp" -C "$dest" && [ -f "$dest/index.html" ] && [ -d "$dest/assets" ]; then
-    rm -rf "$UI_DIR.new"
-    mkdir -p "$UI_DIR.new"
-    cp -R "$dest/index.html" "$dest/assets" "$UI_DIR.new/"
-    rm -rf "$UI_DIR"
-    mv "$UI_DIR.new" "$UI_DIR"
-    say_ok "中文面板已放好。默认是中文，右上角可以换语言。"
-    return 0
-  fi
-  rm -rf "$dest" "$UI_DIR.new"
-  if [ -f "$UI_DIR/index.html" ]; then
-    say_warn "新的中文面板没下下来，继续用现在这块面板。"
-    return 0
-  fi
-  UI_DIR=
-  say_warn "中文面板没装上，先用程序自带的英文面板。"
-  return 0
-}
-
-write_one_wrapper() {
-  cat > /usr/local/bin/yt-dlp-one <<'EOF'
-#!/bin/sh
-# 小内存机器一次只跑一个 yt-dlp。网页如果排了两个，第二个在这里等着。
-export TMPDIR="${TMPDIR:-/var/lib/yt-dlp-webui/tmp}"
-export TEMP="$TMPDIR"
-export TMP="$TMPDIR"
-export HOME="${HOME:-/var/lib/yt-dlp-webui/home}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/var/lib/yt-dlp-webui/cache}"
-mkdir -p "$TMPDIR" "$HOME" "$XDG_CACHE_HOME" 2>/dev/null || true
-lock=${YTD_LOCK:-/var/lib/yt-dlp-webui/download.lock}
-exec flock "$lock" /usr/local/bin/yt-dlp "$@"
-EOF
-  # 数据目录如果因为 /var 在内存里换了地方，锁也跟着走。
-  if [ "$DATA" != /var/lib/yt-dlp-webui ]; then
-    sed "s#/var/lib/yt-dlp-webui#$DATA#g" /usr/local/bin/yt-dlp-one > "$WORK/yt-dlp-one.new"
-    mv "$WORK/yt-dlp-one.new" /usr/local/bin/yt-dlp-one
-  fi
-  chmod 755 /usr/local/bin/yt-dlp-one
-}
-
-write_runner() {
-  cat > /usr/local/sbin/yt-dlp-webui-run <<EOF
-#!/bin/sh
-set -a
-[ -f /etc/yt-dlp-webui/env ] && . /etc/yt-dlp-webui/env
-set +a
-export TMPDIR="$DATA/tmp"
-export HOME="$DATA/home"
-export XDG_CACHE_HOME="$DATA/cache"
-mkdir -p "\$TMPDIR" "\$HOME" "\$XDG_CACHE_HOME" "$DATA/downloads"
-cd "$DATA" || exit 1
-exec /usr/local/bin/yt-dlp-webui --conf /etc/yt-dlp-webui/config.yml
-EOF
-  chmod 755 /usr/local/sbin/yt-dlp-webui-run
-}
-
-write_env_file() {
-  secret=$1
-  gomem=$2
-  umask 077
-  {
-    printf 'JWT_SECRET=%s\n' "$secret"
-    if [ -n "$gomem" ]; then
-      printf 'GOMEMLIMIT=%s\n' "$gomem"
+# 临时打开 wireproxy，经过它访问 Cloudflare 的检测页。看到 warp=on 就说明线路通了。
+warp_test() {
+  port=$1
+  have curl || return 2
+  /usr/local/bin/wireproxy -c "$WARP_DIR/wireproxy.conf" >"$WORK/warp-test.log" 2>&1 &
+  wp=$!
+  ok=1
+  i=0
+  while [ "$i" -lt 6 ]; do
+    sleep 2
+    out=$(curl -s --max-time 10 --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    if printf '%s\n' "$out" | grep -q '^warp=on'; then
+      ok=0
+      break
     fi
-  } > /etc/yt-dlp-webui/env
-  chmod 600 /etc/yt-dlp-webui/env
-  umask 022
+    i=$((i + 1))
+  done
+  kill "$wp" 2>/dev/null || true
+  wait "$wp" 2>/dev/null || true
+  return "$ok"
 }
 
-env_get() {
-  key=$1
-  [ -f /etc/yt-dlp-webui/env ] || return 1
-  sed -n "s/^${key}=//p" /etc/yt-dlp-webui/env | head -n 1
+install_warp() {
+  WARP_CONF=
+  WARP_PORT=$(config_get warp_port 2>/dev/null || true)
+  [ -n "$WARP_PORT" ] || WARP_PORT=$(pick_warp_port)
+  if [ "$WARP_CHOSEN" != 1 ]; then
+    say_info "按你的选择，不用 Cloudflare WARP。"
+    rm -f /usr/local/bin/wireproxy
+    return 0
+  fi
+  say_step "准备 Cloudflare WARP 线路（被 YouTube 拦时换出口 IP 用）"
+  asset=$(wireproxy_asset "$ARCH" 2>/dev/null || true)
+  [ -n "$asset" ] || { say_warn "这个架构没有 wireproxy，跳过 WARP"; return 0; }
+  tag=$(latest_tag whyvl/wireproxy)
+  [ -n "$tag" ] || tag=v1.1.3
+  tgz=$WORK/wireproxy.tar.gz
+  # shellcheck disable=SC2046
+  if fetch_first "$tgz" $(github_urls "whyvl/wireproxy/releases/download/$tag/$asset") && is_gzip "$tgz"; then
+    mkdir -p "$WORK/wp"
+    tar -xzf "$tgz" -C "$WORK/wp" 2>/dev/null || true
+    wpbin=$(find "$WORK/wp" -type f -name wireproxy | head -n 1)
+    if [ -n "$wpbin" ] && is_elf "$wpbin"; then
+      place_elf "$wpbin" /usr/local/bin/wireproxy
+    fi
+    rm -rf "$WORK/wp" "$tgz"
+  fi
+  if [ ! -x /usr/local/bin/wireproxy ]; then
+    say_warn "wireproxy 没下下来，被拦时跳过 WARP 这一招"
+    return 0
+  fi
+  mkdir -p "$WARP_DIR"
+  chmod 700 "$WARP_DIR"
+  # 账号只注册一次。以后更新时沿用，不会每次都去 Cloudflare 注册新的。
+  if [ ! -s "$WARP_DIR/wgcf-profile.conf" ]; then
+    wtag=$(latest_tag ViRb3/wgcf)
+    [ -n "$wtag" ] || wtag=v2.3.0
+    wasset=$(wgcf_asset "${wtag#v}" "$ARCH" 2>/dev/null || true)
+    wbin=$WORK/wgcf
+    # shellcheck disable=SC2046
+    if [ -z "$wasset" ] || ! fetch_first "$wbin" $(github_urls "ViRb3/wgcf/releases/download/$wtag/$wasset") || ! is_elf "$wbin"; then
+      rm -f "$wbin"
+      say_warn "wgcf（注册 WARP 用的小工具）没下下来，被拦时跳过 WARP 这一招"
+      return 0
+    fi
+    chmod 755 "$wbin"
+    say_info "正在 Cloudflare 匿名注册一个免费 WARP（不用邮箱）…"
+    # 注册过程的输出记到 wgcf.log，失败时印最后几行，方便查原因。已经注册过就不再注册。
+    if ! (cd "$WARP_DIR" && { [ -s wgcf-account.toml ] || "$wbin" register --accept-tos; } && "$wbin" generate) > "$WARP_DIR/wgcf.log" 2>&1 \
+      || [ ! -s "$WARP_DIR/wgcf-profile.conf" ]; then
+      rm -f "$wbin"
+      say_warn "WARP 注册没成功（可能这台机器连不上 Cloudflare），被拦时跳过这一招。以后再运行 ytdlp-web 回车会重试。"
+      tail -n 5 "$WARP_DIR/wgcf.log" 2>/dev/null | sed 's/^/    /'
+      chmod 600 "$WARP_DIR/wgcf.log" 2>/dev/null || true
+      return 0
+    fi
+    rm -f "$wbin"
+  fi
+  {
+    printf '%s\n' "WGConfig = $WARP_DIR/wgcf-profile.conf"
+    printf '\n%s\n' '[Socks5]'
+    printf '%s\n' "BindAddress = 127.0.0.1:$WARP_PORT"
+  } > "$WARP_DIR/wireproxy.conf"
+  chmod 600 "$WARP_DIR"/* 2>/dev/null || true
+  WARP_CONF=$WARP_DIR/wireproxy.conf
+  if warp_test "$WARP_PORT"; then
+    say_ok "WARP 线路试过了，能用。平时不开，被拦时才自动打开。"
+  else
+    say_warn "WARP 线路这次没试通（有的机器封了 UDP）。先留着，被拦时还会再试。"
+  fi
 }
 
-config_get() {
-  key=$1
-  file=${2:-${YTD_CONFIG_FILE:-/etc/yt-dlp-webui/config.yml}}
-  [ -f "$file" ] || return 1
-  sed -n "s/^  ${key}: //p" "$file" | head -n 1 | sed 's/^"//; s/"$//'
+#----------------------------------------------------------------------
+# 网页服务本身（server.pl）。整份程序就写在这个脚本里，装的时候原样放出去。
+# 这样脚本和网页永远是同一个版本，不会一个新一个旧。
+#----------------------------------------------------------------------
+write_server() {
+  mkdir -p "$LIB_DIR"
+  cat > "$LIB_DIR/server.pl.new" <<'YTDLP_WEB_SERVER_EOF'
+#!/usr/bin/perl
+#======================================================================
+# ytdlp-web 网页服务
+#----------------------------------------------------------------------
+# 这是 install.sh 装到 VPS 上的小网页。Mac 浏览器打开的就是它。
+# 你贴一个链接，它让 yt-dlp 把视频下到 VPS，下完马上让浏览器存到 Mac，
+# 传完以后自动把 VPS 上的文件删掉。只用 Perl 自带的模块，64MB 小鸡也跑得动。
+#
+# 名词小词典
+#   网页服务  一直在 VPS 上跑的这个程序，听一个端口，浏览器连进来
+#   任务      你贴一次链接就是一个任务。每个任务在 jobs 里有一个自己的文件夹
+#   yt-dlp    真正去 YouTube 下视频的程序
+#   办法      被 YouTube 拦住时换的下载方式：换客户端、IPv6、PO 令牌、WARP、cookies
+#   PO 令牌   YouTube 用来确认“你是真浏览器”的一串码，bgutil-pot 程序会自动算
+#   WARP      Cloudflare 的免费线路。换一个 YouTube 不拦的出口 IP
+#   cookies   浏览器里的登录记录。上传以后 yt-dlp 就像登录了你的 YouTube 小号
+#   断点续传  网断了，浏览器从断的地方接着下，不用从头来（HTTP 的 Range）
+#   会话      登录成功后浏览器拿到的通行证（一个 cookie），30 天有效
+#   送达      文件的每一个字节都已经发给了浏览器
+#======================================================================
+use strict;
+use warnings;
+use IO::Socket::INET;
+use IO::Select;
+use POSIX qw(:sys_wait_h setsid strftime setlocale LC_ALL);
+use Fcntl qw(:flock O_WRONLY O_CREAT O_APPEND);
+use File::Path qw(make_path remove_tree);
+
+my $VERSION = '2.0.0';
+setlocale(LC_ALL, 'C');
+$SIG{PIPE} = 'IGNORE';
+
+#----------------------------------------------------------------------
+# 读配置。配置是 install.sh 写的 key=value 文件，一行一个。
+#----------------------------------------------------------------------
+my $CONF_FILE = $ARGV[0] || '/etc/ytdlp-web/web.conf';
+my %C = (
+  listen      => '0.0.0.0',
+  data        => '/var/lib/ytdlp-web',
+  keep_hours  => 6,      # 没传到 Mac 的文件，最多在 VPS 上留几个小时
+  grace       => 120,    # 传完以后再等几秒才删，给浏览器补最后一点的机会
+  ytdlp       => '/usr/local/bin/yt-dlp',
+  js          => '',
+  ffmpeg      => '',
+  wireproxy   => '',
+  warp_conf   => '',
+  warp_port   => 40000,
+  pot         => '',
+  pot_plugins => '',
+  cookies     => '/etc/ytdlp-web/cookies.txt',
+  min_free_mb => 300,
+  update_hours => 24,
+  sweep_secs  => 30,     # 多久检查一次该删的文件
+);
+read_conf($CONF_FILE);
+
+sub read_conf {
+  my ($f) = @_;
+  open(my $fh, '<', $f) or die "读不到配置文件 $f\n";
+  while (my $l = <$fh>) {
+    chomp $l;
+    $l =~ s/\r$//;
+    next if $l =~ /^\s*(#|$)/;
+    my ($k, $v) = split /=/, $l, 2;
+    next unless defined $v;
+    $C{$k} = $v;
+  }
+  close $fh;
+  die "配置里没有端口 port\n" unless ($C{port} || '') =~ /^\d+$/;
+  die "配置里没有密码 pass_hash\n" unless ($C{pass_hash} || '') =~ /^\$/;
+  $C{user} = 'admin' unless defined $C{user} && length $C{user};
+}
+
+my $DATA  = $C{data};
+my $JOBS  = "$DATA/jobs";
+my $STATE = "$DATA/state";
+make_path($JOBS, $STATE, "$DATA/tmp", "$DATA/cache", "$DATA/home");
+chmod 0700, $DATA;
+
+#----------------------------------------------------------------------
+# 小工具：读写文件、随机数、时间、JSON。
+#----------------------------------------------------------------------
+sub slurp {
+  my ($f) = @_;
+  open(my $fh, '<', $f) or return undef;
+  local $/;
+  my $d = <$fh>;
+  close $fh;
+  return $d;
+}
+
+# 先写到旁边的临时文件再改名，别的进程永远读不到写了一半的文件。
+sub spit {
+  my ($f, $d) = @_;
+  my $t = "$f.tmp$$";
+  open(my $fh, '>', $t) or return 0;
+  print $fh $d;
+  close $fh;
+  rename($t, $f) or do { unlink $t; return 0 };
+  return 1;
+}
+
+sub kv_read {
+  my ($f) = @_;
+  my %h;
+  my $d = slurp($f);
+  return \%h unless defined $d;
+  for my $l (split /\n/, $d) {
+    my ($k, $v) = split /=/, $l, 2;
+    next unless defined $v;
+    $v =~ s/\\n/\n/g;
+    $h{$k} = $v;
+  }
+  return \%h;
+}
+
+sub kv_write {
+  my ($f, $h) = @_;
+  my $d = '';
+  for my $k (sort keys %$h) {
+    my $v = defined $h->{$k} ? $h->{$k} : '';
+    $v =~ s/\r//g;
+    $v =~ s/\n/\\n/g;
+    $d .= "$k=$v\n";
+  }
+  return spit($f, $d);
+}
+
+sub kv_update {
+  my ($f, %new) = @_;
+  my $h = kv_read($f);
+  $h->{$_} = $new{$_} for keys %new;
+  kv_write($f, $h);
+}
+
+sub rand_hex {
+  my ($n) = @_;
+  open(my $fh, '<', '/dev/urandom') or die "没有 /dev/urandom\n";
+  my $b = '';
+  read($fh, $b, $n);
+  close $fh;
+  return unpack('H*', $b);
+}
+
+sub json {
+  my ($v) = @_;
+  if (ref $v eq 'HASH') {
+    return '{' . join(',', map { json_str($_) . ':' . json($v->{$_}) } sort keys %$v) . '}';
+  }
+  if (ref $v eq 'ARRAY') {
+    return '[' . join(',', map { json($_) } @$v) . ']';
+  }
+  if (ref $v eq 'SCALAR') {
+    return $$v;
+  }
+  return json_str($v);
+}
+
+sub json_str {
+  my ($s) = @_;
+  $s = '' unless defined $s;
+  $s =~ s/(["\\])/\\$1/g;
+  $s =~ s/\n/\\n/g;
+  $s =~ s/\r/\\r/g;
+  $s =~ s/\t/\\t/g;
+  $s =~ s/([\x00-\x1f\x7f])/sprintf('\\u%04x', ord($1))/ge;
+  $s =~ s/</\\u003c/g;
+  return "\"$s\"";
+}
+
+sub num  { my $n = shift; $n = 0 unless defined $n && $n =~ /^-?\d+(\.\d+)?$/; return \$n; }
+sub bool { return \($_[0] ? 'true' : 'false'); }
+
+sub url_decode {
+  my ($s) = @_;
+  return '' unless defined $s;
+  $s =~ tr/+/ /;
+  $s =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/ge;
+  return $s;
+}
+
+sub parse_form {
+  my ($s) = @_;
+  my %h;
+  for my $p (split /&/, $s || '') {
+    my ($k, $v) = split /=/, $p, 2;
+    $h{url_decode($k)} = url_decode($v);
+  }
+  return \%h;
+}
+
+sub pct_encode {
+  my ($s) = @_;
+  $s =~ s/([^A-Za-z0-9._~-])/sprintf('%%%02X', ord($1))/ge;
+  return $s;
+}
+
+sub html_esc {
+  my ($s) = @_;
+  $s = '' unless defined $s;
+  $s =~ s/&/&amp;/g;
+  $s =~ s/</&lt;/g;
+  $s =~ s/>/&gt;/g;
+  $s =~ s/"/&quot;/g;
+  return $s;
+}
+
+sub http_date { return strftime('%a, %d %b %Y %H:%M:%S GMT', gmtime($_[0])); }
+
+sub human_size {
+  my ($b) = @_;
+  return '' unless defined $b && $b =~ /^\d+(\.\d+)?$/;
+  return sprintf('%.1f GB', $b / 1073741824) if $b >= 1073741824;
+  return sprintf('%.1f MB', $b / 1048576) if $b >= 1048576;
+  return sprintf('%.0f KB', $b / 1024);
+}
+
+sub human_secs {
+  my ($s) = @_;
+  return '' unless defined $s && $s =~ /^\d+(\.\d+)?$/;
+  $s = int($s);
+  return sprintf('%d 小时 %d 分', int($s / 3600), int(($s % 3600) / 60)) if $s >= 3600;
+  return sprintf('%d 分 %d 秒', int($s / 60), $s % 60) if $s >= 60;
+  return "$s 秒";
+}
+
+sub logline {
+  my ($msg) = @_;
+  my $t = strftime('%Y-%m-%d %H:%M:%S', localtime);
+  print STDERR "[$t] $msg\n";
+}
+
+sub disk_free_mb {
+  my ($dir) = @_;
+  my $out = `df -Pk '$dir' 2>/dev/null`;
+  my @l = split /\n/, $out;
+  return -1 unless @l >= 2;
+  my @f = split /\s+/, $l[-1];
+  return -1 unless defined $f[3] && $f[3] =~ /^\d+$/;
+  return int($f[3] / 1024);
+}
+
+#----------------------------------------------------------------------
+# 读浏览器发来的请求。只收一个请求，回完就断开，简单可靠。
+#----------------------------------------------------------------------
+sub read_request {
+  my ($c) = @_;
+  my $buf = '';
+  my $sel = IO::Select->new($c);
+  my $deadline = time + 20;
+  while ($buf !~ /\r?\n\r?\n/) {
+    return undef if length($buf) > 32768;
+    my $left = $deadline - time;
+    return undef if $left <= 0;
+    return undef unless $sel->can_read($left);
+    my $n = sysread($c, $buf, 8192, length $buf);
+    return undef unless $n;
+  }
+  my ($head, $rest) = split /\r?\n\r?\n/, $buf, 2;
+  $rest = '' unless defined $rest;
+  my @lines = split /\r?\n/, $head;
+  my $first = shift @lines;
+  return undef unless $first =~ m{^([A-Z]+) (\S+) HTTP/\d\.\d$};
+  my ($method, $target) = ($1, $2);
+  my %h;
+  for my $l (@lines) {
+    next unless $l =~ /^([^:]+):\s*(.*?)\s*$/;
+    $h{lc $1} = $2;
+  }
+  my ($path, $query) = split /\?/, $target, 2;
+  my $r = {
+    method  => $method,
+    path    => $path,
+    query   => parse_form($query),
+    headers => \%h,
+    body    => '',
+    ip      => ($c->peerhost || '?'),
+  };
+  my $len = $h{'content-length'} || 0;
+  if ($len =~ /^\d+$/ && $len > 0) {
+    return { %$r, too_big => 1 } if $len > 2 * 1024 * 1024;
+    my $body = $rest;
+    while (length($body) < $len) {
+      my $left = $deadline + 20 - time;
+      return undef if $left <= 0;
+      return undef unless $sel->can_read($left);
+      my $n = sysread($c, $body, 65536, length $body);
+      return undef unless $n;
+    }
+    $r->{body} = substr($body, 0, $len);
+  }
+  return $r;
+}
+
+# 一直写，直到全部写完。浏览器 2 分钟都不收数据，就当它走了。
+sub write_all {
+  my ($c, $data) = @_;
+  my $sel = IO::Select->new($c);
+  my ($off, $len) = (0, length $data);
+  while ($off < $len) {
+    return 0 unless $sel->can_write(120);
+    my $n = syswrite($c, $data, $len - $off, $off);
+    return 0 unless defined $n && $n > 0;
+    $off += $n;
+  }
+  return 1;
+}
+
+my %REASON = (200 => 'OK', 206 => 'Partial Content', 302 => 'Found', 400 => 'Bad Request',
+  401 => 'Unauthorized', 403 => 'Forbidden', 404 => 'Not Found', 405 => 'Method Not Allowed',
+  413 => 'Payload Too Large', 416 => 'Range Not Satisfiable', 429 => 'Too Many Requests',
+  500 => 'Internal Server Error', 503 => 'Service Unavailable');
+
+sub head_text {
+  my ($code, $hdr) = @_;
+  my $s = "HTTP/1.1 $code " . ($REASON{$code} || 'OK') . "\r\n";
+  my %h = (
+    'Connection' => 'close',
+    'X-Content-Type-Options' => 'nosniff',
+    'X-Frame-Options' => 'SAMEORIGIN',
+    'Referrer-Policy' => 'no-referrer',
+    %$hdr,
+  );
+  $s .= "$_: $h{$_}\r\n" for sort keys %h;
+  return "$s\r\n";
+}
+
+sub respond {
+  my ($c, $r, $code, $type, $body, $extra) = @_;
+  $body = '' unless defined $body;
+  my %h = ('Content-Type' => $type, 'Content-Length' => length($body), 'Cache-Control' => 'no-store', %{ $extra || {} });
+  write_all($c, head_text($code, \%h) . (($r && $r->{method} eq 'HEAD') ? '' : $body));
+}
+
+sub respond_json { my ($c, $r, $code, $v) = @_; respond($c, $r, $code, 'application/json; charset=utf-8', json($v)); }
+sub redirect     { my ($c, $r, $to, $extra) = @_; respond($c, $r, 302, 'text/plain; charset=utf-8', '', { Location => $to, %{ $extra || {} } }); }
+
+#----------------------------------------------------------------------
+# 登录：密码对了发一张 30 天的通行证。错 5 次要等 10 分钟。
+#----------------------------------------------------------------------
+my $SESS_FILE = "$STATE/sessions";
+my $FAIL_FILE = "$STATE/login-fails";
+
+sub with_lock {
+  my ($name, $code) = @_;
+  open(my $lk, '>>', "$STATE/$name.lock") or return $code->();
+  flock($lk, LOCK_EX);
+  my @r = $code->();
+  close $lk;
+  return wantarray ? @r : $r[0];
+}
+
+sub cookie_token {
+  my ($r) = @_;
+  my $ck = $r->{headers}{cookie} || '';
+  return $1 if $ck =~ /(?:^|;\s*)ytw=([0-9a-f]{64})/;
+  return '';
+}
+
+sub session_ok {
+  my ($r) = @_;
+  my $tok = cookie_token($r);
+  return 0 unless $tok;
+  my $d = slurp($SESS_FILE) || '';
+  my $now = time;
+  for my $l (split /\n/, $d) {
+    my ($t, $exp) = split / /, $l;
+    return 1 if defined $exp && $t eq $tok && $exp > $now;
+  }
+  return 0;
+}
+
+sub session_add {
+  my $tok = rand_hex(32);
+  my $now = time;
+  with_lock('sessions', sub {
+    my $d = slurp($SESS_FILE) || '';
+    my @keep = grep { my ($t, $e) = split / /; defined $e && $e > $now } split /\n/, $d;
+    @keep = @keep[-50 .. -1] if @keep > 50;
+    push @keep, "$tok " . ($now + 30 * 86400);
+    spit($SESS_FILE, join("\n", @keep) . "\n");
+    chmod 0600, $SESS_FILE;
+  });
+  return $tok;
+}
+
+sub session_del {
+  my ($tok) = @_;
+  return unless $tok;
+  with_lock('sessions', sub {
+    my $d = slurp($SESS_FILE) || '';
+    my @keep = grep { (split / /)[0] ne $tok } split /\n/, $d;
+    spit($SESS_FILE, join("\n", @keep) . (@keep ? "\n" : ''));
+  });
+}
+
+sub login_blocked {
+  my ($ip) = @_;
+  my $d = slurp($FAIL_FILE) || '';
+  my $n = grep { my ($i, $t) = split / /; $i eq $ip && $t > time - 600 } split /\n/, $d;
+  return $n >= 5;
+}
+
+sub login_failed {
+  my ($ip) = @_;
+  with_lock('fails', sub {
+    my $d = slurp($FAIL_FILE) || '';
+    my @keep = grep { my ($i, $t) = split / /; defined $t && $t > time - 600 } split /\n/, $d;
+    push @keep, "$ip " . time;
+    @keep = @keep[-500 .. -1] if @keep > 500;
+    spit($FAIL_FILE, join("\n", @keep) . "\n");
+  });
+}
+
+sub password_ok {
+  my ($user, $pass) = @_;
+  return 0 unless defined $user && defined $pass && $user eq $C{user};
+  my $h = crypt($pass, $C{pass_hash});
+  return defined $h && $h eq $C{pass_hash};
+}
+
+#----------------------------------------------------------------------
+# 任务的样子：jobs/<编号>/ 里面放
+#   meta    链接、画质、什么时候贴的
+#   status  现在到哪一步了（网页每秒来读一次）
+#   log     yt-dlp 的原始输出，出错时排查用
+#   sent    浏览器已经拿走了哪几段（断点续传会分好几段）
+#   视频文件本身
+#----------------------------------------------------------------------
+my %QUALITY = (
+  mac  => 'Mac 能直接播放的最高画质',
+  best => '最高画质（4K/8K）',
+  p720 => '720p 小文件',
+  m4a  => '只要声音（m4a）',
+  mp3  => '只要声音（mp3）',
+);
+
+sub job_dir   { return "$JOBS/$_[0]"; }
+sub valid_id  { return defined $_[0] && $_[0] =~ /^[0-9a-f]{6,40}$/; }
+sub job_meta  { return kv_read(job_dir($_[0]) . '/meta'); }
+sub job_stat  { return kv_read(job_dir($_[0]) . '/status'); }
+sub set_stat  { my ($id, %h) = @_; kv_update(job_dir($id) . '/status', %h, updated => time); }
+
+sub list_jobs {
+  opendir(my $dh, $JOBS) or return ();
+  my @ids = grep { valid_id($_) && -d "$JOBS/$_" } readdir $dh;
+  closedir $dh;
+  return sort { $a cmp $b } @ids;
+}
+
+# 浏览器拿走的几段合在一起，看看有没有把整个文件都拿全。
+sub delivered_bytes {
+  my ($id, $size) = @_;
+  my $d = slurp(job_dir($id) . '/sent') || '';
+  my @r;
+  for my $l (split /\n/, $d) {
+    my ($s, $e) = split / /, $l;
+    next unless defined $e && $s =~ /^\d+$/ && $e =~ /^\d+$/ && $e >= $s;
+    push @r, [$s, $e];
+  }
+  @r = sort { $a->[0] <=> $b->[0] } @r;
+  my ($total, $cs, $ce) = (0, -1, -2);
+  for my $x (@r) {
+    if ($x->[0] > $ce + 1) {
+      $total += $ce - $cs + 1 if $ce >= $cs && $cs >= 0;
+      ($cs, $ce) = @$x;
+    } elsif ($x->[1] > $ce) {
+      $ce = $x->[1];
+    }
+  }
+  $total += $ce - $cs + 1 if $cs >= 0 && $ce >= $cs;
+  return $total;
+}
+
+sub active_transfers {
+  my ($id) = @_;
+  my $dir = job_dir($id);
+  opendir(my $dh, $dir) or return 0;
+  my @a = grep { /^active\.\d+$/ } readdir $dh;
+  closedir $dh;
+  my $n = 0;
+  for my $f (@a) {
+    my ($pid) = $f =~ /(\d+)$/;
+    if (kill(0, $pid)) { $n++; } else { unlink "$dir/$f"; }
+  }
+  return $n;
+}
+
+sub media_path {
+  my ($id) = @_;
+  my $st = job_stat($id);
+  my $f = $st->{file};
+  return undef unless defined $f && length $f && $f !~ m{/} && $f ne '.' && $f ne '..';
+  my $p = job_dir($id) . "/$f";
+  return -f $p ? $p : undef;
+}
+
+sub job_view {
+  my ($id) = @_;
+  my $m  = job_meta($id);
+  my $st = job_stat($id);
+  my $state = $st->{state} || 'queued';
+  my $path = media_path($id);
+  my $size = $st->{size} || 0;
+  my $sent = ($state eq 'done' && $size) ? delivered_bytes($id, $size) : 0;
+  my $line = $st->{line} || '';
+  if ($state eq 'queued') {
+    $line = '排队中，前面的视频下完就轮到它';
+  } elsif ($state eq 'done') {
+    if (!$path) {
+      $line = $st->{gone} || '已经传到你的 Mac，服务器上的文件已删除';
+    } elsif ($size && $sent >= $size) {
+      $line = '已经传到你的 Mac。服务器上的文件马上自动删除';
+    } elsif ($sent > 0) {
+      $line = sprintf('正在传到你的 Mac（%d%%）。看浏览器右上角的下载图标', int($sent * 100 / $size));
+    } else {
+      $line = '服务器已下好，正在交给浏览器保存到 Mac…';
+    }
+  }
+  return {
+    id      => $id,
+    url     => $m->{url},
+    quality => $QUALITY{ $m->{q} || 'mac' } || '',
+    q       => $m->{q} || 'mac',
+    title   => $st->{title} || '',
+    state   => $state,
+    line    => $line,
+    pct     => num($st->{pct} || 0),
+    file    => $st->{file} || '',
+    size    => human_size($size),
+    has_file => bool($path),
+    delivered => bool($size && $sent >= $size),
+    error   => $st->{error} || '',
+    hint    => $st->{hint} || '',
+    created => num($m->{created} || 0),
+  };
+}
+
+#----------------------------------------------------------------------
+# 收到一个新链接。先检查像不像视频链接，再排进队里。
+#----------------------------------------------------------------------
+sub check_url {
+  my ($u) = @_;
+  $u = '' unless defined $u;
+  $u =~ s/^\s+|\s+$//g;
+  return (undef, '先把视频链接粘贴到框里。') unless length $u;
+  $u = "https://$u" if $u =~ m{^(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/}i;
+  return (undef, '这不像网址。请从浏览器地址栏或 YouTube 的「分享」里复制完整链接，应该以 https:// 开头。')
+    unless $u =~ m{^https?://[^\s/]+\.[^\s/]+\S*$}i && length($u) < 2000;
+  if ($u =~ m{^https?://([^/]*\.)?youtube\.com/(playlist|feed|channel|c/|@)}i && $u !~ /[?&]v=/) {
+    return (undef, '这是播放列表或频道的链接。一次只能贴一个视频：点进某个视频，再复制它的链接。');
+  }
+  return ($u, '');
+}
+
+sub add_job {
+  my ($u, $q) = @_;
+  my ($url, $why) = check_url($u);
+  return (undef, $why) unless $url;
+  $q = 'mac' unless defined $q && $QUALITY{$q};
+  my $waiting = grep { my $s = job_stat($_)->{state} || 'queued'; $s eq 'queued' || $s eq 'running' } list_jobs();
+  return (undef, '排队的视频已经有 10 个了，等前面的下完再贴。') if $waiting >= 10;
+  # 编号 = 时间 + 顺序号 + 一点随机数。按编号排序就是贴链接的先后顺序。
+  my $seq = with_lock('seq', sub {
+    my $n = (slurp("$STATE/seq") || 0) + 1;
+    $n = 1 if $n > 99999;
+    spit("$STATE/seq", "$n\n");
+    return $n;
+  });
+  my $id = strftime('%Y%m%d%H%M%S', localtime) . sprintf('%05d', $seq) . rand_hex(2);
+  make_path(job_dir($id));
+  kv_write(job_dir($id) . '/meta', { url => $url, q => $q, created => time });
+  kv_write(job_dir($id) . '/status', { state => 'queued', updated => time });
+  logline("新任务 $id $url ($q)");
+  return ($id, '');
+}
+
+#----------------------------------------------------------------------
+# 把文件发给浏览器。支持断点续传，中文文件名不会乱码。
+#----------------------------------------------------------------------
+my %MIME = (mp4 => 'video/mp4', m4a => 'audio/mp4', mp3 => 'audio/mpeg', webm => 'video/webm',
+  mkv => 'video/x-matroska', opus => 'audio/ogg', ogg => 'audio/ogg', mov => 'video/quicktime');
+
+sub serve_file {
+  my ($c, $r, $id) = @_;
+  my $path = media_path($id);
+  unless ($path) {
+    return respond($c, $r, 404, 'text/html; charset=utf-8',
+      page_simple('文件已经不在服务器上了', '这个视频已经传给浏览器，或者放太久被自动删掉了。回到首页重新贴一次链接就行。'));
+  }
+  open(my $fh, '<', $path) or return respond($c, $r, 404, 'text/plain; charset=utf-8', "not found\n");
+  binmode $fh;
+  my @s = stat($fh);
+  my ($size, $mtime) = ($s[7], $s[9]);
+  my $etag = sprintf('"%x-%x"', $size, $mtime);
+  my $lm = http_date($mtime);
+  my ($start, $end, $partial) = (0, $size - 1, 0);
+  my $range = $r->{headers}{range};
+  my $ifr = $r->{headers}{'if-range'};
+  if (defined $range && (!defined $ifr || $ifr eq $etag || $ifr eq $lm)) {
+    if ($range =~ /^bytes=(\d*)-(\d*)$/ && (length $1 || length $2)) {
+      my ($a, $b) = ($1, $2);
+      if (length $a) {
+        $start = $a + 0;
+        $end = length $b ? $b + 0 : $size - 1;
+        $end = $size - 1 if $end > $size - 1;
+      } else {
+        my $n = $b + 0;
+        $start = $n >= $size ? 0 : $size - $n;
+        $end = $size - 1;
+      }
+      if ($start > $end || $start >= $size) {
+        return respond($c, $r, 416, 'text/plain; charset=utf-8', '', { 'Content-Range' => "bytes */$size" });
+      }
+      $partial = 1;
+    }
+  }
+  my $name = (split m{/}, $path)[-1];
+  my ($ext) = $name =~ /\.([A-Za-z0-9]+)$/;
+  $ext = lc($ext || '');
+  my $ascii = $name;
+  $ascii =~ s/[^\x20-\x7e]/_/g;
+  $ascii =~ s/["\\;%]/_/g;
+  $ascii =~ s/_{2,}/_/g;
+  $ascii = "video.$ext" if $ascii =~ /^[_ .]*(\.[A-Za-z0-9]+)?$/;
+  my $len = $end - $start + 1;
+  my %h = (
+    'Content-Type' => $MIME{$ext} || 'application/octet-stream',
+    'Content-Length' => $len,
+    'Content-Disposition' => "attachment; filename=\"$ascii\"; filename*=UTF-8''" . pct_encode($name),
+    'Accept-Ranges' => 'bytes',
+    'ETag' => $etag,
+    'Last-Modified' => $lm,
+    'Cache-Control' => 'private, no-transform',
+  );
+  $h{'Content-Range'} = "bytes $start-$end/$size" if $partial;
+  return unless write_all($c, head_text($partial ? 206 : 200, \%h));
+  return if $r->{method} eq 'HEAD';
+  # 记下“有人正在拿这个文件”。正在传的时候不会被清理删掉。
+  my $mark = job_dir($id) . "/active.$$";
+  if (open(my $mk, '>', $mark)) { close $mk; }
+  logline("开始发送 $id 字节 $start-$end/$size 给 $r->{ip}");
+  sysseek($fh, $start, 0);
+  my $sel = IO::Select->new($c);
+  my $done = 0;
+  while ($done < $len) {
+    my $want = $len - $done;
+    $want = 262144 if $want > 262144;
+    my $buf;
+    my $got = sysread($fh, $buf, $want);
+    last unless $got;
+    my $off = 0;
+    while ($off < $got) {
+      last unless $sel->can_write(300);
+      my $n = syswrite($c, $buf, $got - $off, $off);
+      last unless defined $n && $n > 0;
+      $off += $n;
+    }
+    $done += $off;
+    last if $off < $got;
+  }
+  close $fh;
+  if ($done > 0) {
+    if (sysopen(my $sf, job_dir($id) . '/sent', O_WRONLY | O_CREAT | O_APPEND)) {
+      syswrite($sf, sprintf("%d %d\n", $start, $start + $done - 1));
+      close $sf;
+    }
+  }
+  unlink $mark;
+  logline(sprintf('发送结束 %s 发出 %s / %s', $id, $done, $len));
+}
+
+#----------------------------------------------------------------------
+# cookies：网页上贴进来的 cookies.txt。先检查格式，再存成只有 root 能读的文件。
+#----------------------------------------------------------------------
+sub save_cookies {
+  my ($text) = @_;
+  $text = '' unless defined $text;
+  $text =~ s/\r\n?/\n/g;
+  $text =~ s/^\x{FEFF}//;
+  $text =~ s/^\xEF\xBB\xBF//;
+  return '框里是空的。先选择文件，或者把 cookies.txt 的内容粘贴进来。' unless $text =~ /\S/;
+  return '这是 JSON 格式。请在扩展里选「Netscape」或「cookies.txt」格式再导出一次。' if $text =~ /^\s*[\[{]/;
+  my ($ok, $yt) = (0, 0);
+  for my $l (split /\n/, $text) {
+    next if $l =~ /^#(?!HttpOnly_)/ || $l !~ /\S/;
+    my @f = split /\t/, $l;
+    next unless @f >= 7;
+    $ok++;
+    $yt++ if $f[0] =~ /youtube\.com$/i;
+  }
+  return '看不懂这个文件。要的是扩展导出的 cookies.txt（每行用 Tab 分隔的那种）。' unless $ok;
+  return '文件里没有 youtube.com 的 cookies。请先在浏览器里打开 YouTube 并登录，再导出。' unless $yt;
+  $text = "# Netscape HTTP Cookie File\n$text" unless $text =~ /^# (Netscape )?HTTP Cookie File/;
+  my $f = $C{cookies};
+  my $old = umask 077;
+  my $okw = spit($f, $text);
+  umask $old;
+  return '保存失败，服务器上写不了文件。' unless $okw;
+  chmod 0600, $f;
+  unlink "$STATE/cookies-bad";
+  logline('收到新的 cookies');
+  return '';
+}
+
+#----------------------------------------------------------------------
+# 路由：浏览器要什么，就交给对应的那一段。
+#----------------------------------------------------------------------
+sub handle {
+  my ($c) = @_;
+  my $r = read_request($c);
+  return unless $r;
+  my $p = $r->{path};
+  my $m = $r->{method};
+  return respond($c, $r, 413, 'text/plain; charset=utf-8', "too big\n") if $r->{too_big};
+
+  if ($p eq '/health') {
+    return respond($c, $r, 200, 'text/plain; charset=utf-8', "ytdlp-web ok $VERSION\n");
+  }
+  if ($p eq '/login' && $m eq 'POST') {
+    if (login_blocked($r->{ip})) {
+      return respond($c, $r, 429, 'text/html; charset=utf-8', page_login('密码错了太多次。请 10 分钟后再试。'));
+    }
+    my $f = parse_form($r->{body});
+    if (password_ok($f->{user}, $f->{pass})) {
+      my $tok = session_add();
+      logline("登录成功 $r->{ip}");
+      return redirect($c, $r, '/', { 'Set-Cookie' => "ytw=$tok; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax" });
+    }
+    login_failed($r->{ip});
+    logline("登录失败 $r->{ip}");
+    return respond($c, $r, 401, 'text/html; charset=utf-8', page_login('名字或密码不对。忘了密码：在 VPS 上输入 ytdlp-web --status 查看。'));
+  }
+  if ($p eq '/logout') {
+    session_del(cookie_token($r));
+    return redirect($c, $r, '/', { 'Set-Cookie' => 'ytw=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax' });
+  }
+  unless (session_ok($r)) {
+    return respond_json($c, $r, 401, { error => '请先登录' }) if $p =~ m{^/api/};
+    return respond($c, $r, 200, 'text/html; charset=utf-8', page_login('')) if $p eq '/' || $p eq '/login';
+    return redirect($c, $r, '/');
+  }
+
+  if ($p eq '/' || $p eq '/login') {
+    return respond($c, $r, 200, 'text/html; charset=utf-8', page_app());
+  }
+  if ($p =~ m{^/dl/([0-9a-f]+)$} && ($m eq 'GET' || $m eq 'HEAD')) {
+    my $id = $1;
+    return respond($c, $r, 404, 'text/plain; charset=utf-8', "not found\n") unless valid_id($id);
+    return serve_file($c, $r, $id);
+  }
+  if ($p eq '/api/jobs' && $m eq 'GET') {
+    my @v = map { job_view($_) } reverse list_jobs();
+    @v = @v[0 .. 29] if @v > 30;
+    return respond_json($c, $r, 200, { jobs => \@v, info => server_info() });
+  }
+  # 改东西的请求必须带上网页自己加的暗号，别的网站骗不了你的浏览器来下单。
+  if ($m eq 'POST' && $p =~ m{^/api/}) {
+    return respond_json($c, $r, 403, { error => '请刷新网页再试一次' }) unless ($r->{headers}{'x-ytw'} || '') eq '1';
+    my $f = parse_form($r->{body});
+    if ($p eq '/api/add') {
+      my ($id, $why) = add_job($f->{url}, $f->{q});
+      return respond_json($c, $r, 200, $id ? { ok => bool(1), id => $id } : { error => $why });
+    }
+    if ($p eq '/api/delete') {
+      my $id = $f->{id};
+      return respond_json($c, $r, 404, { error => '没有这个任务' }) unless valid_id($id) && -d job_dir($id);
+      my $st = job_stat($id)->{state} || 'queued';
+      if ($st eq 'running') {
+        if (open(my $cf, '>', job_dir($id) . '/cancel')) { close $cf; }
+      } else {
+        remove_tree(job_dir($id));
+      }
+      logline("删除任务 $id");
+      return respond_json($c, $r, 200, { ok => bool(1) });
+    }
+    if ($p eq '/api/cookies') {
+      my $why = save_cookies($f->{text});
+      return respond_json($c, $r, 200, $why ? { error => $why } : { ok => bool(1) });
+    }
+    if ($p eq '/api/cookies/delete') {
+      unlink $C{cookies};
+      unlink "$STATE/cookies-bad";
+      logline('cookies 已删除');
+      return respond_json($c, $r, 200, { ok => bool(1) });
+    }
+    if ($p eq '/api/update') {
+      unlink "$STATE/last-update";
+      return respond_json($c, $r, 200, { ok => bool(1) });
+    }
+  }
+  return respond($c, $r, 404, 'text/plain; charset=utf-8', "not found\n");
+}
+
+sub server_info {
+  my $st = kv_read("$STATE/info");
+  my $sticky = kv_read("$STATE/sticky");
+  my %names = map { $_->{key} => $_->{label} } all_methods();
+  my $has_ck = -s $C{cookies} ? 1 : 0;
+  my @ms = map { $_->{label} } grep { $_->{ok} } all_methods();
+  return {
+    ytdlp      => $st->{ytdlp_version} || '',
+    updated    => $st->{last_update_text} || '',
+    method     => ($sticky->{key} && $names{ $sticky->{key} }) ? $names{ $sticky->{key} } : '',
+    methods    => \@ms,
+    cookies    => bool($has_ck),
+    cookies_at => $has_ck ? strftime('%Y-%m-%d %H:%M', localtime((stat($C{cookies}))[9])) : '',
+    cookies_bad => bool(-e "$STATE/cookies-bad"),
+    keep_hours => num($C{keep_hours}),
+    grace_min  => num(int(($C{grace} + 59) / 60)),
+    free       => disk_free_mb($DATA) >= 0 ? human_size(disk_free_mb($DATA) * 1048576) : '',
+    version    => $VERSION,
+  };
+}
+
+#----------------------------------------------------------------------
+# 被 YouTube 拦住时一个一个试的办法。前面的不用账号，最后才用你上传的 cookies。
+# 上次成功的办法会先试（记 24 小时），省时间。
+#----------------------------------------------------------------------
+sub has_global_ipv6 {
+  my $d = slurp('/proc/net/if_inet6') || '';
+  for my $l (split /\n/, $d) {
+    my @f = split /\s+/, $l;
+    next unless @f >= 6;
+    next unless $f[3] eq '00';
+    next if $f[0] =~ /^(fe8|fe9|fea|feb|fc|fd)/i || $f[0] =~ /^0{31}1$/;
+    return 1;
+  }
+  return 0;
+}
+
+sub pot_args {
+  return () unless $C{pot} && -x $C{pot} && $C{pot_plugins} && -d $C{pot_plugins};
+  return ('--plugin-dirs', $C{pot_plugins}, '--extractor-args', "youtubepot-bgutilcli:cli_path=$C{pot}");
+}
+
+sub all_methods {
+  my @pot = pot_args();
+  my $warp = ($C{wireproxy} && -x $C{wireproxy} && $C{warp_conf} && -s $C{warp_conf}) ? 1 : 0;
+  return (
+    { key => 'direct',  label => '直接下载', ok => 1, args => [] },
+    { key => 'clients', label => '换一种 YouTube 客户端', ok => 1,
+      args => ['--extractor-args', 'youtube:player_client=android_vr,web_safari,tv_downgraded,web_embedded'] },
+    { key => 'ipv6',    label => '改走 IPv6', ok => has_global_ipv6(), args => ['--force-ipv6'] },
+    { key => 'pot',     label => '自动生成 PO 令牌', ok => (@pot ? 1 : 0),
+      args => [@pot, '--extractor-args', 'youtube:player_client=default,mweb'] },
+    { key => 'warp',    label => '换 Cloudflare WARP 线路', ok => $warp, warp => 1,
+      args => ['--proxy', "socks5://127.0.0.1:$C{warp_port}", @pot] },
+    { key => 'cookies', label => '用你上传的 cookies', ok => (-s $C{cookies} ? 1 : 0), cookies => 1,
+      args => ['--cookies', $C{cookies}] },
+  );
+}
+
+sub method_order {
+  my @m = grep { $_->{ok} } all_methods();
+  my $s = kv_read("$STATE/sticky");
+  if ($s->{key} && ($s->{at} || 0) > time - 86400) {
+    my @first = grep { $_->{key} eq $s->{key} } @m;
+    my @rest  = grep { $_->{key} ne $s->{key} } @m;
+    @m = (@first, @rest);
+  }
+  return @m;
+}
+
+sub quality_args {
+  my ($q) = @_;
+  my $ff = ($C{ffmpeg} && -x $C{ffmpeg}) ? 1 : 0;
+  if ($q eq 'm4a') {
+    return $ff ? ('-f', 'ba[ext=m4a]/ba/b', '-x', '--audio-format', 'm4a') : ('-f', 'ba[ext=m4a]/ba');
+  }
+  if ($q eq 'mp3') {
+    return ('-f', 'ba/b', '-x', '--audio-format', 'mp3', '--audio-quality', '2');
+  }
+  my $fmt = $ff ? 'bv*+ba/b' : 'b';
+  return ('-f', $fmt, '--merge-output-format', 'mp4/mkv') if $q eq 'best';
+  return ('-f', $fmt, '-S', 'vcodec:h264,res:720,acodec:aac', '--merge-output-format', 'mp4') if $q eq 'p720';
+  return ('-f', $fmt, '-S', 'vcodec:h264,res,acodec:aac', '--merge-output-format', 'mp4');
+}
+
+sub base_args {
+  my ($dir) = @_;
+  my @a = (
+    '--ignore-config', '--no-playlist', '--no-mtime', '--newline', '--progress', '--color', 'never',
+    '--no-simulate', '--match-filter', '!is_live',
+    '--progress-template', 'download:PROG %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(progress.speed)s %(progress.eta)s',
+    '--progress-template', 'postprocess:POST %(progress.postprocessor)s',
+    '--print', 'video:TITLE %(title)s',
+    '--print', 'after_move:FILE %(filepath)s',
+    '--paths', "home:$dir", '--paths', "temp:$dir",
+    '-o', '%(title).150B.%(ext)s',
+    '--retries', '5', '--fragment-retries', '5', '--socket-timeout', '30',
+    '--cache-dir', "$DATA/cache",
+  );
+  push @a, '--js-runtimes', $C{js} if $C{js};
+  push @a, '--ffmpeg-location', $C{ffmpeg} if $C{ffmpeg} && -x $C{ffmpeg};
+  return @a;
+}
+
+#----------------------------------------------------------------------
+# 看 yt-dlp 的英文报错，换成大白话。返回：种类、给你看的话、提示。
+#   blocked      被拦了，换下一种办法
+#   need_cookies 一定要登录才能看（年龄限制、会员）
+#   cookies_bad  cookies 过期了
+#   fatal        换办法也没用（链接错、视频删了、硬盘满）
+#----------------------------------------------------------------------
+sub classify {
+  my ($out, $sig) = @_;
+  my $t = lc($out || '');
+  my @err = grep { /^error:/i } split /\n/, ($out || '');
+  my $e = lc(join("\n", @err) || $t);
+  return ('fatal', '服务器内存不够，下载程序被系统杀掉了。换一个小一点的画质（比如 720p）再试，或者给 VPS 加内存。', '')
+    if $sig && $sig == 9;
+  return ('fatal', '服务器硬盘满了。等一会儿让旧文件自动删掉，或者清一清 VPS 的硬盘。', '') if $t =~ /no space left/;
+  return ('cookies_bad', '你上传的 cookies 已经失效了（过期或者 YouTube 让它下线了）。请按下面的步骤重新导出一份再上传。', 'cookies')
+    if $e =~ /cookies are no longer valid|cookies (have|has) (expired|been rotated)/;
+  return ('need_cookies', '这个视频有年龄限制，YouTube 要求登录才能看。请上传一个已满 18 岁的 YouTube 小号的 cookies。', 'cookies')
+    if $e =~ /confirm your age|age[- ]restricted|inappropriate for some users/;
+  return ('need_cookies', '这是频道会员专属视频，要用已经加入会员的账号的 cookies 才能下。', 'cookies')
+    if $e =~ /members[- ]only|join this channel/;
+  return ('fatal', '这是私密视频，只有上传者自己能看，下不了。', '') if $e =~ /private video/;
+  return ('fatal', '这是正在直播（或还没开始）的视频，暂时下不了。等直播结束有回放了再试。', '')
+    if $e =~ /live event will begin|premieres in|is_live|is a live/ || ($t =~ /does not pass filter/ && $t =~ /is_live/);
+  return ('fatal', '这个链接下载程序认不出来。请确认是视频页面的链接（例如 https://www.youtube.com/watch?v=...）。', '')
+    if $e =~ /unsupported url|is not a valid url|no video formats found|incomplete youtube id/;
+  return ('fatal', '服务器上的 ffmpeg 不能用，合并不了画面和声音。在 VPS 上运行 ytdlp-web 回车更新一次。', '')
+    if $e =~ /ffmpeg.*not (installed|found)|ffprobe.*not found/;
+  return ('blocked', 'YouTube 认为这台服务器是机器人，要求登录（Sign in to confirm you’re not a bot）。', 'cookies')
+    if $e =~ /not a bot|sign in to confirm/;
+  return ('blocked', '这台服务器下载太频繁，被 YouTube 暂时限制了。', 'cookies')
+    if $e =~ /http error 429|too many requests|try again later|rate[- ]limit/;
+  return ('blocked', 'YouTube 拒绝了这台服务器的下载请求（403）。', 'cookies') if $e =~ /http error 403|403: forbidden/;
+  return ('blocked', '这个视频在服务器所在的国家/地区看不了。', '')
+    if $e =~ /not available in your country|not made this video available in your country|geo.?restrict/;
+  return ('blocked', 'YouTube 的视频暗号没解开（要用 JavaScript 程序算）。', '')
+    if $e =~ /javascript runtime|challenge solving failed|signature|nsig|n challenge/;
+  return ('blocked', '没拿到可以下载的画质，多半是被 YouTube 限制了。', 'cookies')
+    if $e =~ /requested format is not available|only images are available|page needs to be reloaded|failed to extract|unable to extract|precondition/;
+  return ('fatal', '这个视频不存在，或者已经被删除。请在浏览器里确认一下能不能打开。', '')
+    if $e =~ /video unavailable|has been removed|does not exist|this video is no longer available/;
+  return ('blocked', '服务器连不上 YouTube（网络不通或超时）。', '')
+    if $e =~ /timed out|connection (reset|refused)|network is unreachable|name or service not known|temporary failure in name resolution|unable to connect to proxy|eof occurred|ssl: |ssl error|certificate verify/;
+  my $raw = $err[-1] || (grep { /\S/ } split /\n/, ($out || ''))[-1] || '没有输出';
+  $raw =~ s/^ERROR:\s*//i;
+  $raw = substr($raw, 0, 300);
+  return ('blocked', "下载失败。原始报错：$raw", '');
+}
+
+#----------------------------------------------------------------------
+# 跑一次 yt-dlp。一边跑一边把进度写给网页看。
+#----------------------------------------------------------------------
+sub child_env {
+  $ENV{TMPDIR} = "$DATA/tmp";
+  $ENV{TMP} = $ENV{TEMP} = $ENV{TMPDIR};
+  $ENV{HOME} = "$DATA/home";
+  $ENV{XDG_CACHE_HOME} = "$DATA/cache";
+  $ENV{LANG} = 'C.UTF-8';
+  $ENV{LC_ALL} = 'C.UTF-8';
+  $ENV{PYTHONIOENCODING} = 'utf-8';
+  $ENV{PYTHONUTF8} = '1';
+  $ENV{MALLOC_ARENA_MAX} = '2';
+  $ENV{PATH} = '/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin';
+}
+
+sub run_cmd_capture {
+  my ($timeout, @cmd) = @_;
+  my $pid = open(my $out, '-|');
+  return ('', -1) unless defined $pid;
+  if ($pid == 0) {
+    child_env();
+    open(STDERR, '>&', \*STDOUT);
+    exec { $cmd[0] } @cmd or POSIX::_exit(127);
+  }
+  my $buf = '';
+  my $sel = IO::Select->new($out);
+  my $end = time + $timeout;
+  while (time < $end) {
+    next unless $sel->can_read(1);
+    my $n = sysread($out, $buf, 65536, length $buf);
+    last unless $n;
+  }
+  kill 'KILL', $pid if time >= $end;
+  close $out;
+  return ($buf, $?);
+}
+
+sub port_open {
+  my ($port) = @_;
+  my $s = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $port, Proto => 'tcp', Timeout => 2);
+  return 0 unless $s;
+  close $s;
+  return 1;
+}
+
+# WARP 平时不开，省内存。要用的时候才把 wireproxy 叫起来，用完就关。
+sub warp_start {
+  return 0 if port_open($C{warp_port});
+  my $pid = fork();
+  return undef unless defined $pid;
+  if ($pid == 0) {
+    child_env();
+    open(STDOUT, '>>', "$STATE/warp.log");
+    open(STDERR, '>&', \*STDOUT);
+    exec { $C{wireproxy} } $C{wireproxy}, '-c', $C{warp_conf} or POSIX::_exit(127);
+  }
+  for (1 .. 40) {
+    return $pid if port_open($C{warp_port});
+    last if waitpid($pid, WNOHANG) == $pid;
+    select(undef, undef, undef, 0.25);
+  }
+  kill 'TERM', $pid;
+  waitpid($pid, 0);
+  return undef;
+}
+
+sub warp_stop {
+  my ($pid) = @_;
+  return unless $pid;
+  kill 'TERM', $pid;
+  for (1 .. 20) {
+    return if waitpid($pid, WNOHANG) == $pid;
+    select(undef, undef, undef, 0.1);
+  }
+  kill 'KILL', $pid;
+  waitpid($pid, 0);
+}
+
+sub clean_media {
+  my ($dir) = @_;
+  opendir(my $dh, $dir) or return;
+  for my $f (readdir $dh) {
+    next if $f =~ /^(\.|\.\.|meta|status|log|cancel|sent)$/ || $f =~ /^active\./ || $f =~ /\.tmp\d+$/;
+    my $p = "$dir/$f";
+    if (-d $p) { remove_tree($p); } else { unlink $p; }
+  }
+  closedir $dh;
+}
+
+sub append_log {
+  my ($dir, $text) = @_;
+  my $f = "$dir/log";
+  return if -s $f && -s $f > 2 * 1024 * 1024;
+  if (open(my $fh, '>>', $f)) { print $fh $text; close $fh; }
+}
+
+# 网页服务要停的时候，正在跑的 yt-dlp 和 WARP 也一起停掉，不留孤儿进程。
+our ($CUR_CHILD, $CUR_WARP) = (0, 0);
+sub runner_stop {
+  kill 'KILL', -$CUR_CHILD if $CUR_CHILD;
+  kill 'TERM', $CUR_WARP if $CUR_WARP;
+  POSIX::_exit(1);
+}
+
+sub run_ytdlp {
+  my ($id, $meta, $m, $n, $total) = @_;
+  my $dir = job_dir($id);
+  my @cmd = ($C{ytdlp}, base_args($dir), quality_args($meta->{q} || 'mac'), @{ $m->{args} }, '--', $meta->{url});
+  append_log($dir, "\n===== 第 $n 种办法：$m->{label} =====\n" . join(' ', map { /\s/ ? "'$_'" : $_ } @cmd) . "\n");
+  my $warp_pid;
+  if ($m->{warp}) {
+    set_stat($id, line => "正在打开 Cloudflare WARP 线路…");
+    $warp_pid = warp_start();
+    unless (defined $warp_pid) {
+      append_log($dir, "WARP 没打开，看 $STATE/warp.log\n");
+      return (0, 'ERROR: unable to connect to proxy (WARP 没打开)', 0);
+    }
+  }
+  my $pid = open(my $out, '-|');
+  unless (defined $pid) {
+    warp_stop($warp_pid);
+    return (0, 'ERROR: fork failed', 0);
+  }
+  if ($pid == 0) {
+    setpgrp(0, 0);
+    child_env();
+    chdir $dir;
+    open(STDERR, '>&', \*STDOUT);
+    eval { setpriority(0, 0, 10) };
+    exec { $cmd[0] } @cmd or do { print "ERROR: 启动不了 $cmd[0]：$!\n"; POSIX::_exit(127); };
+  }
+  $CUR_CHILD = $pid;
+  $CUR_WARP = $warp_pid;
+  my $sel = IO::Select->new($out);
+  my ($buf, $tail, $file, $part, $lastb, $lastw, $lastout) = ('', '', '', 1, -1, 0, time);
+  my $label = $total > 1 ? "（第 $n 种办法：$m->{label}）" : '';
+  my $cancel = 0;
+  while (1) {
+    if (-e "$dir/cancel") { $cancel = 1; kill 'KILL', -$pid; last; }
+    if (time - $lastout > 900) { append_log($dir, "15 分钟没有动静，强制停止\n"); kill 'KILL', -$pid; last; }
+    next unless $sel->can_read(1);
+    my $n2 = sysread($out, $buf, 65536, length $buf);
+    last unless $n2;
+    $lastout = time;
+    while ($buf =~ s/^([^\n]*)\n//) {
+      my $l = $1;
+      $l =~ s/\r//g;
+      if ($l =~ /^PROG (\S+) (\S+) (\S+) (\S+) (\S+)/) {
+        my ($got, $tot, $est, $spd, $eta) = ($1, $2, $3, $4, $5);
+        $tot = $est if $tot !~ /^\d/;
+        next unless $got =~ /^\d/;
+        $part++ if $lastb > 0 && $got + 0 < $lastb * 0.5 && $lastb > 1048576;
+        $lastb = $got + 0;
+        next if time - $lastw < 1;
+        $lastw = time;
+        my $pct = ($tot =~ /^\d/ && $tot > 0) ? int($got * 100 / $tot) : 0;
+        my $line = '正在从 YouTube 下载到服务器' . ($part > 1 ? '（声音部分）' : '') . "：$pct%";
+        $line .= '，' . human_size($spd) . '/秒' if $spd =~ /^\d/;
+        $line .= '，还要 ' . human_secs($eta) if $eta =~ /^\d/;
+        set_stat($id, line => $line . $label, pct => $pct);
+        next;
+      }
+      if ($l =~ /^POST (\S+)/) {
+        my $pp = $1;
+        my $line = $pp =~ /Merger/ ? '正在把画面和声音合在一起…' : $pp =~ /ExtractAudio/ ? '正在转换成音频文件…' : '正在整理文件…';
+        set_stat($id, line => $line, pct => 100) if time - $lastw >= 1;
+        $lastw = time;
+        next;
+      }
+      if ($l =~ /^TITLE (.*)$/) { set_stat($id, title => $1); next; }
+      if ($l =~ /^FILE (.*)$/)  { $file = $1; next; }
+      $tail .= "$l\n";
+      append_log($dir, "$l\n");
+      $tail = substr($tail, -20000) if length $tail > 40000;
+    }
+  }
+  close $out;
+  my $st = $?;
+  waitpid($pid, 0);
+  $CUR_CHILD = 0;
+  $CUR_WARP = 0;
+  warp_stop($warp_pid);
+  return (0, 'CANCEL', 0) if $cancel;
+  my $sig = $st & 127;
+  my $code = $st >> 8;
+  append_log($dir, "结束：退出码 $code" . ($sig ? "，信号 $sig" : '') . "\n");
+  if ($code == 0 && !$sig && $file) {
+    my $base = (split m{/}, $file)[-1];
+    if (-f "$dir/$base" && -s "$dir/$base") {
+      return (1, $base, 0);
+    }
+  }
+  if ($code == 0 && !$sig && $tail =~ /does not pass filter/) {
+    return (0, "ERROR: this is a live event (is_live)\n$tail", 0);
+  }
+  return (0, $tail, $sig);
+}
+
+# yt-dlp 每天自己更新一次。YouTube 经常改，旧版本很快就不能用。
+sub update_ytdlp {
+  my ($why) = @_;
+  logline("检查 yt-dlp 更新（$why）");
+  my ($out) = run_cmd_capture(600, $C{ytdlp}, '-U');
+  my ($ver) = run_cmd_capture(120, $C{ytdlp}, '--version');
+  $ver =~ s/\s+$//;
+  $ver = (split /\n/, $ver)[-1] || '' if $ver;
+  kv_update("$STATE/info", ytdlp_version => $ver, last_update => time,
+    last_update_text => strftime('%Y-%m-%d %H:%M', localtime));
+  $out =~ s/\s+$//;
+  logline("yt-dlp 更新结果：" . ((split /\n/, $out)[-1] || ''));
+}
+
+sub update_due {
+  my ($hours) = @_;
+  my $last = kv_read("$STATE/info")->{last_update} || 0;
+  return time - $last > $hours * 3600;
+}
+
+sub fail_job {
+  my ($id, $msg, $hint) = @_;
+  clean_media(job_dir($id));
+  set_stat($id, state => 'error', error => $msg, hint => $hint || '', line => '', pct => 0);
+  logline("任务 $id 失败：$msg");
+}
+
+sub run_job {
+  my ($id) = @_;
+  $0 = 'ytdlp-web-job';
+  my $dir = job_dir($id);
+  my $meta = job_meta($id);
+  set_stat($id, state => 'running', line => '准备中…', pct => 0, started => time);
+  update_ytdlp('每天一次') if update_due($C{update_hours});
+  my $free = disk_free_mb($DATA);
+  if ($free >= 0 && $free < $C{min_free_mb}) {
+    return fail_job($id, "服务器硬盘只剩 ${free}MB，放不下视频。等旧文件自动删掉，或者清一清 VPS 的硬盘。", '');
+  }
+  my @ms = method_order();
+  my $updated = 0;
+  my ($last_msg, $last_hint, $used_cookies) = ('', '', 0);
+  my $i = 0;
+  while ($i < @ms) {
+    my $m = $ms[$i];
+    $i++;
+    set_stat($id, line => @ms > 1 && $i > 1 ? "上一种办法不行，换第 $i 种办法：$m->{label}…" : '正在向 YouTube 要视频信息…', pct => 0);
+    clean_media($dir);
+    my ($ok, $res, $sig) = run_ytdlp($id, $meta, $m, $i, scalar @ms);
+    if ($res eq 'CANCEL') {
+      remove_tree($dir);
+      logline("任务 $id 已取消");
+      return;
+    }
+    if ($ok) {
+      my $size = -s "$dir/$res";
+      opendir(my $dh, $dir);
+      for my $f (readdir $dh) {
+        next if $f eq $res || $f =~ /^(\.|\.\.|meta|status|log|sent)$/ || $f =~ /^active\./;
+        my $p = "$dir/$f";
+        if (-d $p) { remove_tree($p); } else { unlink $p; }
+      }
+      closedir $dh;
+      set_stat($id, state => 'done', file => $res, size => $size, done_at => time, line => '', pct => 100, method => $m->{label});
+      kv_write("$STATE/sticky", { key => $m->{key}, at => time });
+      unlink "$STATE/cookies-bad" if $m->{cookies};
+      logline("任务 $id 下好了（$m->{label}）：$res " . human_size($size));
+      return;
+    }
+    my ($class, $msg, $hint) = classify($res, $sig);
+    append_log($dir, "判断：$class / $msg\n");
+    $used_cookies = 1 if $m->{cookies};
+    ($last_msg, $last_hint) = ($msg, $hint);
+    return fail_job($id, $msg, $hint) if $class eq 'fatal';
+    if ($class eq 'cookies_bad') {
+      if (open(my $bf, '>', "$STATE/cookies-bad")) { close $bf; }
+      return fail_job($id, $msg, 'cookies');
+    }
+    if ($class eq 'need_cookies') {
+      my @ck = grep { $_->{cookies} } @ms[$i .. $#ms];
+      return fail_job($id, $msg . ' 上传方法在网页下面的「被 YouTube 拦住了？」里。', 'cookies') unless @ck;
+      @ms = (@ms[0 .. $i - 1], @ck);
+      next;
+    }
+    # 被拦了。先确认 yt-dlp 是最新的（新版本常常就修好了），再换下一种办法。
+    if (!$updated && update_due(1)) {
+      $updated = 1;
+      set_stat($id, line => '先把 yt-dlp 更新到最新版本…');
+      update_ytdlp('被 YouTube 拦了');
+    }
+  }
+  my $has_ck = -s $C{cookies} ? 1 : 0;
+  my $tail;
+  if ($used_cookies) {
+    $tail = '所有办法（包括你上传的 cookies）都试过了。cookies 可能过期了，请重新导出一份上传；也可能这台 VPS 的 IP 被 YouTube 拉黑得比较严重，过几个小时再试。';
+  } elsif (!$has_ck && $last_hint eq 'cookies') {
+    $tail = '不用账号的办法都试过了。最后一招：上传一个 YouTube 小号的 cookies（步骤见网页下面的「被 YouTube 拦住了？」）。';
+  } else {
+    $tail = '能试的办法都试过了，过一会儿再试一次。';
+  }
+  fail_job($id, "$last_msg $tail", $has_ck && !$used_cookies ? '' : $last_hint);
+}
+
+# 运行记录超过 2MB 时，只留最后 200KB，免得把硬盘慢慢写满。
+sub trim_log {
+  my $f = $C{log};
+  return unless $f && -f $f && -s $f > 2 * 1024 * 1024;
+  open(my $in, "<", $f) or return;
+  seek($in, -200 * 1024, 2);
+  local $/;
+  my $tail = <$in>;
+  close $in;
+  $tail =~ s/\A[^\n]*\n//;
+  open(my $out, ">", $f) or return;
+  print $out "[日志太长，前面的已删掉]\n", $tail;
+  close $out;
+}
+
+#----------------------------------------------------------------------
+# 定时清理：传完的文件过一会儿删，放太久没人拿的也删，旧任务记录也删。
+#----------------------------------------------------------------------
+sub sweep {
+  my $now = time;
+  trim_log();
+  for my $id (list_jobs()) {
+    my $dir = job_dir($id);
+    my $st = job_stat($id);
+    my $meta = job_meta($id);
+    my $state = $st->{state} || 'queued';
+    my $created = $meta->{created} || (stat($dir))[9] || $now;
+    if ($state eq 'done') {
+      my $path = media_path($id);
+      if ($path) {
+        my $size = $st->{size} || -s $path || 0;
+        my $busy = active_transfers($id);
+        if (!$busy && $size && delivered_bytes($id, $size) >= $size) {
+          my $sent_at = (stat("$dir/sent"))[9] || $now;
+          if ($now - $sent_at >= $C{grace}) {
+            unlink $path;
+            set_stat($id, gone => '已经传到你的 Mac，服务器上的文件已删除');
+            logline("已送达，删除服务器文件 $id");
+          }
+        } elsif (!$busy && $now - ($st->{done_at} || $created) > $C{keep_hours} * 3600) {
+          unlink $path;
+          set_stat($id, gone => "放了 $C{keep_hours} 小时没人来拿，服务器上的文件已自动删除。要的话重新贴一次链接。");
+          logline("放太久，删除服务器文件 $id");
+        }
+      }
+    }
+    if ($state ne 'running' && $now - $created > 86400) {
+      remove_tree($dir);
+    } elsif ($state eq 'error' && $now - $created > 6 * 3600) {
+      remove_tree($dir);
+    }
+  }
+  # 下载程序临时解压的东西，万一被强制停止会留下。超过 6 小时的删掉。
+  if (opendir(my $dh, "$DATA/tmp")) {
+    for my $f (readdir $dh) {
+      next if $f eq '.' || $f eq '..';
+      my $p = "$DATA/tmp/$f";
+      my $age = $now - ((lstat($p))[9] || $now);
+      next if $age < 6 * 3600;
+      if (-d $p) { remove_tree($p); } else { unlink $p; }
+    }
+    closedir $dh;
+  }
+}
+
+#----------------------------------------------------------------------
+# 网页（登录页和主页面）。不用外网的任何东西，打开就能用。
+#----------------------------------------------------------------------
+my $CSS = <<'CSS';
+*{box-sizing:border-box}body{margin:0;font:16px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;background:#f4f5f7;color:#1d1d1f}
+main{max-width:760px;margin:0 auto;padding:24px 16px 60px}h1{font-size:26px;margin:8px 0 4px}.sub{color:#555;margin:0 0 18px}
+.card{background:#fff;border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+input[type=text],input[type=password],textarea{width:100%;font-size:17px;padding:12px;border:1px solid #c7c7cc;border-radius:10px;background:#fff}
+textarea{font:13px/1.4 ui-monospace,Menlo,monospace;height:120px}
+button,.btn{font-size:17px;padding:11px 20px;border:0;border-radius:10px;background:#0a7cff;color:#fff;cursor:pointer;text-decoration:none;display:inline-block}
+button.gray,.btn.gray{background:#e5e5ea;color:#1d1d1f}button.red{background:#ff3b30}button:disabled{opacity:.5}
+.qs label{display:block;padding:6px 2px;cursor:pointer}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}
+.msg{padding:10px 14px;border-radius:10px;margin:10px 0;display:none}.msg.ok{display:block;background:#e8f5e9}.msg.bad{display:block;background:#ffebee;color:#b00020}
+.job .t{font-weight:600;word-break:break-all}.job .l{color:#333;margin:6px 0}.bar{height:8px;background:#e5e5ea;border-radius:4px;overflow:hidden}
+.bar i{display:block;height:100%;background:#34c759;width:0}.err{background:#fff4f4;border-left:4px solid #ff3b30;padding:10px;border-radius:6px;margin:8px 0;white-space:pre-wrap}
+.small{font-size:13px;color:#666}details{margin:14px 0}summary{cursor:pointer;font-weight:600;padding:6px 0}ol{padding-left:22px}code{background:#eee;padding:1px 5px;border-radius:4px}
+.top{display:flex;justify-content:space-between;align-items:center}.top a{color:#666;font-size:14px}
+CSS
+
+sub page_simple {
+  my ($title, $text) = @_;
+  return "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>"
+    . html_esc($title) . "</title><style>$CSS</style></head><body><main><div class=\"card\"><h1>" . html_esc($title)
+    . "</h1><p>" . html_esc($text) . "</p><p><a class=\"btn\" href=\"/\">回到首页</a></p></div></main></body></html>";
+}
+
+sub page_login {
+  my ($msg) = @_;
+  my $m = $msg ? '<div class="msg bad">' . html_esc($msg) . '</div>' : '';
+  return <<"HTML";
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 · 存 YouTube 视频到 Mac</title><style>$CSS</style></head><body><main>
+<h1>存 YouTube 视频到 Mac</h1><p class="sub">先登录。名字和密码是安装时屏幕上显示的那一对。</p>
+<form class="card" method="post" action="/login">$m
+<p>登录名字<br><input type="text" name="user" value="admin" autocomplete="username" autocapitalize="off"></p>
+<p>密码<br><input type="password" name="pass" autocomplete="current-password" autofocus></p>
+<button type="submit">登录</button>
+<p class="small">忘了密码：在 VPS 上输入 <code>ytdlp-web --status</code> 查看，或 <code>ytdlp-web --reset-password</code> 换一把。</p>
+</form></main></body></html>
+HTML
+}
+
+sub page_app {
+  return <<"HTML" . <<'JS';
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>存 YouTube 视频到 Mac</title><style>$CSS</style></head><body><main>
+<div class="top"><h1>存 YouTube 视频到 Mac</h1><a href="/logout">退出登录</a></div>
+<p class="sub">贴链接 → 点「开始」→ 视频自动存进 Mac 的「下载」文件夹。传完以后，服务器上的文件会自动删掉。</p>
+<form class="card" id="f">
+<input type="text" id="url" placeholder="在这里粘贴 YouTube 视频链接" autocomplete="off" autofocus>
+<div class="qs" style="margin-top:10px">
+<label><input type="radio" name="q" value="mac" checked> Mac 能直接播放的最高画质（推荐，一般是 1080p MP4）</label>
+<label><input type="radio" name="q" value="best"> 最高画质（4K/8K，文件大，QuickTime 可能放不了，用 IINA 或 VLC）</label>
+<label><input type="radio" name="q" value="p720"> 720p（文件小，下得快）</label>
+<label><input type="radio" name="q" value="m4a"> 只要声音（m4a，Mac 的「音乐」能直接放）</label>
+<label><input type="radio" name="q" value="mp3"> 只要声音（mp3）</label>
+</div>
+<div class="row"><button type="submit" id="go">开始</button><span class="small">第一次自动保存时，Safari 会问「是否允许下载」，请点「允许」。</span></div>
+<div class="msg" id="msg"></div>
+</form>
+<div id="jobs"></div>
+<details class="card" id="ck"><summary>被 YouTube 拦住了？（上传 cookies，最后一招）</summary>
+<div id="ckstate" class="small"></div>
+<p>VPS 是机房 IP，YouTube 有时会说「请登录，确认你不是机器人」。网页会先自动换几种<b>不用账号</b>的办法；都不行时，才需要你上传一个 YouTube 账号的 cookies（登录记录）。</p>
+<p><b>请用小号，不要用主号</b>：YouTube 发现账号被程序用，可能会限制甚至封号。cookies 过几周到几个月会失效，失效时网页会提醒你重新上传。</p>
+<ol>
+<li>Mac 上用 <b>Chrome</b>（或 Firefox）。Safari 没有好用的导出工具。</li>
+<li>Chrome 网上应用店搜索并安装扩展 <b>Get cookies.txt LOCALLY</b>（Firefox 装 <b>cookies.txt</b>）。在扩展的「详情」里打开「在无痕模式下启用」。</li>
+<li>打开一个<b>无痕窗口</b>（Chrome 菜单「文件 → 打开新的无痕窗口」），在里面登录你的 YouTube 小号。</li>
+<li>在同一个标签页的地址栏打开 <code>https://www.youtube.com/robots.txt</code></li>
+<li>点浏览器右上角的扩展图标，选 <b>Export</b>（格式选 Netscape），会下载一个 <code>www.youtube.com_cookies.txt</code>。</li>
+<li>直接关掉这个无痕窗口，以后别再打开它（这样 cookies 不会被 YouTube 换掉）。</li>
+<li>回到这里，点下面「选择文件」选刚才那个 txt（或者把文件内容粘贴进框里），再点「保存 cookies」。</li>
+</ol>
+<input type="file" id="ckfile" accept=".txt,text/plain">
+<textarea id="cktext" placeholder="也可以把 cookies.txt 的内容整个粘贴到这里"></textarea>
+<div class="row"><button type="button" id="cksave">保存 cookies</button><button type="button" class="gray" id="ckdel">删除已上传的 cookies</button></div>
+<div class="msg" id="ckmsg"></div>
+</details>
+<details class="card"><summary>常见问题</summary>
+<p><b>视频存在哪？</b> Mac 的「下载」文件夹（访达左边的「下载」）。Safari、Chrome 默认都存到这里。</p>
+<p><b>点了开始，下好了却没有保存？</b> Safari 第一次会问「是否允许在此网站上下载」，点「允许」。Chrome 如果问「此网站想下载多个文件」，点「允许」。也可以点任务里的「保存到 Mac」按钮。</p>
+<p><b>下载到一半网断了？</b> 在浏览器的下载列表里点「继续/恢复」，会接着下，不用从头来。服务器上的文件会等你拿完再删（最多留几个小时）。</p>
+<p><b>4K 视频 QuickTime 打不开？</b> 4K 一般是 VP9/AV1 格式，装一个免费的 IINA 或 VLC 就能放。想直接用 QuickTime，就选第一项。</p>
+<p><b>可以关掉网页吗？</b> 服务器下载时可以关，下好后重新打开网页，在任务里点「保存到 Mac」。</p>
+</details>
+<p class="small" id="foot"></p>
+</main>
+HTML
+<script>
+const $=s=>document.querySelector(s);
+const load=k=>{try{return new Set(JSON.parse(localStorage.getItem(k)||'[]'))}catch(e){return new Set()}};
+const mine=load('ytw_mine'),got=load('ytw_got');
+function keep(){localStorage.setItem('ytw_mine',JSON.stringify([...mine].slice(-60)));localStorage.setItem('ytw_got',JSON.stringify([...got].slice(-60)));}
+async function api(p,data){const o={headers:{'X-YTW':'1'},cache:'no-store'};if(data){o.method='POST';o.body=new URLSearchParams(data);}
+ const r=await fetch(p,o);if(r.status===401){location.href='/';throw new Error('login');}return r.json();}
+function say(el,t,bad){el.textContent=t;el.className='msg '+(bad?'bad':'ok');}
+const lastQ=localStorage.getItem('ytw_q');if(lastQ){const x=document.querySelector('input[name=q][value="'+lastQ+'"]');if(x)x.checked=true;}
+$('#f').onsubmit=async e=>{e.preventDefault();const url=$('#url').value.trim();
+ if(!url){say($('#msg'),'先把 YouTube 视频链接粘贴到上面的框里。',1);return;}
+ const q=document.querySelector('input[name=q]:checked').value;localStorage.setItem('ytw_q',q);$('#go').disabled=true;
+ try{const r=await api('/api/add',{url,q});if(r.error){say($('#msg'),r.error,1);}else{mine.add(r.id);keep();$('#url').value='';
+  say($('#msg'),'收到了！下面能看到进度。下好以后会自动存到 Mac，不用一直盯着。');tick();}}
+ catch(err){say($('#msg'),'连不上服务器，请检查网络后再试。',1);}finally{$('#go').disabled=false;}};
+function saveFile(id){const a=document.createElement('a');a.href='/dl/'+id;a.download='';document.body.appendChild(a);a.click();a.remove();}
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
+function render(d){const box=$('#jobs');box.textContent='';
+ for(const j of d.jobs){const c=el('div','card job');c.appendChild(el('div','t',j.title||j.url));
+  c.appendChild(el('div','small',j.quality+(j.size?' · '+j.size:'')));
+  if(j.state==='error'){c.appendChild(el('div','err',j.error));}
+  else{c.appendChild(el('div','l',j.line));if(j.state==='running'||j.state==='queued'){const b=el('div','bar');const i=el('i');i.style.width=(j.pct||0)+'%';b.appendChild(i);c.appendChild(b);}}
+  const row=el('div','row');
+  if(j.has_file){const b=el('button',null,'保存到 Mac');b.onclick=()=>{got.add(j.id);keep();saveFile(j.id);};row.appendChild(b);}
+  if(j.hint==='cookies'){const b=el('button','gray','去上传 cookies');b.onclick=()=>{$('#ck').open=true;$('#ck').scrollIntoView({behavior:'smooth'});};row.appendChild(b);}
+  if(j.state==='error'){const b=el('button','gray','再试一次');b.onclick=async()=>{const r=await api('/api/add',{url:j.url,q:j.q});if(r.id){mine.add(r.id);keep();await api('/api/delete',{id:j.id});tick();}};row.appendChild(b);}
+  const del=el('button','gray',j.state==='running'?'取消':'删除');del.onclick=async()=>{await api('/api/delete',{id:j.id});tick();};row.appendChild(del);
+  c.appendChild(row);box.appendChild(c);
+  if(j.state==='done'&&j.has_file&&mine.has(j.id)&&!got.has(j.id)){got.add(j.id);keep();saveFile(j.id);}}
+ const i=d.info;let f='yt-dlp '+(i.ytdlp||'?')+(i.updated?'（'+i.updated+' 检查过更新，每天自动更新）':'（每天自动更新）');
+ if(i.method)f+=' · 上次成功的办法：'+i.method;f+=' · 被拦时会依次试：'+i.methods.join(' → ');
+ f+=' · 传到 Mac 后约 '+i.grace_min+' 分钟删除服务器文件，没人拿的 '+i.keep_hours+' 小时后删除';if(i.free)f+=' · 服务器硬盘剩 '+i.free;
+ $('#foot').textContent=f;
+ $('#ckstate').textContent=i.cookies?('已上传 cookies（'+i.cookies_at+'）'+(i.cookies_bad?'，但已经失效了，请重新上传。':'。只有前面的办法都不行时才会用。')):'还没有上传 cookies。大多数时候不需要。';
+ if(i.cookies_bad)$('#ck').open=true;
+ return d.jobs.some(j=>j.state==='queued'||j.state==='running'||(j.state==='done'&&j.has_file&&!j.delivered));}
+let timer=null;
+async function tick(){clearTimeout(timer);let busy=false;try{busy=render(await api('/api/jobs'));}catch(e){}timer=setTimeout(tick,busy?1500:8000);}
+$('#ckfile').onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{$('#cktext').value=r.result;};r.readAsText(f);};
+$('#cksave').onclick=async()=>{const r=await api('/api/cookies',{text:$('#cktext').value});if(r.error)say($('#ckmsg'),r.error,1);else{say($('#ckmsg'),'保存好了。被拦的视频点「再试一次」就会用上。');$('#cktext').value='';tick();}};
+$('#ckdel').onclick=async()=>{await api('/api/cookies/delete',{});say($('#ckmsg'),'已删除服务器上的 cookies。');tick();};
+tick();
+</script></body></html>
+JS
+}
+
+#----------------------------------------------------------------------
+# 主循环：开端口、接浏览器、排队下载、定时清理。
+#----------------------------------------------------------------------
+sub open_listeners {
+  my @socks;
+  my $host = $C{listen};
+  if ($host eq '0.0.0.0' && eval { require IO::Socket::IP; 1 }) {
+    my $s = IO::Socket::IP->new(LocalHost => '::', LocalPort => $C{port}, Listen => 64, ReuseAddr => 1, V6Only => 0, Proto => 'tcp');
+    push @socks, $s if $s;
+  }
+  unless (@socks) {
+    my $s = IO::Socket::INET->new(LocalAddr => $host, LocalPort => $C{port}, Listen => 64, ReuseAddr => 1, Proto => 'tcp');
+    die "端口 $C{port} 打不开：$!\n" unless $s;
+    push @socks, $s;
+  }
+  return @socks;
+}
+
+sub main {
+  my @ls = open_listeners();
+  $0 = 'ytdlp-web';
+  spit("$STATE/server.pid", "$$\n");
+  logline("网页已启动，端口 $C{port}，版本 $VERSION");
+  # 上次没下完就被重启的任务，标成失败，免得一直卡在“下载中”。
+  for my $id (list_jobs()) {
+    my $s = job_stat($id)->{state} || '';
+    fail_job($id, '服务器重启了，这个下载被打断。点「再试一次」就行。', '') if $s eq 'running';
+  }
+  my $sel = IO::Select->new(@ls);
+  my %handlers;
+  my ($runner, $runner_job) = (0, '');
+  my $last_sweep = 0;
+  my $stop = 0;
+  $SIG{TERM} = $SIG{INT} = sub { $stop = 1; };
+  $SIG{HUP} = 'IGNORE';
+  while (!$stop) {
+    for my $l ($sel->can_read(1)) {
+      my $c = $l->accept or next;
+      if (keys(%handlers) >= 40) {
+        respond($c, undef, 503, 'text/plain; charset=utf-8', "busy\n");
+        close $c;
+        next;
+      }
+      my $pid = fork();
+      if (!defined $pid) { close $c; next; }
+      if ($pid == 0) {
+        $SIG{TERM} = $SIG{INT} = 'DEFAULT';
+        close $_ for @ls;
+        eval { handle($c); };
+        logline("请求出错：$@") if $@;
+        close $c;
+        POSIX::_exit(0);
+      }
+      $handlers{$pid} = 1;
+      close $c;
+    }
+    while ((my $k = waitpid(-1, WNOHANG)) > 0) {
+      delete $handlers{$k};
+      if ($k == $runner) { $runner = 0; $runner_job = ''; }
+    }
+    if (!$runner) {
+      my ($next) = grep { (job_stat($_)->{state} || 'queued') eq 'queued' } list_jobs();
+      my $task = $next ? "job:$next" : (update_due($C{update_hours}) ? 'update' : '');
+      if ($task) {
+        my $pid = fork();
+        if (defined $pid && $pid == 0) {
+          $SIG{TERM} = $SIG{INT} = \&runner_stop;
+          close $_ for @ls;
+          if ($next) { eval { run_job($next) }; fail_job($next, "出错了：$@", '') if $@; }
+          else { $0 = 'ytdlp-web-update'; update_ytdlp('每天一次'); }
+          POSIX::_exit(0);
+        }
+        if (defined $pid) {
+          # 先在父进程里标上“下载中”，免得下一圈又把它派出去一次。
+          set_stat($next, state => 'running', line => '准备中…') if $next;
+          ($runner, $runner_job) = ($pid, $next || 'update');
+        }
+      }
+    }
+    if (time - $last_sweep >= ($C{sweep_secs} || 30)) {
+      $last_sweep = time;
+      eval { sweep() };
+      logline("清理出错：$@") if $@;
+    }
+  }
+  logline('收到停止信号，正在退出');
+  kill 'TERM', $runner if $runner;
+  kill 'TERM', keys %handlers;
+  exit 0;
+}
+
+main() unless $ENV{YTDLP_WEB_NO_MAIN};
+1;
+YTDLP_WEB_SERVER_EOF
+  if ! perl -c "$LIB_DIR/server.pl.new" >/dev/null 2>&1; then
+    why=$(perl -c "$LIB_DIR/server.pl.new" 2>&1 | head -n 3 | tr '\n' ' ')
+    rm -f "$LIB_DIR/server.pl.new"
+    die "网页程序在这台机器的 Perl 上跑不起来：$why"
+  fi
+  chmod 755 "$LIB_DIR/server.pl.new"
+  mv "$LIB_DIR/server.pl.new" "$LIB_DIR/server.pl"
+}
+
+#----------------------------------------------------------------------
+# 开机自动启动：先写一个小启动脚本，再按这台机器的启动方式登记。
+#----------------------------------------------------------------------
+write_runner() {
+  mkdir -p /usr/local/sbin
+  cat > "$RUNNER" <<EOF
+#!/bin/sh
+# ytdlp-web 网页服务的启动脚本。开机时由系统调用，记录写到 $LOG_FILE
+mkdir -p "$DATA"
+exec perl "$LIB_DIR/server.pl" "$CONF_FILE" >> "$LOG_FILE" 2>&1
+EOF
+  chmod 755 "$RUNNER"
 }
 
 write_service() {
   case "$INIT" in
     systemd)
-      cat > /etc/systemd/system/yt-dlp-webui.service <<EOF
+      cat > /etc/systemd/system/ytdlp-web.service <<EOF
 [Unit]
-Description=yt-dlp web ui
+Description=ytdlp-web (YouTube to Mac)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/yt-dlp-webui-run
-WorkingDirectory=$DATA
-Restart=on-failure
+ExecStart=$RUNNER
+WorkingDirectory=/
+Restart=always
 RestartSec=3
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target
 EOF
       systemctl daemon-reload
-      systemctl enable yt-dlp-webui >/dev/null 2>&1 || true
+      systemctl enable ytdlp-web >/dev/null 2>&1 || true
       ;;
     openrc)
-      cat > /etc/init.d/yt-dlp-webui <<EOF
+      cat > /etc/init.d/ytdlp-web <<EOF
 #!/sbin/openrc-run
-name="yt-dlp-webui"
-description="yt-dlp web ui"
-command="/usr/local/sbin/yt-dlp-webui-run"
+name="ytdlp-web"
+description="ytdlp-web (YouTube to Mac)"
+command="$RUNNER"
 command_background=true
-pidfile="/run/yt-dlp-webui.pid"
-directory="$DATA"
-output_log="/var/log/yt-dlp-webui.service.log"
-error_log="/var/log/yt-dlp-webui.service.log"
+pidfile="/run/ytdlp-web.pid"
 
 depend() {
   need net
 }
 EOF
-      chmod 755 /etc/init.d/yt-dlp-webui
-      rc-update add yt-dlp-webui default >/dev/null 2>&1 || true
+      chmod 755 /etc/init.d/ytdlp-web
+      rc-update add ytdlp-web default >/dev/null 2>&1 || true
       ;;
     procd)
-      cat > /etc/init.d/yt-dlp-webui <<'EOF'
+      cat > /etc/init.d/ytdlp-web <<EOF
 #!/bin/sh /etc/rc.common
 START=99
 USE_PROCD=1
 start_service() {
   procd_open_instance
-  procd_set_param command /usr/local/sbin/yt-dlp-webui-run
+  procd_set_param command $RUNNER
   procd_set_param respawn 3600 5 0
-  procd_set_param stdout 1
-  procd_set_param stderr 1
   procd_close_instance
 }
 EOF
-      chmod 755 /etc/init.d/yt-dlp-webui
-      /etc/init.d/yt-dlp-webui enable >/dev/null 2>&1 || true
+      chmod 755 /etc/init.d/ytdlp-web
+      /etc/init.d/ytdlp-web enable >/dev/null 2>&1 || true
       ;;
     *)
-      cat > /etc/init.d/yt-dlp-webui <<'EOF'
+      cat > /etc/init.d/ytdlp-web <<EOF
 #!/bin/sh
 ### BEGIN INIT INFO
-# Provides:          yt-dlp-webui
-# Required-Start:    $network
+# Provides:          ytdlp-web
+# Required-Start:    \$network
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
-# Short-Description: yt-dlp web ui
+# Short-Description: ytdlp-web (YouTube to Mac)
 ### END INIT INFO
-PIDFILE=/run/yt-dlp-webui.pid
-LOG=/var/log/yt-dlp-webui.service.log
-case "$1" in
+PIDFILE=/run/ytdlp-web.pid
+case "\$1" in
   start)
     mkdir -p /run
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    if [ -f "\$PIDFILE" ] && kill -0 "\$(cat "\$PIDFILE")" 2>/dev/null; then
       exit 0
     fi
-    /usr/local/sbin/yt-dlp-webui-run >> "$LOG" 2>&1 &
-    echo $! > "$PIDFILE"
+    if command -v setsid >/dev/null 2>&1; then
+      setsid $RUNNER </dev/null >/dev/null 2>&1 &
+    else
+      $RUNNER </dev/null >/dev/null 2>&1 &
+    fi
+    echo \$! > "\$PIDFILE"
     ;;
   stop)
-    if [ -f "$PIDFILE" ]; then
-      kill "$(cat "$PIDFILE")" 2>/dev/null || true
-      rm -f "$PIDFILE"
+    if [ -f "\$PIDFILE" ]; then
+      kill "\$(cat "\$PIDFILE")" 2>/dev/null || true
+      rm -f "\$PIDFILE"
     fi
     ;;
   restart)
-    "$0" stop
-    "$0" start
+    "\$0" stop
+    sleep 1
+    "\$0" start
     ;;
   *)
-    echo "usage: $0 {start|stop|restart}" >&2
+    echo "usage: \$0 {start|stop|restart}" >&2
     exit 1
     ;;
 esac
 EOF
-      chmod 755 /etc/init.d/yt-dlp-webui
+      chmod 755 /etc/init.d/ytdlp-web
       if [ -f /etc/rc.local ]; then
-        if ! grep -q 'yt-dlp-webui-run' /etc/rc.local 2>/dev/null; then
+        if ! grep -q '/etc/init.d/ytdlp-web start' /etc/rc.local 2>/dev/null; then
           if [ -s /etc/rc.local ] && [ -n "$(tail -c 1 /etc/rc.local 2>/dev/null)" ]; then
             printf '\n' >> /etc/rc.local
           fi
-          printf '%s\n' '/etc/init.d/yt-dlp-webui start' >> /etc/rc.local
+          if grep -q '^exit 0' /etc/rc.local 2>/dev/null; then
+            sed -i 's#^exit 0#/etc/init.d/ytdlp-web start\nexit 0#' /etc/rc.local 2>/dev/null || true
+          else
+            printf '%s\n' '/etc/init.d/ytdlp-web start' >> /etc/rc.local
+          fi
         fi
         chmod +x /etc/rc.local 2>/dev/null || true
       fi
       if have update-rc.d; then
-        update-rc.d yt-dlp-webui defaults >/dev/null 2>&1 || true
+        update-rc.d ytdlp-web defaults >/dev/null 2>&1 || true
       elif have chkconfig; then
-        chkconfig --add yt-dlp-webui >/dev/null 2>&1 || true
+        chkconfig --add ytdlp-web >/dev/null 2>&1 || true
       fi
       ;;
   esac
@@ -1593,26 +3335,91 @@ EOF
 
 stop_service() {
   case "$INIT" in
-    systemd) systemctl stop yt-dlp-webui >/dev/null 2>&1 || true ;;
-    openrc) rc-service yt-dlp-webui stop >/dev/null 2>&1 || true ;;
-    procd) [ -x /etc/init.d/yt-dlp-webui ] && /etc/init.d/yt-dlp-webui stop >/dev/null 2>&1 || true ;;
-    *) [ -x /etc/init.d/yt-dlp-webui ] && /etc/init.d/yt-dlp-webui stop >/dev/null 2>&1 || true ;;
+    systemd) systemctl stop ytdlp-web >/dev/null 2>&1 || true ;;
+    openrc) rc-service ytdlp-web stop >/dev/null 2>&1 || true ;;
+    *) [ -x /etc/init.d/ytdlp-web ] && /etc/init.d/ytdlp-web stop >/dev/null 2>&1 || true ;;
   esac
+  # 启动方式认错、或者旧记录残留时，按网页自己记下的进程号再停一次。
+  for pf in /run/ytdlp-web.pid "$DATA/state/server.pid"; do
+    if [ -f "$pf" ]; then
+      kill "$(cat "$pf")" >/dev/null 2>&1 || true
+      rm -f "$pf"
+    fi
+  done
+  sleep 1
+}
+
+start_service() {
+  case "$INIT" in
+    systemd) systemctl restart ytdlp-web ;;
+    openrc) rc-service ytdlp-web restart ;;
+    *) /etc/init.d/ytdlp-web restart || /etc/init.d/ytdlp-web start ;;
+  esac
+}
+
+# 旧版（1.x）用的服务。升级和卸载时要先停掉，端口才空得出来。
+stop_old_service() {
+  if have systemctl && [ -f /etc/systemd/system/yt-dlp-webui.service ]; then
+    systemctl stop yt-dlp-webui >/dev/null 2>&1 || true
+    systemctl disable yt-dlp-webui >/dev/null 2>&1 || true
+  fi
+  if [ -x /etc/init.d/yt-dlp-webui ]; then
+    if [ "$INIT" = openrc ]; then
+      rc-service yt-dlp-webui stop >/dev/null 2>&1 || true
+      rc-update del yt-dlp-webui default >/dev/null 2>&1 || true
+    else
+      /etc/init.d/yt-dlp-webui stop >/dev/null 2>&1 || true
+    fi
+  fi
   if [ -f /run/yt-dlp-webui.pid ]; then
     kill "$(cat /run/yt-dlp-webui.pid)" >/dev/null 2>&1 || true
     rm -f /run/yt-dlp-webui.pid
   fi
 }
 
-start_service() {
-  case "$INIT" in
-    systemd) systemctl restart yt-dlp-webui ;;
-    openrc) rc-service yt-dlp-webui restart ;;
-    procd) /etc/init.d/yt-dlp-webui restart || /etc/init.d/yt-dlp-webui start ;;
-    *) /etc/init.d/yt-dlp-webui restart || /etc/init.d/yt-dlp-webui start ;;
-  esac
+# 新版装好、跑起来以后，把旧版的程序和服务清掉。旧版下好的视频不删，告诉你在哪。
+remove_old_install() {
+  stop_old_service
+  rm -f /etc/systemd/system/yt-dlp-webui.service
+  have systemctl && systemctl daemon-reload >/dev/null 2>&1 || true
+  rm -f /etc/init.d/yt-dlp-webui
+  if [ -f /etc/rc.local ]; then
+    fstab_remove_line /etc/rc.local '/etc/init.d/yt-dlp-webui start'
+  fi
+  if have update-rc.d; then
+    update-rc.d -f yt-dlp-webui remove >/dev/null 2>&1 || true
+  fi
+  # 旧版做的虚拟内存还在用，就交给新版管，卸载时一起删。
+  if [ -f /etc/yt-dlp-webui/swap.size ] && [ -f /yt-dlp-webui.swap ]; then
+    mkdir -p "$CONF_DIR"
+    printf '%s\n' /yt-dlp-webui.swap > "$CONF_DIR/swap.old"
+  fi
+  if [ -f /etc/yt-dlp-webui/ffmpeg-static ]; then
+    mkdir -p "$CONF_DIR"
+    printf '%s\n' static > "$CONF_DIR/ffmpeg-static"
+  fi
+  if [ -f /etc/sysctl.d/99-yt-dlp-webui-overcommit.conf ]; then
+    mv /etc/sysctl.d/99-yt-dlp-webui-overcommit.conf /etc/sysctl.d/99-ytdlp-web-overcommit.conf 2>/dev/null || true
+  fi
+  rm -f /usr/local/bin/yt-dlp-webui /usr/local/bin/yt-dlp-one /usr/local/sbin/yt-dlp-webui-run
+  rm -rf /etc/yt-dlp-webui /usr/local/share/yt-dlp-webui
+  rm -f /var/log/yt-dlp-webui.log /var/log/yt-dlp-webui.service.log
+  for d in /var/lib/yt-dlp-webui /yt-dlp-webui-data; do
+    [ -d "$d" ] || continue
+    rm -f "$d"/*.db "$d"/*.db-* "$d/download.lock" 2>/dev/null || true
+    rm -rf "${d:?}/tmp" "${d:?}/cache" "${d:?}/home" 2>/dev/null || true
+    if [ -d "$d/downloads" ] && [ -n "$(ls -A "$d/downloads" 2>/dev/null)" ]; then
+      say_warn "旧版下在 VPS 上的视频还在 $d/downloads 。不要的话可以输入：rm -rf $d"
+    else
+      rm -rf "$d"
+    fi
+  done
+  say_ok "旧版网页（yt-dlp-web-ui）已经清掉"
 }
 
+#----------------------------------------------------------------------
+# 端口：有没有被占用、是不是我们自己的网页、网页有没有起来。
+#----------------------------------------------------------------------
 port_busy() {
   port=$1
   if have ss; then
@@ -1626,39 +3433,35 @@ port_busy() {
   return 1
 }
 
-# 我们自己的网页占着这个端口时，更新可以继续用它。别的程序占着就不行。
+health_once() {
+  port=$1
+  out=
+  if have curl; then
+    out=$(curl -s --noproxy '*' --max-time 3 "http://127.0.0.1:${port}/health" 2>/dev/null || true)
+  elif have wget; then
+    out=$(no_proxy=127.0.0.1 NO_PROXY=127.0.0.1 wget -q -T 3 -O - "http://127.0.0.1:${port}/health" 2>/dev/null || true)
+  fi
+  case "$out" in
+    'ytdlp-web ok'*) return 0 ;;
+  esac
+  return 1
+}
+
+# 我们自己的网页（或者马上要被换掉的旧版）占着这个端口没关系，别的程序占着就不行。
 port_taken_by_other() {
   port=$1
   port_busy "$port" || return 1
-  if have ss; then
-    info=$(ss -ltnp 2>/dev/null | grep -E ":${port}([^0-9]|$)" || true)
-    if [ -n "$info" ]; then
-      if printf '%s\n' "$info" | grep -q 'yt-dlp-webui'; then
-        return 1
-      fi
-      if printf '%s\n' "$info" | grep -q 'users:'; then
-        return 0
-      fi
-    fi
-  fi
-  old=$(config_get port 2>/dev/null || true)
-  [ "$port" = "$old" ] && return 1
+  health_once "$port" && return 1
+  old=$(old_config_get port 2>/dev/null || true)
+  [ -n "$old" ] && [ "$port" = "$(normalize_port "$old" 2>/dev/null)" ] && return 1
   return 0
 }
 
 health_ok() {
   port=$1
   i=0
-  while [ "$i" -lt 20 ]; do
-    code=000
-    if have curl; then
-      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${port}/" 2>/dev/null || true)
-    elif have wget; then
-      wget -q -O /dev/null "http://127.0.0.1:${port}/" && code=200
-    fi
-    case "$code" in
-      200|301|302|401) return 0 ;;
-    esac
+  while [ "$i" -lt 25 ]; do
+    health_once "$port" && return 0
     i=$((i + 1))
     sleep 1
   done
@@ -1667,22 +3470,23 @@ health_ok() {
 
 show_fail_log() {
   say_err "网页没有起来。最近的记录："
-  if have journalctl; then
-    journalctl -u yt-dlp-webui -n 40 --no-pager 2>/dev/null || true
+  if [ "$INIT" = systemd ] && have journalctl; then
+    journalctl -u ytdlp-web -n 20 --no-pager 2>/dev/null || true
   fi
-  if [ -f /var/log/yt-dlp-webui.service.log ]; then
-    tail -n 40 /var/log/yt-dlp-webui.service.log 2>/dev/null || true
-  fi
-  if [ -f /var/log/yt-dlp-webui.log ]; then
-    tail -n 40 /var/log/yt-dlp-webui.log 2>/dev/null || true
+  if [ -f "$LOG_FILE" ]; then
+    tail -n 30 "$LOG_FILE" 2>/dev/null || true
   fi
 }
 
+# 你选了“浏览器直接打开”，并且本机防火墙开着时，放开这个 TCP 端口。
 open_firewall() {
   port=$1
   if have ufw && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-    ufw allow "${port}/tcp" >/dev/null 2>&1 || say_warn "ufw 没能放开 ${port}"
-    say_ok "ufw 已放开 ${port}/tcp"
+    if ufw allow "${port}/tcp" >/dev/null 2>&1; then
+      say_ok "ufw 已放开 ${port}/tcp"
+    else
+      say_warn "ufw 没能放开 ${port}"
+    fi
   fi
   if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd --add-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
@@ -1700,6 +3504,9 @@ open_firewall() {
   fi
 }
 
+#----------------------------------------------------------------------
+# 这台机器的地址。只有内网地址时，再问一下外面看到的公网 IP，好告诉你打开哪个网址。
+#----------------------------------------------------------------------
 collect_addrs() {
   ADDR_V4=
   ADDR_V4_PRIVATE=
@@ -1713,6 +3520,7 @@ collect_addrs() {
   fi
   for ip in $ips; do
     ip=${ip%%/*}
+    case "$ip" in 127.*|::1) continue ;; esac
     if is_ipv4 "$ip"; then
       if is_private_ipv4 "$ip"; then
         [ -n "$ADDR_V4_PRIVATE" ] || ADDR_V4_PRIVATE=$ip
@@ -1723,52 +3531,67 @@ collect_addrs() {
       [ -n "$ADDR_V6" ] || ADDR_V6=$ip
     fi
   done
-}
-
-hash_password() {
-  user=$1
-  pass=$2
-  # 不能在这里 die。调用方把它放在 $(...) 里，die 只会退出这个小括号，外面还会继续装。
-  if ! need_tool htpasswd; then
-    ensure_tool htpasswd >/dev/null || return 1
+  ADDR_PUBLIC=$ADDR_V4
+  if [ -z "$ADDR_PUBLIC" ] && [ "${YTD_TEST:-}" != 1 ]; then
+    for u in https://api.ipify.org https://ifconfig.me/ip https://ipv4.icanhazip.com; do
+      got=
+      if have curl; then
+        got=$(curl -4 -s --max-time 6 "$u" 2>/dev/null | tr -d ' \r\n' || true)
+      elif have wget; then
+        got=$(wget -q -T 6 -O - "$u" 2>/dev/null | tr -d ' \r\n' || true)
+      fi
+      if is_ipv4 "$got" && ! is_private_ipv4 "$got"; then
+        ADDR_PUBLIC=$got
+        break
+      fi
+    done
   fi
-  line=$(htpasswd -nbB "$user" "$pass" 2>/dev/null || true)
-  hash=$(printf '%s\n' "$line" | awk -F: 'NR==1 {print substr($0, index($0, ":")+1)}')
-  case "$hash" in
-    \$2a\$*|\$2b\$*|\$2y\$*) printf '%s\n' "$hash"; return 0 ;;
-  esac
-  return 1
 }
 
-read_saved_password() {
-  [ -f /etc/yt-dlp-webui/install.txt ] || return 1
-  sed -n 's/^password=//p' /etc/yt-dlp-webui/install.txt | head -n 1
+#----------------------------------------------------------------------
+# 登录密码：存的是加密后的样子（SHA-512），网页服务拿它来核对。原文另外记一份给你看。
+#----------------------------------------------------------------------
+hash_password() {
+  pass=$1
+  salt=$(rand_hex 8) || return 1
+  for pre in '$6$' '$5$' '$1$'; do
+    h=$(YTD_P="$pass" YTD_S="${pre}${salt}\$" perl -e 'print crypt($ENV{YTD_P}, $ENV{YTD_S})' 2>/dev/null || true)
+    case "$h" in
+      "$pre"*) printf '%s\n' "$h"; return 0 ;;
+    esac
+  done
+  return 1
 }
 
 write_install_note() {
   user=$1
   pass=$2
   port=$3
+  mkdir -p "$CONF_DIR"
   umask 077
   {
     printf 'username=%s\n' "$user"
     printf 'password=%s\n' "$pass"
     printf 'port=%s\n' "$port"
-  } > /etc/yt-dlp-webui/install.txt
-  chmod 600 /etc/yt-dlp-webui/install.txt
+  } > "$NOTE_FILE"
+  chmod 600 "$NOTE_FILE"
   umask 022
 }
 
+#----------------------------------------------------------------------
+# ytdlp-web 这个命令：其实就是这个脚本自己，拷一份放好。
+#----------------------------------------------------------------------
 install_cli() {
-  dest=/usr/local/sbin/ytdlp-web
-  mkdir -p /usr/local/sbin /usr/local/bin
-  if [ -f "$0" ]; then
-    cp "$0" "$dest"
-    chmod 755 "$dest"
+  mkdir -p /usr/local/sbin
+  if [ -f "$0" ] && grep -q 'ytdlp-onekey-begin' "$0" 2>/dev/null; then
+    if [ "$0" != "$CLI_FILE" ]; then
+      cp "$0" "$CLI_FILE.new" && mv "$CLI_FILE.new" "$CLI_FILE"
+    fi
+    chmod 755 "$CLI_FILE"
   fi
   link=$(shortcut_link_dir "$PATH")
   if [ -n "$link" ]; then
-    ln -sfn "$dest" "$link/ytdlp-web"
+    ln -sfn "$CLI_FILE" "$link/ytdlp-web"
   fi
 }
 
@@ -1789,6 +3612,7 @@ fetch_quiet() {
   return 1
 }
 
+# 运行前先看看 GitHub 上有没有更新的脚本，有就换新的接着跑。
 maybe_self_update() {
   [ "${YTD_UPDATED:-}" = 1 ] && return 0
   [ "${YTD_NO_UPDATE:-}" = 1 ] && return 0
@@ -1814,41 +3638,89 @@ maybe_self_update() {
   rm -f "$tmp"
 }
 
+#----------------------------------------------------------------------
+# ytdlp-web --status：看看装得怎么样。
+#----------------------------------------------------------------------
 print_status() {
   detect_machine
   printf '%s\n' "系统：$OS_PRETTY"
   printf '%s\n' "包管理：$PM    架构：$ARCH    系统库：$LIBC    启动方式：$INIT"
   printf '%s\n' "内存：${MEM_MB:-未知}MB    虚拟内存：${SWAP_MB:-0}MB    磁盘剩余：${DISK_MB}MB"
   if [ -x /usr/local/bin/yt-dlp ]; then
-    printf '%s\n' "yt-dlp：$(/usr/local/bin/yt-dlp --version 2>/dev/null | head -n 1)"
+    printf '%s\n' "yt-dlp：$(/usr/local/bin/yt-dlp --version 2>/dev/null | head -n 1)（网页服务每天自动更新）"
   else
     printf '%s\n' "yt-dlp：还没装"
   fi
-  if [ -x /usr/local/bin/yt-dlp-webui ]; then
-    printf '%s\n' "网页程序：已安装"
-  else
-    printf '%s\n' "网页程序：还没装"
+  if qjs_eval_ok /usr/local/bin/qjs; then
+    printf '%s\n' "QuickJS：能用"
   fi
-  port=$(config_get port 2>/dev/null || true)
-  [ -n "$port" ] && printf '%s\n' "端口：$port"
-  user=$(config_get username 2>/dev/null || true)
-  [ -n "$user" ] && printf '%s\n' "用户名：$user"
+  if need_tool ffmpeg; then
+    printf '%s\n' "ffmpeg：能用"
+  else
+    printf '%s\n' "ffmpeg：没有（高画质合并会失败）"
+  fi
+  if [ -n "$(config_get pot 2>/dev/null || true)" ]; then
+    printf '%s\n' "PO 令牌程序：已装（被拦时自动用）"
+  else
+    printf '%s\n' "PO 令牌程序：没装"
+  fi
+  if [ -n "$(config_get warp_conf 2>/dev/null || true)" ]; then
+    printf '%s\n' "Cloudflare WARP：已准备好（被拦时自动用）"
+  elif [ "$(config_get warp 2>/dev/null || true)" = 1 ]; then
+    printf '%s\n' "Cloudflare WARP：你选了要，但还没准备好。运行 ytdlp-web 回车会重试"
+  else
+    printf '%s\n' "Cloudflare WARP：不用"
+  fi
+  if [ -s "$CONF_DIR/cookies.txt" ]; then
+    printf '%s\n' "cookies：已上传（实在被拦时才用）"
+  fi
+  if ! install_ready; then
+    if old_install_present; then
+      printf '%s\n' "这里装的是旧版（下到 VPS 的那种）。运行 ytdlp-web 回车就升级成新版。"
+    else
+      printf '%s\n' "网页：还没装"
+    fi
+    return 0
+  fi
+  port=$(config_get port)
+  user=$(config_get user)
+  printf '%s\n' "端口：$port"
+  printf '%s\n' "登录名字：$user"
   pass=$(read_saved_password 2>/dev/null || true)
   if [ -n "$pass" ]; then
     printf '%s\n' "密码：$pass"
-  elif [ -f /etc/yt-dlp-webui/config.yml ]; then
+  else
     printf '%s\n' "密码：记录丢了。运行 ytdlp-web --reset-password 可以换一把新的。"
   fi
-  case "$INIT" in
-    systemd) systemctl --no-pager --full status yt-dlp-webui 2>/dev/null | head -n 12 || true ;;
-    openrc) rc-service yt-dlp-webui status 2>/dev/null || true ;;
-  esac
+  if health_once "$port"; then
+    say_ok "网页正在运行"
+  else
+    say_warn "网页现在没有在运行。运行 ytdlp-web 回车可以重新装好并启动。"
+  fi
+  collect_addrs
+  if [ "$(config_get open_mode 2>/dev/null || true)" = 2 ]; then
+    printf '%s\n' "打开方式：SSH 转发。Mac 终端执行 ssh -L ${port}:127.0.0.1:${port} root@你的VPS ，再打开 http://127.0.0.1:${port}"
+  elif [ -n "$ADDR_PUBLIC" ]; then
+    printf '%s\n' "网址：http://${ADDR_PUBLIC}:${port}"
+  fi
+  printf '%s\n' "运行记录：$LOG_FILE （输入 ytdlp-web --log 查看最近的）"
 }
 
+print_log() {
+  if [ -f "$LOG_FILE" ]; then
+    tail -n "${1:-60}" "$LOG_FILE"
+  else
+    printf '%s\n' "还没有运行记录（$LOG_FILE）。"
+  fi
+}
+
+#----------------------------------------------------------------------
+# ytdlp-web --uninstall：先问一句再卸。直接回车不卸。
+#----------------------------------------------------------------------
 uninstall_all() {
   detect_machine
-  printf '%s\n' "确定要卸掉网页下载器吗？"
-  printf '%s\n' "已经下好的视频会留着，不会删。"
+  printf '%s\n' "确定要卸掉吗？会删掉网页、yt-dlp、QuickJS、PO 令牌程序、WARP 和 VPS 上的临时视频。"
+  printf '%s\n' "你 Mac 上已经保存的视频不受影响。"
   printf '%s\n' "  1) 卸掉"
   printf '%s\n' "  2) 先不卸（推荐）"
   ask_menu UNINSTALL_OK 2 2
@@ -1860,37 +3732,56 @@ uninstall_all() {
   stop_service
   case "$INIT" in
     systemd)
-      systemctl disable yt-dlp-webui >/dev/null 2>&1 || true
-      rm -f /etc/systemd/system/yt-dlp-webui.service
+      systemctl disable ytdlp-web >/dev/null 2>&1 || true
+      rm -f /etc/systemd/system/ytdlp-web.service
       systemctl daemon-reload >/dev/null 2>&1 || true
       ;;
     openrc)
-      rc-update del yt-dlp-webui default >/dev/null 2>&1 || true
-      rm -f /etc/init.d/yt-dlp-webui
+      rc-update del ytdlp-web default >/dev/null 2>&1 || true
+      ;;
+    procd)
+      [ -x /etc/init.d/ytdlp-web ] && /etc/init.d/ytdlp-web disable >/dev/null 2>&1 || true
       ;;
     *)
-      rm -f /etc/init.d/yt-dlp-webui
+      if have update-rc.d; then
+        update-rc.d -f ytdlp-web remove >/dev/null 2>&1 || true
+      elif have chkconfig; then
+        chkconfig --del ytdlp-web >/dev/null 2>&1 || true
+      fi
       ;;
   esac
-  if [ -f /etc/yt-dlp-webui/swap.size ] && [ -f /yt-dlp-webui.swap ]; then
-    swapoff /yt-dlp-webui.swap >/dev/null 2>&1 || true
-    rm -f /yt-dlp-webui.swap
-    fstab_remove_line /etc/fstab "/yt-dlp-webui.swap none swap sw 0 0"
+  rm -f /etc/init.d/ytdlp-web
+  [ -f /etc/rc.local ] && fstab_remove_line /etc/rc.local '/etc/init.d/ytdlp-web start'
+  if old_install_present; then
+    remove_old_install
   fi
-  if [ -f /etc/yt-dlp-webui/ffmpeg-static ]; then
+  for sf in "$SWAP_FILE" "$(cat "$CONF_DIR/swap.old" 2>/dev/null || true)"; do
+    [ -n "$sf" ] && [ -f "$sf" ] || continue
+    swapoff "$sf" >/dev/null 2>&1 || true
+    rm -f "$sf"
+    fstab_remove_line /etc/fstab "$sf none swap sw 0 0"
+  done
+  if [ -f "$CONF_DIR/ffmpeg-static" ]; then
     rm -f /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
   fi
-  rm -f /usr/local/bin/yt-dlp /usr/local/bin/yt-dlp-one /usr/local/bin/qjs \
-    /usr/local/bin/yt-dlp-webui /usr/local/sbin/yt-dlp-webui-run /usr/local/sbin/ytdlp-web \
-    /usr/bin/ytdlp-web /etc/sysctl.d/99-yt-dlp-webui-overcommit.conf
-  rm -rf /etc/yt-dlp-webui /usr/local/share/yt-dlp-webui
-  say_ok "程序已卸掉。下载过的视频还在 ${DATA}/downloads ，没有删。"
+  rm -f /usr/local/bin/yt-dlp /usr/local/bin/qjs /usr/local/bin/bgutil-pot /usr/local/bin/wireproxy \
+    "$RUNNER" /etc/sysctl.d/99-ytdlp-web-overcommit.conf "$LOG_FILE"
+  rm -rf "$LIB_DIR" "$CONF_DIR" "$DATA"
+  link=$(shortcut_link_dir "$PATH")
+  [ -n "$link" ] && [ -L "$link/ytdlp-web" ] && rm -f "$link/ytdlp-web"
+  rm -f "$CLI_FILE"
+  say_ok "已经卸干净了。想再装，重新运行安装命令就行。"
 }
 
-# 键盘不在脚本的输入上时，改回真正的键盘。
+#----------------------------------------------------------------------
+# 问问题：一次一题，直接回车就是推荐的选项。
+#----------------------------------------------------------------------
+# 键盘不在脚本的输入上时（比如用 curl | sh 运行），改回真正的键盘。
 # 不能写进 ask_line：测试用管道喂答案时，这里去读 /dev/tty 会卡住。
 prepare_stdin() {
   [ "${YTD_TEST:-}" = 1 ] && return 0
+  [ "$action" = install ] && auto_mode && return 0
+  [ "${YTD_NO_TTY:-}" = 1 ] && return 0
   if [ ! -t 0 ] && [ -r /dev/tty ] && (: < /dev/tty) 2>/dev/null; then
     exec < /dev/tty
   fi
@@ -1908,7 +3799,7 @@ ask_line() {
   _v=$3
   printf '%s\n' "$_p"
   if [ -n "$_d" ]; then
-    printf '不懂就直接按回车，会用：%s\n' "$_d"
+    printf '直接按回车，会用：%s\n' "$_d"
   fi
   printf '请输入：'
   if ! read -r _a; then
@@ -1942,24 +3833,18 @@ ask_menu() {
   done
 }
 
-ask_settings() {
-  reset_pass=$1
-  PASS_MODE=new
-  say_step "先回答 6 个问题"
-  printf '%s\n' "除了网页端口，其他题可以直接按回车。回车就是适合新手的选项。"
-  printf '%s\n' "端口要你自己填一个数字。脚本不会替你定成 3033。"
-
-  saved_port=$(config_get port 2>/dev/null || true)
+ask_port() {
+  saved_port=$(config_get port 2>/dev/null || old_config_get port 2>/dev/null || true)
   if ! port_prompt_default "$saved_port" >/dev/null 2>&1; then
     saved_port=
   else
     saved_port=$(port_prompt_default "$saved_port")
   fi
   printf '\n%s\n' "第 1 题：网页端口"
-  printf '%s\n' "Mac 打开网页时，地址是 http://小鸡IP:端口"
-  printf '%s\n' "端口就是冒号后面那个数字。请从 1 到 65535 里自己选一个，不要用 22。"
+  printf '%s\n' "Mac 打开网页时，地址是 http://VPS的IP:端口 。端口就是冒号后面那个数字。"
+  printf '%s\n' "请从 1 到 65535 里自己选一个，不要用 22。服务商给你开了哪个端口，就填哪个。"
   if [ -n "$saved_port" ]; then
-    printf '%s\n' "这台鸡现在用的是 ${saved_port}。直接回车就继续用这个。"
+    printf '%s\n' "这台 VPS 现在用的是 ${saved_port}。直接回车就继续用这个。"
   else
     printf '%s\n' "这一题要自己填，不能直接回车。例如 8080。"
   fi
@@ -1970,7 +3855,7 @@ ask_settings() {
     case "$why" in
       ok) ;;
       ssh)
-        say_warn "22 是你登录这台鸡用的，不能给网页。请另选一个，例如 8080。"
+        say_warn "22 是你登录这台 VPS 用的，不能给网页。请另选一个，例如 8080。"
         continue
         ;;
       *)
@@ -1983,17 +3868,72 @@ ask_settings() {
         ;;
     esac
     if port_taken_by_other "$PORT_CHOSEN"; then
-      say_warn "端口 ${PORT_CHOSEN} 已经有别的程序在用。请输入另一个数字，比如 8080。这一题不要直接回车。"
+      say_warn "端口 ${PORT_CHOSEN} 已经有别的程序在用。请输入另一个数字，比如 8080。"
       saved_port=
       continue
     fi
     break
   done
+}
 
-  saved_user=$(config_get username 2>/dev/null || true)
-  [ -n "$saved_user" ] || saved_user=admin
+ask_password() {
+  reset_pass=$1
+  PASS_MODE=new
+  printf '\n%s\n' "第 3 题：登录密码"
+  printf '%s\n' "打开网页要先登录，这样别人不能拿你的 VPS 去下载。"
+  saved_pass=$(read_saved_password 2>/dev/null || true)
+  saved_hash=$(config_get pass_hash 2>/dev/null || true)
+  if [ "$reset_pass" != 1 ] && [ -n "$saved_pass" ] && [ -n "$saved_hash" ]; then
+    printf '%s\n' "这台 VPS 已经有密码了。"
+    printf '%s\n' "  1) 继续用现在的密码（推荐）"
+    printf '%s\n' "  2) 换一把新密码"
+    ask_menu PASS_KEEP 1 2
+    if [ "$PASS_KEEP" = 1 ]; then
+      PASS_MODE=keep
+      PASS_CHOSEN=$saved_pass
+      return 0
+    fi
+  fi
+  printf '%s\n' "  1) 帮我随机生成一把（推荐，不容易被别人猜到）"
+  printf '%s\n' "  2) 我自己设一个"
+  ask_menu PASS_HOW 1 2
+  if [ "$PASS_HOW" = 1 ]; then
+    PASS_MODE=random
+    PASS_CHOSEN=
+    return 0
+  fi
+  PASS_MODE=custom
+  printf '%s\n' "自己设密码时，屏幕上看得见字，这是正常的。设完请记到备忘录里。"
+  while true; do
+    ask_line "请输入密码。至少 6 位，字母和数字都可以" "" PASS_CHOSEN
+    case "$(pass_text_problem "$PASS_CHOSEN")" in
+      ok) ;;
+      space)
+        say_warn "密码里先不要加空格。"
+        continue
+        ;;
+      *)
+        say_warn "太短了。请至少 6 位，比如 abc123。"
+        continue
+        ;;
+    esac
+    ask_line "再输入一次，确认没有打错" "" PASS_AGAIN
+    if [ "$PASS_CHOSEN" = "$PASS_AGAIN" ]; then
+      break
+    fi
+    say_warn "两次不一样，请重新设。"
+  done
+}
+
+ask_settings() {
+  reset_pass=$1
+  say_step "先回答 5 个问题"
+  printf '%s\n' "除了第 1 题的端口，其他题直接按回车就是推荐的选项。"
+  ask_port
+
+  saved_user=$(config_get user 2>/dev/null || true)
+  [ -n "$saved_user" ] || saved_user="admin"
   printf '\n%s\n' "第 2 题：登录名字"
-  printf '%s\n' "打开网页要先登录，这样别人不能拿你的鸡去下载。"
   printf '%s\n' "名字只用英文字母和数字。"
   while true; do
     ask_line "登录名字用什么？" "$saved_user" USER_CHOSEN
@@ -2004,98 +3944,31 @@ ask_settings() {
     esac
   done
 
-  printf '\n%s\n' "第 3 题：登录密码"
-  saved_pass=$(read_saved_password 2>/dev/null || true)
-  saved_hash=$(config_get password_hash 2>/dev/null || true)
-  case "$saved_hash" in
-    \$2a\$*|\$2b\$*|\$2y\$*) ;;
-    *) saved_hash= ;;
-  esac
-  if [ "$reset_pass" != 1 ] && [ -n "$saved_pass" ] && [ -n "$saved_hash" ]; then
-    printf '%s\n' "这台鸡已经有密码了。"
-    printf '%s\n' "  1) 继续用现在的密码（推荐）"
-    printf '%s\n' "  2) 换一把新密码"
-    ask_menu PASS_KEEP 1 2
-    if [ "$PASS_KEEP" = 1 ]; then
-      PASS_MODE=keep
-      PASS_CHOSEN=$saved_pass
-    fi
-  fi
-  if [ "$PASS_MODE" != keep ]; then
-    printf '%s\n' "  1) 帮我随机生成一把（推荐，不容易被别人猜到）"
-    printf '%s\n' "  2) 我自己设一个"
-    ask_menu PASS_HOW 1 2
-    if [ "$PASS_HOW" = 1 ]; then
-      PASS_MODE=random
-      PASS_CHOSEN=
-    else
-      PASS_MODE=custom
-      printf '%s\n' "自己设密码时，屏幕上看得见字，这是正常的。设完请记到备忘录里。"
-      while true; do
-        ask_line "请输入密码。至少 6 位，字母和数字都可以" "" PASS_CHOSEN
-        case "$(pass_text_problem "$PASS_CHOSEN")" in
-          ok) ;;
-          space)
-            say_warn "密码里先不要加空格。"
-            continue
-            ;;
-          *)
-            say_warn "太短了。请至少 6 位，比如 abc123。"
-            continue
-            ;;
-        esac
-        ask_line "再输入一次，确认没有打错" "" PASS_AGAIN
-        if [ "$PASS_CHOSEN" = "$PASS_AGAIN" ]; then
-          break
-        fi
-        say_warn "两次不一样，请重新设。"
-      done
-    fi
-  fi
+  ask_password "$reset_pass"
 
-  printf '\n%s\n' "第 4 题：一次下几个视频"
-  if [ -n "$MEM_MB" ] && [ "$MEM_MB" -lt 768 ]; then
-    printf '%s\n' "这台鸡大约 ${MEM_MB}MB 内存，比较小。"
-    printf '%s\n' "一次只能下一个视频。两个一起下，鸡容易卡死。这一项已经帮你选好了。"
-    QUEUE_CHOSEN=1
-  else
-    printf '%s\n' "  1) 一次下一个（更稳，推荐）"
-    printf '%s\n' "  2) 一次下两个（更快，内存要够）"
-    ask_menu QUEUE_CHOSEN 1 2
-  fi
-
-  printf '\n%s\n' "第 5 题：Mac 怎么打开这个网页"
+  printf '\n%s\n' "第 4 题：Mac 怎么打开这个网页"
   collect_addrs
   if [ -n "$ADDR_V4" ]; then
-    printf '%s\n' "这台鸡有公网地址 ${ADDR_V4}，Mac 浏览器可以直接打开。"
-    printf '%s\n' "  1) 浏览器直接打开（推荐）。需要的话我会放开这个端口。"
-    printf '%s\n' "  2) 只用 SSH 转发，不把端口暴露到公网。"
-    ask_menu OPEN_CHOSEN 1 2
-  elif [ -n "$ADDR_V4_PRIVATE" ]; then
-    printf '%s\n' "这台鸡的地址是 ${ADDR_V4_PRIVATE}，这是内网地址，Mac 不能直接打开。"
-    printf '%s\n' "  1) 我已经在服务商面板做了端口映射，请放开小鸡上的端口。"
-    printf '%s\n' "  2) 用 SSH 转发（推荐，不用懂端口映射）。"
-    ask_menu OPEN_CHOSEN 2 2
-  else
-    printf '%s\n' "  1) 浏览器直接打开（推荐）"
-    printf '%s\n' "  2) 只用 SSH 转发"
-    ask_menu OPEN_CHOSEN 1 2
+    printf '%s\n' "这台 VPS 有公网地址 ${ADDR_V4}。"
+  elif [ -n "$ADDR_PUBLIC" ]; then
+    printf '%s\n' "这台 VPS 本机只有内网地址 ${ADDR_V4_PRIVATE:-?}，外面看到的地址是 ${ADDR_PUBLIC}。"
+    printf '%s\n' "服务商给了端口映射（外网端口和你填的一样）时选 1。不确定也先选 1，打不开再重新运行选 2。"
   fi
+  printf '%s\n' "  1) 浏览器直接打开 http://地址:端口（推荐）"
+  printf '%s\n' "  2) 只用 SSH 转发（更安全，但每次都要先在 Mac 终端敲一行命令）"
+  ask_menu OPEN_CHOSEN 1 2
 
-  printf '\n%s\n' "第 6 题：视频放在哪个文件夹"
-  saved_dir=$(config_get download_path 2>/dev/null || true)
-  [ -n "$saved_dir" ] || saved_dir="${DATA}/downloads"
-  printf '%s\n' "下好的视频会放在这个文件夹。不懂路径就直接回车。"
-  while true; do
-    ask_line "视频文件夹" "$saved_dir" DIR_CHOSEN
-    case "$(dir_text_problem "$DIR_CHOSEN")" in
-      ok) break ;;
-      relative) say_warn "请写从 / 开头的完整路径，例如 /root/youtube。或者直接回车。" ;;
-      space) say_warn "路径里先不要加空格。" ;;
-      system) say_warn "这个位置是系统用的，请换一个，例如 /root/youtube。" ;;
-      *) say_warn "这个路径不能用。直接回车就用推荐的文件夹。" ;;
-    esac
-  done
+  printf '\n%s\n' "第 5 题：被 YouTube 拦住时，要不要自动换 Cloudflare WARP 线路？"
+  printf '%s\n' "VPS 是机房 IP，YouTube 有时会说「请登录，确认你不是机器人」。"
+  printf '%s\n' "网页会自动试好几种不用账号的办法，WARP 是其中一招：换成 Cloudflare 的出口 IP。"
+  printf '%s\n' "选「要」会在 Cloudflare 免费匿名注册一个 WARP（不用邮箱、不花钱）。平时不开，被拦时才临时打开。"
+  saved_warp=$(config_get warp 2>/dev/null || true)
+  d=1
+  [ "$saved_warp" = 0 ] && d=2
+  printf '%s\n' "  1) 要（推荐）"
+  printf '%s\n' "  2) 不要"
+  ask_menu WARP_ANS "$d" 2
+  if [ "$WARP_ANS" = 1 ]; then WARP_CHOSEN=1; else WARP_CHOSEN=0; fi
 }
 
 show_plan() {
@@ -2104,122 +3977,190 @@ show_plan() {
   printf '%s\n' "  登录名字：${USER_CHOSEN}"
   case "$PASS_MODE" in
     keep) printf '%s\n' "  密码：继续用现在的" ;;
-    custom) printf '%s\n' "  密码：用你刚设的那把" ;;
+    custom) printf '%s\n' "  密码：用你设的那把" ;;
     *) printf '%s\n' "  密码：随机生成，装完会显示出来" ;;
   esac
-  if [ "$QUEUE_CHOSEN" = 2 ]; then
-    printf '%s\n' "  下载：一次可以下两个"
-  else
-    printf '%s\n' "  下载：一次下一个"
-  fi
   if [ "$OPEN_CHOSEN" = 2 ]; then
-    printf '%s\n' "  Mac 打开方式：SSH 转发"
+    printf '%s\n' "  Mac 打开方式：SSH 转发（网页只在 VPS 本机能打开）"
   else
     printf '%s\n' "  Mac 打开方式：浏览器直接打开"
   fi
-  printf '%s\n' "  视频文件夹：${DIR_CHOSEN}"
+  if [ "$WARP_CHOSEN" = 1 ]; then
+    printf '%s\n' "  被拦时用 Cloudflare WARP：要"
+  else
+    printf '%s\n' "  被拦时用 Cloudflare WARP：不要"
+  fi
   printf '\n%s\n' "  1) 开始安装（推荐）"
   printf '%s\n' "  2) 上面有选错的，重新答一遍"
 }
 
-print_how_to_open() {
+#----------------------------------------------------------------------
+# 全自动模式：一键命令前面加上 PORT=端口 ，就一个问题都不问。
+#   PORT=15346          网页端口（第一次安装必须给）
+#   WEB_USER=admin      登录名字（可不给，默认 admin）
+#   WEB_PASS=...        登录密码（可不给，默认随机生成；已经装过就沿用原来的）
+#   OPEN=1 或 2         1 浏览器直接打开（默认），2 只用 SSH 转发
+#   WARP=1 或 0         被拦时要不要用 Cloudflare WARP（默认 1 要）
+# 已经装过的机器，只写 YTD_AUTO=1 也行，就是按原来的设置自动更新。
+#----------------------------------------------------------------------
+auto_mode() {
+  [ -n "${YTD_PORT:-}${PORT:-}" ] || [ "${YTD_AUTO:-}" = 1 ]
+}
+
+yes_value() {
+  case "$1" in
+    1|y|Y|yes|YES|on|true) printf '%s\n' 1 ;;
+    0|n|N|no|NO|off|false) printf '%s\n' 0 ;;
+    *) printf '%s\n' "$2" ;;
+  esac
+}
+
+load_auto_choices() {
+  want_port=${YTD_PORT:-${PORT:-}}
+  saved_port=$(config_get port 2>/dev/null || old_config_get port 2>/dev/null || true)
+  [ -n "$want_port" ] || want_port=$saved_port
+  [ -n "$want_port" ] || die "全自动模式要告诉我端口。例如在安装命令前面加上 PORT=15346"
+  PORT_CHOSEN=$(normalize_port "$want_port" 2>/dev/null) || die "端口 ${want_port} 不对，请用 1 到 65535 的数字。"
+  case "$(port_text_problem "$PORT_CHOSEN")" in
+    ok) ;;
+    ssh) die "22 是登录 VPS 用的端口，不能给网页。请换一个，例如 PORT=8080" ;;
+    *) die "端口 ${want_port} 不对，请用 1 到 65535 的数字。" ;;
+  esac
+  if [ "$MIGRATE" != 1 ] && [ "$PORT_CHOSEN" != "$saved_port" ] && port_taken_by_other "$PORT_CHOSEN"; then
+    die "端口 ${PORT_CHOSEN} 已经有别的程序在用。请换一个，例如 PORT=8080"
+  fi
+  USER_CHOSEN=${WEB_USER:-$(config_get user 2>/dev/null || old_config_get username 2>/dev/null || printf '%s' admin)}
+  [ "$(user_text_problem "$USER_CHOSEN")" = ok ] || die "登录名字只能用英文字母和数字（WEB_USER）。"
+  if [ -n "${WEB_PASS:-}" ]; then
+    [ "$(pass_text_problem "$WEB_PASS")" = ok ] || die "WEB_PASS 至少 6 位，不能有空格。"
+    PASS_MODE=custom
+    PASS_CHOSEN=$WEB_PASS
+  elif [ -n "$(config_get pass_hash 2>/dev/null || true)" ]; then
+    PASS_MODE=keep
+    PASS_CHOSEN=$(read_saved_password 2>/dev/null || true)
+  else
+    PASS_CHOSEN=$(read_saved_password "$OLD_NOTE" 2>/dev/null || true)
+    if [ -n "$PASS_CHOSEN" ] && [ "$(pass_text_problem "$PASS_CHOSEN")" = ok ]; then
+      PASS_MODE=custom
+    else
+      PASS_MODE=random
+      PASS_CHOSEN=
+    fi
+  fi
+  OPEN_CHOSEN=${OPEN:-$(config_get open_mode 2>/dev/null || printf '%s' 1)}
+  [ "$OPEN_CHOSEN" = 2 ] || OPEN_CHOSEN=1
+  WARP_CHOSEN=$(yes_value "${WARP:-$(config_get warp 2>/dev/null || printf '%s' 1)}" 1)
+  say_ok "全自动模式：端口 ${PORT_CHOSEN}，登录名字 ${USER_CHOSEN}，不再提问"
+}
+
+#----------------------------------------------------------------------
+# 装好以后，告诉你怎么在 Mac 上用。
+#----------------------------------------------------------------------
+print_how_to_use() {
   port=$1
   user=$2
   pass=$3
   open_mode=$4
-  dir=$5
+  title=$5
   collect_addrs
-  printf '\n%s\n' "${C_GREEN}装好了。${C_NC}"
-  printf '%s\n' "用户名：${user}"
-  printf '%s\n' "密码：${pass}"
-  printf '%s\n' "密码也记在 /etc/yt-dlp-webui/install.txt ，忘记了可以输入：ytdlp-web --status"
+  printf '\n%s\n' "${C_GREEN}${title}${C_NC}"
   if [ "$open_mode" = 2 ]; then
-    printf '\n%s\n' "你选了 SSH 转发。在 Mac 终端执行（地址换成你平时登这台鸡用的）："
-    printf '%s\n' "ssh -L ${port}:127.0.0.1:${port} root@你的鸡"
-    printf '%s\n' "然后浏览器打开 http://127.0.0.1:${port}"
-  elif [ -n "$ADDR_V4" ]; then
-    printf '\n%s\n' "在 Mac 浏览器打开："
-    printf '%s\n' "http://${ADDR_V4}:${port}"
-  elif [ -n "$ADDR_V6" ] && [ -z "$ADDR_V4_PRIVATE" ]; then
-    printf '\n%s\n' "在 Mac 浏览器打开："
-    printf '%s\n' "http://[${ADDR_V6}]:${port}"
-  fi
-  if [ "$open_mode" != 2 ] && [ -n "$ADDR_V4_PRIVATE" ] && [ -z "$ADDR_V4" ]; then
-    printf '\n%s\n' "这台小鸡的地址是 ${ADDR_V4_PRIVATE}，外面不能直接打开。"
-    printf '%s\n' "请在服务商面板把公网端口转到这台鸡的 ${port}，再用公网地址打开。"
-    printf '%s\n' "如果还没做映射，可以在 Mac 终端执行："
-    printf '%s\n' "ssh -L ${port}:127.0.0.1:${port} root@你的鸡"
-    printf '%s\n' "然后浏览器打开 http://127.0.0.1:${port}"
-  fi
-  printf '\n%s\n' "把 YouTube 链接贴进网页，视频会下到 ${dir} 。"
-  printf '%s\n' "下完后在网页里可以把文件再下回 Mac。鸡的硬盘不大，下回 Mac 后把鸡上的文件删掉。"
-  if [ "$QUEUE_CHOSEN" = 1 ]; then
-    printf '%s\n' "按你的选择，视频会一个接一个下载。"
-  fi
-  printf '%s\n' "面板默认是中文。打开后先登录，右上角可以换成别的语言。"
-  printf '%s\n' "以后再运行一次安装命令，或者输入 ytdlp-web ，直接回车就是更新到最新版本。想改端口或密码就选第 2 项。"
-  printf '%s\n' "查看：ytdlp-web --status    换密码：ytdlp-web --reset-password    卸载：ytdlp-web --uninstall"
-}
-
-print_updated() {
-  port=$1
-  user=$2
-  pass=$3
-  dir=$4
-  collect_addrs
-  printf '\n%s\n' "${C_GREEN}更新好了。${C_NC}"
-  printf '%s\n' "程序已经换成最新版本。端口、密码和视频文件夹都没改。"
-  printf '%s\n' "用户名：${user}"
-  if [ -n "$pass" ]; then
-    printf '%s\n' "密码：${pass}"
+    printf '\n%s\n' "你选了 SSH 转发。每次用之前，在 Mac 的「终端」里执行（地址换成你平时登这台 VPS 用的）："
+    printf '%s\n' "  ssh -L ${port}:127.0.0.1:${port} root@你的VPS地址"
+    printf '%s\n' "不要关这个终端窗口，然后在 Mac 浏览器打开：http://127.0.0.1:${port}"
   else
-    printf '%s\n' "密码还是原来的那把。忘记了可以输入：ytdlp-web --reset-password"
+    printf '\n%s\n' "在 Mac 浏览器（Safari 或 Chrome）打开："
+    if [ -n "$ADDR_PUBLIC" ]; then
+      printf '%s\n' "  http://${ADDR_PUBLIC}:${port}"
+    else
+      printf '%s\n' "  http://你的VPS的IP:${port}"
+    fi
+    if [ -n "$ADDR_V6" ]; then
+      printf '%s\n' "  （也可以用 IPv6：http://[${ADDR_V6}]:${port}）"
+    fi
+    if [ -z "$ADDR_V4" ] && [ -n "$ADDR_V4_PRIVATE" ]; then
+      printf '%s\n' "这台 VPS 本机只有内网地址 ${ADDR_V4_PRIVATE}。上面的网址打不开时，"
+      printf '%s\n' "请在服务商面板把外网端口 ${port} 映射到这台 VPS 的 ${port}，或者重新运行 ytdlp-web 选 SSH 转发。"
+    fi
   fi
-  printf '%s\n' "密码也记在 /etc/yt-dlp-webui/install.txt ，忘记了可以输入：ytdlp-web --status"
-  if [ -n "$ADDR_V4" ]; then
-    printf '\n%s\n' "在 Mac 浏览器打开："
-    printf '%s\n' "http://${ADDR_V4}:${port}"
-  elif [ -n "$ADDR_V4_PRIVATE" ]; then
-    printf '\n%s\n' "这台小鸡的地址是 ${ADDR_V4_PRIVATE}，外面不能直接打开。"
-    printf '%s\n' "请用公网地址加端口 ${port}，或者在 Mac 终端执行："
-    printf '%s\n' "ssh -L ${port}:127.0.0.1:${port} root@你的鸡"
-    printf '%s\n' "然后浏览器打开 http://127.0.0.1:${port}"
+  printf '\n%s\n' "怎么用："
+  printf '%s\n' "  1. 登录后，把 YouTube 视频链接粘贴到框里，点「开始」。"
+  printf '%s\n' "  2. 等进度走完，视频会自动存进 Mac 的「下载」文件夹。"
+  printf '%s\n' "     Safari 第一次会问「是否允许下载」，点「允许」。"
+  printf '%s\n' "  3. 传完以后 VPS 上的文件会自动删掉，不用管。"
+  printf '%s\n' "  被 YouTube 拦住时，网页会自动换办法；实在不行会用中文告诉你怎么上传 cookies。"
+  printf '\n%s\n' "以后再运行一次安装命令，或者输入 ytdlp-web ，直接回车就是更新到最新版本。"
+  printf '%s\n' "查看：ytdlp-web --status    运行记录：ytdlp-web --log    换密码：ytdlp-web --reset-password    卸载：ytdlp-web --uninstall"
+  # 最后醒目地印出：网址、登录名、密码。
+  if [ "$open_mode" = 2 ]; then
+    url="http://127.0.0.1:${port}  （先在 Mac 终端执行 ssh -L ${port}:127.0.0.1:${port} root@你的VPS地址）"
+  elif [ -n "$ADDR_PUBLIC" ]; then
+    url="http://${ADDR_PUBLIC}:${port}"
+  else
+    url="http://你的VPS的IP:${port}"
   fi
-  printf '\n%s\n' "视频还是下到 ${dir} 。"
-  printf '%s\n' "面板默认是中文。右上角可以换成别的语言。打开后如果还没登录，会先进入登录页。"
-  printf '%s\n' "想改端口、密码或文件夹，再运行一次，选第 2 项。"
+  [ -n "$pass" ] || pass="还是原来那把（忘了就运行 ytdlp-web --reset-password）"
+  printf '\n%s\n' "${C_GREEN}==================== 记下这三样 ====================${C_NC}"
+  printf '%s\n' "${C_GREEN}  网址：  ${url}${C_NC}"
+  printf '%s\n' "${C_GREEN}  登录名：${user}${C_NC}"
+  printf '%s\n' "${C_GREEN}  密码：  ${pass}${C_NC}"
+  printf '%s\n' "${C_GREEN}=====================================================${C_NC}"
+  printf '%s\n' "（也记在 $NOTE_FILE ，忘了就输入：ytdlp-web --status）"
 }
 
+#----------------------------------------------------------------------
+# 安装 / 更新的总流程。
+#----------------------------------------------------------------------
 do_install() {
-  reset_pass=$1
   detect_machine
-  say_step "这台鸡"
+  say_step "这台 VPS"
   say_info "系统：$OS_PRETTY"
   say_info "包管理：${PM}    架构：${ARCH}    系统库：${LIBC}    启动：${INIT}"
   say_info "内存：${MEM_MB:-未知}MB    已有虚拟内存：${SWAP_MB}MB    磁盘剩余：${DISK_MB}MB    CPU：${NCPU}"
-  webui_asset "$ARCH" >/dev/null || die "这个网页程序没有 $ARCH 的版本，32 位系统装不了。"
-  ytdlp_asset "$ARCH" "$LIBC" >/dev/null || die "没有适合 $ARCH / $LIBC 的 yt-dlp。"
+  ytdlp_asset "$ARCH" "$LIBC" >/dev/null || die "没有适合 $ARCH / $LIBC 的 yt-dlp，这台机器装不了。"
 
   UPDATE_MODE=0
-  if [ "$reset_pass" != 1 ] && install_ready; then
-    say_step "这台鸡已经装过了"
-    printf '%s\n' "再运行一次，就是把程序更新到最新版本。"
-    printf '%s\n' "端口、登录密码和视频文件夹都保持不变。"
+  MIGRATE=0
+  asked=0
+  if auto_mode; then
+    if install_ready; then
+      UPDATE_MODE=1
+    elif old_install_present; then
+      MIGRATE=1
+    fi
+    load_auto_choices
+    asked=1
+  elif install_ready; then
+    say_step "这台 VPS 已经装过了"
+    printf '%s\n' "再运行一次，就是把所有程序更新到最新版本。端口、密码都保持不变。"
     printf '%s\n' "  1) 更新到最新版本（推荐）"
-    printf '%s\n' "  2) 我想改端口、密码或文件夹"
+    printf '%s\n' "  2) 我想改端口、密码或其他设置"
     ask_menu UPDATE_CHOICE 1 2
     if [ "$UPDATE_CHOICE" = 1 ]; then
       if load_saved_choices; then
         UPDATE_MODE=1
-        say_ok "按原来的设置更新。端口 ${PORT_CHOSEN}，视频文件夹 ${DIR_CHOSEN}"
+        asked=1
+        say_ok "按原来的设置更新。端口 ${PORT_CHOSEN}"
       else
         say_warn "原来的设置读不全，请再答一遍。"
       fi
     fi
+  elif old_install_present; then
+    MIGRATE=1
+    say_step "这台 VPS 装的是旧版"
+    printf '%s\n' "旧版是先把视频下到 VPS，你再自己存回 Mac。"
+    printf '%s\n' "新版：贴链接以后视频自动存进 Mac 的「下载」文件夹，VPS 上自动删掉。"
+    printf '%s\n' "  1) 升级到新版，端口和密码不变（推荐）"
+    printf '%s\n' "  2) 升级到新版，重新回答问题"
+    ask_menu MIGRATE_CHOICE 1 2
+    if [ "$MIGRATE_CHOICE" = 1 ] && load_old_choices; then
+      asked=1
+      say_ok "沿用旧版的端口 ${PORT_CHOSEN} 和登录名字 ${USER_CHOSEN}"
+    fi
   fi
-  if [ "$UPDATE_MODE" != 1 ]; then
+  if [ "$asked" != 1 ]; then
     while true; do
-      ask_settings "$reset_pass"
+      ask_settings 0
       show_plan
       ask_menu PLAN_OK 1 2
       [ "$PLAN_OK" = 1 ] && break
@@ -2227,103 +4168,116 @@ do_install() {
     done
   fi
 
-  say_step "准备内存和软件源"
+  say_step "准备内存和基础工具"
   prepare_workdir
   prepare_memory
   ensure_tool ca || say_warn "证书包没装上，后面下载可能会失败"
+  # 有 curl 最好（WARP 测试要用）。只有 BusyBox 的 wget 时，试着从软件源补一个 curl。
+  if ! have curl; then
+    pm_install_one curl >/dev/null 2>&1 || true
+  fi
   ensure_tool curl || die "装不上 curl 或 wget，没法下载程序。"
   ensure_tool tar || die "装不上 tar。"
-  ensure_tool flock || die "装不上 flock。小内存机器要用它把下载排成一个一个。"
-  # 趁内存还干净先装这个小工具。放到大文件下载之后，64MB 的鸡会在这一步被杀掉。
-  ensure_tool htpasswd || die "装不上生成密码用的 htpasswd。没有登录不能把网页暴露出去。"
+  # 网页服务是 Perl 写的。Debian / Ubuntu 一定自带，别的系统从软件源装。
+  ensure_tool perl || die "装不上 Perl（网页服务要用）。"
+  ensure_tool unzip >/dev/null 2>&1 || true
 
   ensure_ffmpeg
   install_qjs
   install_ytdlp
-  stop_service
-  install_webui
-  install_panel
+  install_pot
+  install_warp
 
-  mkdir -p "$DATA/downloads" "$DATA/tmp" "$DATA/cache" "$DATA/home" "$DIR_CHOSEN" /etc/yt-dlp-webui /usr/local/sbin
-  DL=$(downloader_for_choice "$QUEUE_CHOSEN")
-  if [ "$DL" = /usr/local/bin/yt-dlp-one ]; then
-    write_one_wrapper
-    say_ok "按你的选择，视频会一个接一个下载"
-  else
-    rm -f /usr/local/bin/yt-dlp-one
-    say_ok "按你的选择，可以同时下两个"
-  fi
-
+  # 密码：继续用、自己设或者随机生成。
   user=$USER_CHOSEN
+  hash=
   if [ "$PASS_MODE" = keep ]; then
     pass=$PASS_CHOSEN
-    hash=$(config_get password_hash 2>/dev/null || true)
-    [ -n "$hash" ] || die "原来的密码记录坏了。请重新运行，并选择换一把新密码。"
-    if [ -n "$pass" ]; then
-      say_ok "沿用原来的登录密码"
-    else
-      say_warn "原来的密码原文没找到。登录密码没变。忘记了可以运行 ytdlp-web --reset-password"
-    fi
+    hash=$(config_get pass_hash 2>/dev/null || true)
+    [ -n "$hash" ] || die "原来的密码记录坏了。请运行 ytdlp-web --reset-password 换一把。"
   elif [ "$PASS_MODE" = custom ]; then
     pass=$PASS_CHOSEN
-    hash=$(hash_password "$user" "$pass") || die "登录密码没能生成。没有登录不能把网页暴露出去。"
   else
-    say_step "生成登录密码"
-    pass=$(rand_hex 8) || die "随机密码没生成。"
-    hash=$(hash_password "$user" "$pass") || die "登录密码没能生成。没有登录不能把网页暴露出去。"
+    pass=$(rand_hex 6) || die "随机密码没生成。"
+  fi
+  if [ -z "$hash" ]; then
+    hash=$(hash_password "$pass") || die "登录密码没能生成。没有登录不能把网页放到网上。"
   fi
 
-  secret=$(env_get JWT_SECRET 2>/dev/null || true)
-  if [ -z "$secret" ]; then
-    secret=$(rand_hex 24) || die "登录密钥没生成。"
-  fi
-  gomem=$(gomem_for "${MEM_MB:-1024}")
-  write_env_file "$secret" "$gomem"
-  write_runner
-
+  say_step "放好网页服务"
+  stop_service
+  [ "$MIGRATE" = 1 ] && stop_old_service
+  write_server
+  mkdir -p "$CONF_DIR" "$DATA"
+  chmod 700 "$CONF_DIR"
+  ff=$(command -v ffmpeg 2>/dev/null || true)
+  [ -n "$JS_RUNTIME" ] || JS_RUNTIME=$(js_runtime_value quickjs /usr/local/bin/qjs)
   port=$PORT_CHOSEN
-  q=$QUEUE_CHOSEN
-  write_config /etc/yt-dlp-webui/config.yml "$port" "$user" "$hash" "$DL" "$JS_RUNTIME" "$q" "$DATA" "$DIR_CHOSEN" "${UI_DIR:-}"
-  chmod 600 /etc/yt-dlp-webui/config.yml
-  if [ -n "$pass" ]; then
-    write_install_note "$user" "$pass" "$port"
+  write_config "$CONF_FILE" "$port" "$(listen_for_open "$OPEN_CHOSEN")" "$user" "$hash" "$DATA" \
+    /usr/local/bin/yt-dlp "$JS_RUNTIME" "$ff" "${POT_BIN:-}" "${WARP_CONF:-}" "${WARP_PORT:-40000}" "$OPEN_CHOSEN" "$WARP_CHOSEN"
+  chmod 600 "$CONF_FILE"
+  # 换了密码，以前登录过的浏览器都要重新登录。
+  if [ "$PASS_MODE" != keep ]; then
+    rm -f "$DATA/state/sessions"
   fi
+  [ -n "$pass" ] && write_install_note "$user" "$pass" "$port"
+  write_runner
   write_service
   install_cli
   if [ "$OPEN_CHOSEN" = 1 ]; then
     open_firewall "$port"
-  elif [ "$OPEN_CHOSEN" = 2 ]; then
-    say_info "按你的选择，没有把端口放开到公网。"
   else
-    say_info "端口放开方式保持原来的。"
+    say_info "按你的选择，网页只在 VPS 本机能打开，没有放到公网。"
   fi
 
   say_step "启动"
   start_service || true
-  if ! health_ok "$port" && [ -n "$gomem" ]; then
-    say_warn "带内存上限时网页没起来，去掉上限再试一次"
-    write_env_file "$secret" ""
-    start_service || true
-  fi
   if ! health_ok "$port"; then
     show_fail_log
-    die "网页没能在端口 $port 上打开。"
+    die "网页没能在端口 $port 上打开。把上面的记录发给懂的人看看。"
   fi
   say_ok "网页已在端口 ${port} 运行"
+  [ "$MIGRATE" = 1 ] && remove_old_install
   rm -rf "$WORK"
   if [ "$UPDATE_MODE" = 1 ]; then
-    print_updated "$port" "$user" "$pass" "$DIR_CHOSEN"
+    print_how_to_use "$port" "$user" "$pass" "$OPEN_CHOSEN" "更新好了。程序都换成了最新版本，端口和密码没变。"
   else
-    print_how_to_open "$port" "$user" "$pass" "$OPEN_CHOSEN" "$DIR_CHOSEN"
+    print_how_to_use "$port" "$user" "$pass" "$OPEN_CHOSEN" "装好了。"
   fi
+}
+
+# 只换密码，别的都不动。
+reset_password_only() {
+  detect_machine
+  install_ready || die "还没装好，先运行 ytdlp-web 安装。"
+  load_saved_choices || die "原来的设置读不全，请运行 ytdlp-web 选第 2 项重新设置。"
+  ask_password 1
+  if [ "$PASS_MODE" = random ]; then
+    pass=$(rand_hex 6) || die "随机密码没生成。"
+  else
+    pass=$PASS_CHOSEN
+  fi
+  hash=$(hash_password "$pass") || die "密码没能生成。"
+  tmp=$CONF_FILE.new
+  awk -v h="$hash" 'BEGIN{done=0} /^pass_hash=/{print "pass_hash=" h; done=1; next} {print} END{if(!done) print "pass_hash=" h}' "$CONF_FILE" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONF_FILE"
+  write_install_note "$USER_CHOSEN" "$pass" "$PORT_CHOSEN"
+  rm -f "$DATA/state/sessions"
+  stop_service
+  start_service || true
+  health_ok "$PORT_CHOSEN" || { show_fail_log; die "网页没能重新启动。"; }
+  say_ok "密码换好了。登录名字：${USER_CHOSEN}    新密码：${pass}"
+  printf '%s\n' "以前登录过的浏览器需要用新密码重新登录。"
 }
 
 usage() {
   printf '%s\n' "用法："
-  printf '%s\n' "  ytdlp-web                 第一次安装会问几个问题。已经装过再运行，直接回车就是更新到最新版本"
-  printf '%s\n' "  ytdlp-web --status        查看"
+  printf '%s\n' "  ytdlp-web                   第一次安装会问几个问题。已经装过再运行，直接回车就是更新到最新版本"
+  printf '%s\n' "  ytdlp-web --status          查看装得怎么样、网址和密码"
+  printf '%s\n' "  ytdlp-web --log             查看最近的运行记录"
   printf '%s\n' "  ytdlp-web --reset-password  换一把登录密码"
-  printf '%s\n' "  ytdlp-web --uninstall     卸掉程序，留下已经下好的视频"
+  printf '%s\n' "  ytdlp-web --uninstall       卸载"
 }
 
 main() {
@@ -2331,6 +4285,7 @@ main() {
   for arg in "$@"; do
     case "$arg" in
       --status|-s) action=status ;;
+      --log|--logs) action=log ;;
       --uninstall) action=uninstall ;;
       --reset-password) action=reset ;;
       --help|-h) usage; exit 0 ;;
@@ -2339,21 +4294,21 @@ main() {
   done
   case "$(uname -s)" in
     Linux) ;;
-    *) die "这个脚本要在 Linux 小鸡上运行。你现在是 $(uname -s)。" ;;
+    *) die "这个脚本要在 Linux VPS 上运行。你现在是 $(uname -s)。Mac 上不用装任何东西，用浏览器打开 VPS 的网页就行。" ;;
   esac
-  if [ "$action" = status ]; then
-    print_status
-    exit 0
-  fi
   if [ "$(id -u)" -ne 0 ]; then
     die "请用 root 运行。可以先输入：sudo -i"
   fi
+  case "$action" in
+    status) print_status; exit 0 ;;
+    log) print_log 80; exit 0 ;;
+  esac
   prepare_stdin
   maybe_self_update "$@"
   case "$action" in
     uninstall) uninstall_all ;;
-    reset) do_install 1 ;;
-    install) do_install 0 ;;
+    reset) reset_password_only ;;
+    install) do_install ;;
   esac
 }
 
