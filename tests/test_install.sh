@@ -112,7 +112,7 @@ if version_newer 1.0.0 1.0.0; then
 else
   printf 'ok version-equal\n'
 fi
-check ver-file "$(version_from_file ./install.sh)" 1.0.0
+check ver-file "$(version_from_file ./install.sh)" 1.0.1
 if remote_script_ok ./install.sh; then
   printf 'ok script-marker\n'
 else
@@ -127,6 +127,10 @@ check cfg-user "$(config_get username "$tmp")" admin
 check cfg-hash "$(config_get password_hash "$tmp")" '$2y$05$abc/DEF.ghi'
 check cfg-js "$(config_get js_runtime_path "$tmp")" 'quickjs:/usr/local/bin/qjs'
 check cfg-dl "$(config_get downloader_path "$tmp")" /usr/local/bin/yt-dlp-one
+check cfg-dir "$(config_get download_path "$tmp")" /var/lib/yt-dlp-webui/downloads
+write_config "$tmp" 8080 admin '$2y$05$abc/DEF.ghi' /usr/local/bin/yt-dlp 'quickjs:/usr/local/bin/qjs' 2 /var/lib/yt-dlp-webui /root/youtube
+check cfg-custom-port "$(config_get port "$tmp")" 8080
+check cfg-custom-dir "$(config_get download_path "$tmp")" /root/youtube
 if grep -q 'SuperSecret' "$tmp"; then
   printf 'FAIL plaintext password leaked\n' >&2
   fail=1
@@ -159,6 +163,46 @@ else
   printf 'ok fstab-remove\n'
 fi
 rm -f "$fs"
+
+check port-ok "$(port_text_problem 3033)" ok
+check port-pad "$(port_text_problem 03033)" ok
+check port-norm "$(normalize_port 03033)" 3033
+check port-ssh "$(port_text_problem 22)" ssh
+check port-zero "$(port_text_problem 0)" range
+check port-big "$(port_text_problem 70000)" range
+check port-nan "$(port_text_problem abc)" nan
+check user-ok "$(user_text_problem admin)" ok
+check user-bad "$(user_text_problem 'xiao ming')" chars
+check user-long "$(user_text_problem aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)" len
+check pass-ok "$(pass_text_problem abc123)" ok
+check pass-short "$(pass_text_problem abc)" short
+check pass-space "$(pass_text_problem 'abc 123')" space
+check dir-ok "$(dir_text_problem /root/youtube)" ok
+check dir-rel "$(dir_text_problem youtube)" relative
+check dir-tmp "$(dir_text_problem /tmp/a)" system
+check dir-dot "$(dir_text_problem /root/../etc)" dotdot
+check dir-quote "$(dir_text_problem '/root/a"b')" symbol
+check menu-enter "$(menu_answer '' 1 2)" 1
+check menu-space "$(menu_answer ' 2 ' 1 2)" 2
+check menu-pad "$(menu_answer 01 1 2)" 1
+check menu-bad "$(menu_answer 9 1 2)" bad
+check menu-word "$(menu_answer abc 1 2)" bad
+check dl-choice1 "$(downloader_for_choice 1)" /usr/local/bin/yt-dlp-one
+check dl-choice2 "$(downloader_for_choice 2)" /usr/local/bin/yt-dlp
+
+ask_line "端口题" "3033" ASK_PORT <<EOF
+8080
+EOF
+check ask-port "$ASK_PORT" 8080
+ask_line "端口题" "3033" ASK_ENTER <<EOF
+
+EOF
+check ask-enter "$ASK_ENTER" 3033
+ask_menu ASK_MENU 1 2 <<EOF
+9
+2
+EOF
+check ask-menu "$ASK_MENU" 2
 
 if [ "$fail" -eq 0 ]; then
   printf '全部通过\n'

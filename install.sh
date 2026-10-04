@@ -9,7 +9,8 @@
 # 不用 Docker。Docker 自己就占满 64MB，小小鸡起不来。
 # 64MB 会先做一块硬盘上的虚拟内存，并让下载一个接一个跑，避免内存被打爆。
 #
-# 再运行一次是安全的：更新程序，原来的登录密码不动。
+# 安装时会用大白话问端口、登录、一次下几个、Mac 怎么打开、视频放哪。
+# 每一题直接回车就是推荐项。再运行一次会再问，回车就沿用原来的选择。
 #
 #   sh install.sh
 #   sh install.sh --status
@@ -17,7 +18,7 @@
 #   sh install.sh --uninstall
 #======================================================================
 
-VERSION=1.0.0
+VERSION=1.0.1
 # ytdlp-onekey-begin
 
 if [ -t 1 ]; then
@@ -314,14 +315,16 @@ write_config() {
   js=$6
   queue=$7
   data=$8
+  down=$9
   [ -n "$file" ] && [ -n "$port" ] && [ -n "$user" ] && [ -n "$hash" ] || return 1
+  [ -n "$down" ] || down="$data/downloads"
   {
     printf '%s\n' 'server:'
     printf '%s\n' '  host: "0.0.0.0"'
     printf '  port: %s\n' "$port"
     printf '  queue_size: %s\n' "$queue"
     printf '%s\n' 'paths:'
-    printf '  download_path: "%s"\n' "$data/downloads"
+    printf '  download_path: "%s"\n' "$down"
     printf '  downloader_path: "%s"\n' "$dl"
     printf '  local_database_path: "%s"\n' "$data"
     printf '  js_runtime_path: "%s"\n' "$js"
@@ -333,6 +336,104 @@ write_config() {
     printf '%s\n' '  enable_file_logging: true'
     printf '  log_path: "%s"\n' '/var/log/yt-dlp-webui.log'
   } > "$file"
+}
+
+# 下面几个只判断输入对不对，不读键盘。
+normalize_port() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  n=$(printf '%s' "$1" | sed 's/^0*//')
+  [ -n "$n" ] || n=0
+  printf '%s\n' "$n"
+}
+
+port_text_problem() {
+  p=$(normalize_port "$1") || { printf '%s\n' nan; return 0; }
+  if [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
+    printf '%s\n' range
+    return 0
+  fi
+  if [ "$p" -eq 22 ]; then
+    printf '%s\n' ssh
+    return 0
+  fi
+  printf '%s\n' ok
+}
+
+user_text_problem() {
+  u=$1
+  case "$u" in
+    ''|*[!A-Za-z0-9]*) printf '%s\n' chars; return 0 ;;
+  esac
+  if [ "${#u}" -gt 32 ]; then
+    printf '%s\n' len
+    return 0
+  fi
+  printf '%s\n' ok
+}
+
+pass_text_problem() {
+  p=$1
+  [ -n "$p" ] || { printf '%s\n' empty; return 0; }
+  case "$p" in
+    *[[:space:]]*) printf '%s\n' space; return 0 ;;
+  esac
+  if [ "${#p}" -lt 6 ]; then
+    printf '%s\n' short
+    return 0
+  fi
+  printf '%s\n' ok
+}
+
+dir_text_problem() {
+  d=$1
+  case "$d" in
+    /*) ;;
+    *) printf '%s\n' relative; return 0 ;;
+  esac
+  case "$d" in
+    *[[:space:]]*) printf '%s\n' space; return 0 ;;
+    *..*) printf '%s\n' dotdot; return 0 ;;
+  esac
+  if printf '%s' "$d" | grep -q '["\\]'; then
+    printf '%s\n' symbol
+    return 0
+  fi
+  case "$d" in
+    /|/tmp|/tmp/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/run|/run/*)
+      printf '%s\n' system
+      return 0
+      ;;
+  esac
+  printf '%s\n' ok
+}
+
+# 空答案用默认。不在 1 到 max 之间时打印 bad。
+menu_answer() {
+  a=$1
+  d=$2
+  max=$3
+  a=$(printf '%s' "$a" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -z "$a" ] && a=$d
+  case "$a" in
+    ''|*[!0-9]*) printf '%s\n' bad; return 0 ;;
+  esac
+  n=$(printf '%s' "$a" | sed 's/^0*//')
+  [ -n "$n" ] || n=0
+  if [ "$n" -ge 1 ] && [ "$n" -le "$max" ]; then
+    printf '%s\n' "$n"
+  else
+    printf '%s\n' bad
+  fi
+}
+
+downloader_for_choice() {
+  if [ "$1" = 2 ]; then
+    printf '%s\n' /usr/local/bin/yt-dlp
+  else
+    printf '%s\n' /usr/local/bin/yt-dlp-one
+  fi
 }
 
 fstab_append_line() {
@@ -1148,24 +1249,24 @@ port_busy() {
   return 1
 }
 
-pick_port() {
-  want=$1
-  case "$want" in
-    ''|*[!0-9]*) want=3033 ;;
-  esac
-  if ! port_busy "$want"; then
-    printf '%s\n' "$want"
-    return 0
-  fi
-  n=$want
-  while [ "$n" -lt $((want + 20)) ]; do
-    if ! port_busy "$n"; then
-      printf '%s\n' "$n"
-      return 0
+# 我们自己的网页占着这个端口时，更新可以继续用它。别的程序占着就不行。
+port_taken_by_other() {
+  port=$1
+  port_busy "$port" || return 1
+  if have ss; then
+    info=$(ss -ltnp 2>/dev/null | grep -E ":${port}([^0-9]|$)" || true)
+    if [ -n "$info" ]; then
+      if printf '%s\n' "$info" | grep -q 'yt-dlp-webui'; then
+        return 1
+      fi
+      if printf '%s\n' "$info" | grep -q 'users:'; then
+        return 0
+      fi
     fi
-    n=$((n + 1))
-  done
-  return 1
+  fi
+  old=$(config_get port 2>/dev/null || true)
+  [ "$port" = "$old" ] && return 1
+  return 0
 }
 
 health_ok() {
@@ -1368,6 +1469,15 @@ print_status() {
 
 uninstall_all() {
   detect_machine
+  printf '%s\n' "确定要卸掉网页下载器吗？"
+  printf '%s\n' "已经下好的视频会留着，不会删。"
+  printf '%s\n' "  1) 卸掉"
+  printf '%s\n' "  2) 先不卸（推荐）"
+  ask_menu UNINSTALL_OK 2 2
+  if [ "$UNINSTALL_OK" != 1 ]; then
+    say_ok "没有卸掉，网页还在。"
+    return 0
+  fi
   say_step "卸掉网页下载器"
   stop_service
   case "$INIT" in
@@ -1399,35 +1509,258 @@ uninstall_all() {
   say_ok "程序已卸掉。下载过的视频还在 ${DATA}/downloads ，没有删。"
 }
 
+# 键盘不在脚本的输入上时，改回真正的键盘。
+# 不能写进 ask_line：测试用管道喂答案时，这里去读 /dev/tty 会卡住。
+prepare_stdin() {
+  [ "${YTD_TEST:-}" = 1 ] && return 0
+  if [ ! -t 0 ] && [ -r /dev/tty ] && (: < /dev/tty) 2>/dev/null; then
+    exec < /dev/tty
+  fi
+}
+
+ask_stop() {
+  printf '\n' >&2
+  die "没有读到你的选择，已停止，没有继续安装。请重新运行安装命令，在键盘上回答问题。"
+}
+
+# ask_line "说明" "默认值" 变量名。直接回车用默认值。只去掉两头空格。
+ask_line() {
+  _p=$1
+  _d=$2
+  _v=$3
+  printf '%s\n' "$_p"
+  if [ -n "$_d" ]; then
+    printf '不懂就直接按回车，会用：%s\n' "$_d"
+  fi
+  printf '请输入：'
+  if ! read -r _a; then
+    ask_stop
+  fi
+  _a=$(printf '%s' "$_a" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  if [ -z "$_a" ]; then
+    _a=$_d
+  fi
+  _a_esc=$(printf '%s' "$_a" | sed "s/'/'\\\\''/g")
+  eval "$_v='$_a_esc'"
+}
+
+# 先把选项印出来，再调用。直接回车用默认数字。输错会再问。
+ask_menu() {
+  _v=$1
+  _d=$2
+  _max=$3
+  while true; do
+    printf '请输入数字后回车 [直接回车 = %s]：' "$_d"
+    if ! read -r _a; then
+      ask_stop
+    fi
+    got=$(menu_answer "$_a" "$_d" "$_max")
+    if [ "$got" = bad ]; then
+      printf '%s\n' "请输入 1 到 ${_max} 的数字。不懂就直接按回车。"
+      continue
+    fi
+    eval "$_v='$got'"
+    return 0
+  done
+}
+
+ask_settings() {
+  reset_pass=$1
+  PASS_MODE=new
+  say_step "先回答 6 个问题"
+  printf '%s\n' "每一题都可以直接按回车。回车就是适合新手的选项。"
+
+  saved_port=$(config_get port 2>/dev/null || true)
+  [ -n "$saved_port" ] || saved_port=3033
+  printf '\n%s\n' "第 1 题：网页端口"
+  printf '%s\n' "Mac 打开网页时，地址是 http://小鸡IP:端口"
+  printf '%s\n' "端口就是冒号后面那个数字。例如 3033。"
+  while true; do
+    ask_line "想用哪个端口？" "$saved_port" PORT_CHOSEN
+    PORT_CHOSEN=$(normalize_port "$PORT_CHOSEN" 2>/dev/null || printf '%s' "$PORT_CHOSEN")
+    why=$(port_text_problem "$PORT_CHOSEN")
+    case "$why" in
+      ok) ;;
+      ssh)
+        say_warn "22 是你登录这台鸡用的，不能给网页。直接回车就用 ${saved_port}。"
+        continue
+        ;;
+      *)
+        say_warn "请输入 1 到 65535 的数字。不懂就直接回车。"
+        continue
+        ;;
+    esac
+    if port_taken_by_other "$PORT_CHOSEN"; then
+      say_warn "端口 ${PORT_CHOSEN} 已经有别的程序在用。请输入另一个数字，比如 8080。这一题不要直接回车。"
+      saved_port=
+      continue
+    fi
+    break
+  done
+
+  saved_user=$(config_get username 2>/dev/null || true)
+  [ -n "$saved_user" ] || saved_user=admin
+  printf '\n%s\n' "第 2 题：登录名字"
+  printf '%s\n' "打开网页要先登录，这样别人不能拿你的鸡去下载。"
+  printf '%s\n' "名字只用英文字母和数字。"
+  while true; do
+    ask_line "登录名字用什么？" "$saved_user" USER_CHOSEN
+    case "$(user_text_problem "$USER_CHOSEN")" in
+      ok) break ;;
+      len) say_warn "名字太长了，请控制在 32 位以内。" ;;
+      *) say_warn "名字里只能有英文字母和数字，例如 admin 或 xiaoming。" ;;
+    esac
+  done
+
+  printf '\n%s\n' "第 3 题：登录密码"
+  saved_pass=$(read_saved_password 2>/dev/null || true)
+  saved_hash=$(config_get password_hash 2>/dev/null || true)
+  if [ "$reset_pass" != 1 ] && [ -n "$saved_pass" ] && [ -n "$saved_hash" ]; then
+    printf '%s\n' "这台鸡已经有密码了。"
+    printf '%s\n' "  1) 继续用现在的密码（推荐）"
+    printf '%s\n' "  2) 换一把新密码"
+    ask_menu PASS_KEEP 1 2
+    if [ "$PASS_KEEP" = 1 ]; then
+      PASS_MODE=keep
+      PASS_CHOSEN=$saved_pass
+    fi
+  fi
+  if [ "$PASS_MODE" != keep ]; then
+    printf '%s\n' "  1) 帮我随机生成一把（推荐，不容易被别人猜到）"
+    printf '%s\n' "  2) 我自己设一个"
+    ask_menu PASS_HOW 1 2
+    if [ "$PASS_HOW" = 1 ]; then
+      PASS_MODE=random
+      PASS_CHOSEN=
+    else
+      PASS_MODE=custom
+      printf '%s\n' "自己设密码时，屏幕上看得见字，这是正常的。设完请记到备忘录里。"
+      while true; do
+        ask_line "请输入密码。至少 6 位，字母和数字都可以" "" PASS_CHOSEN
+        case "$(pass_text_problem "$PASS_CHOSEN")" in
+          ok) ;;
+          space)
+            say_warn "密码里先不要加空格。"
+            continue
+            ;;
+          *)
+            say_warn "太短了。请至少 6 位，比如 abc123。"
+            continue
+            ;;
+        esac
+        ask_line "再输入一次，确认没有打错" "" PASS_AGAIN
+        if [ "$PASS_CHOSEN" = "$PASS_AGAIN" ]; then
+          break
+        fi
+        say_warn "两次不一样，请重新设。"
+      done
+    fi
+  fi
+
+  printf '\n%s\n' "第 4 题：一次下几个视频"
+  if [ -n "$MEM_MB" ] && [ "$MEM_MB" -lt 768 ]; then
+    printf '%s\n' "这台鸡大约 ${MEM_MB}MB 内存，比较小。"
+    printf '%s\n' "一次只能下一个视频。两个一起下，鸡容易卡死。这一项已经帮你选好了。"
+    QUEUE_CHOSEN=1
+  else
+    printf '%s\n' "  1) 一次下一个（更稳，推荐）"
+    printf '%s\n' "  2) 一次下两个（更快，内存要够）"
+    ask_menu QUEUE_CHOSEN 1 2
+  fi
+
+  printf '\n%s\n' "第 5 题：Mac 怎么打开这个网页"
+  collect_addrs
+  if [ -n "$ADDR_V4" ]; then
+    printf '%s\n' "这台鸡有公网地址 ${ADDR_V4}，Mac 浏览器可以直接打开。"
+    printf '%s\n' "  1) 浏览器直接打开（推荐）。需要的话我会放开这个端口。"
+    printf '%s\n' "  2) 只用 SSH 转发，不把端口暴露到公网。"
+    ask_menu OPEN_CHOSEN 1 2
+  elif [ -n "$ADDR_V4_PRIVATE" ]; then
+    printf '%s\n' "这台鸡的地址是 ${ADDR_V4_PRIVATE}，这是内网地址，Mac 不能直接打开。"
+    printf '%s\n' "  1) 我已经在服务商面板做了端口映射，请放开小鸡上的端口。"
+    printf '%s\n' "  2) 用 SSH 转发（推荐，不用懂端口映射）。"
+    ask_menu OPEN_CHOSEN 2 2
+  else
+    printf '%s\n' "  1) 浏览器直接打开（推荐）"
+    printf '%s\n' "  2) 只用 SSH 转发"
+    ask_menu OPEN_CHOSEN 1 2
+  fi
+
+  printf '\n%s\n' "第 6 题：视频放在哪个文件夹"
+  saved_dir=$(config_get download_path 2>/dev/null || true)
+  [ -n "$saved_dir" ] || saved_dir="${DATA}/downloads"
+  printf '%s\n' "下好的视频会放在这个文件夹。不懂路径就直接回车。"
+  while true; do
+    ask_line "视频文件夹" "$saved_dir" DIR_CHOSEN
+    case "$(dir_text_problem "$DIR_CHOSEN")" in
+      ok) break ;;
+      relative) say_warn "请写从 / 开头的完整路径，例如 /root/youtube。或者直接回车。" ;;
+      space) say_warn "路径里先不要加空格。" ;;
+      system) say_warn "这个位置是系统用的，请换一个，例如 /root/youtube。" ;;
+      *) say_warn "这个路径不能用。直接回车就用推荐的文件夹。" ;;
+    esac
+  done
+}
+
+show_plan() {
+  printf '\n%s\n' "请核对，接下来会按这个装："
+  printf '%s\n' "  端口：${PORT_CHOSEN}"
+  printf '%s\n' "  登录名字：${USER_CHOSEN}"
+  case "$PASS_MODE" in
+    keep) printf '%s\n' "  密码：继续用现在的" ;;
+    custom) printf '%s\n' "  密码：用你刚设的那把" ;;
+    *) printf '%s\n' "  密码：随机生成，装完会显示出来" ;;
+  esac
+  if [ "$QUEUE_CHOSEN" = 2 ]; then
+    printf '%s\n' "  下载：一次可以下两个"
+  else
+    printf '%s\n' "  下载：一次下一个"
+  fi
+  if [ "$OPEN_CHOSEN" = 2 ]; then
+    printf '%s\n' "  Mac 打开方式：SSH 转发"
+  else
+    printf '%s\n' "  Mac 打开方式：浏览器直接打开"
+  fi
+  printf '%s\n' "  视频文件夹：${DIR_CHOSEN}"
+  printf '\n%s\n' "  1) 开始安装（推荐）"
+  printf '%s\n' "  2) 上面有选错的，重新答一遍"
+}
+
 print_how_to_open() {
   port=$1
   user=$2
   pass=$3
+  open_mode=$4
+  dir=$5
   collect_addrs
   printf '\n%s\n' "${C_GREEN}装好了。${C_NC}"
-  printf '%s\n' "用户名：$user"
-  printf '%s\n' "密码：$pass"
-  printf '%s\n' "密码也记在 /etc/yt-dlp-webui/install.txt"
-  if [ -n "$ADDR_V4" ]; then
+  printf '%s\n' "用户名：${user}"
+  printf '%s\n' "密码：${pass}"
+  printf '%s\n' "密码也记在 /etc/yt-dlp-webui/install.txt ，忘记了可以输入：ytdlp-web --status"
+  if [ "$open_mode" = 2 ]; then
+    printf '\n%s\n' "你选了 SSH 转发。在 Mac 终端执行（地址换成你平时登这台鸡用的）："
+    printf '%s\n' "ssh -L ${port}:127.0.0.1:${port} root@你的鸡"
+    printf '%s\n' "然后浏览器打开 http://127.0.0.1:${port}"
+  elif [ -n "$ADDR_V4" ]; then
     printf '\n%s\n' "在 Mac 浏览器打开："
     printf '%s\n' "http://${ADDR_V4}:${port}"
   elif [ -n "$ADDR_V6" ] && [ -z "$ADDR_V4_PRIVATE" ]; then
     printf '\n%s\n' "在 Mac 浏览器打开："
     printf '%s\n' "http://[${ADDR_V6}]:${port}"
   fi
-  if [ -n "$ADDR_V4_PRIVATE" ] && [ -z "$ADDR_V4" ]; then
+  if [ "$open_mode" != 2 ] && [ -n "$ADDR_V4_PRIVATE" ] && [ -z "$ADDR_V4" ]; then
     printf '\n%s\n' "这台小鸡的地址是 ${ADDR_V4_PRIVATE}，外面不能直接打开。"
-    printf '%s\n' "在 Mac 终端执行（地址换成你平时登这台鸡用的）："
+    printf '%s\n' "请在服务商面板把公网端口转到这台鸡的 ${port}，再用公网地址打开。"
+    printf '%s\n' "如果还没做映射，可以在 Mac 终端执行："
     printf '%s\n' "ssh -L ${port}:127.0.0.1:${port} root@你的鸡"
     printf '%s\n' "然后浏览器打开 http://127.0.0.1:${port}"
-    printf '%s\n' "如果服务商面板有端口映射，把公网端口转到这台鸡的 ${port}，也可以直接用公网地址打开。"
   fi
-  printf '\n%s\n' "把 YouTube 链接贴进网页，视频会下到这台鸡的 ${DATA}/downloads 。"
+  printf '\n%s\n' "把 YouTube 链接贴进网页，视频会下到 ${dir} 。"
   printf '%s\n' "下完后在网页里可以把文件再下回 Mac。鸡的硬盘不大，下回 Mac 后把鸡上的文件删掉。"
-  if [ -n "$MEM_MB" ] && [ "$MEM_MB" -lt 768 ]; then
-    printf '%s\n' "这台鸡内存不大，下载会一个接一个来，中间用到硬盘上的虚拟内存，会比大机器慢。"
+  if [ "$QUEUE_CHOSEN" = 1 ]; then
+    printf '%s\n' "按你的选择，视频会一个接一个下载。"
   fi
-  printf '%s\n' "以后要更新，再运行一次安装命令，或者输入 ytdlp-web 。密码不会变。"
+  printf '%s\n' "以后要改端口、密码或文件夹，再运行一次安装命令，或者输入 ytdlp-web 。每题直接回车就沿用现在的。"
   printf '%s\n' "查看：ytdlp-web --status    换密码：ytdlp-web --reset-password    卸载：ytdlp-web --uninstall"
 }
 
@@ -1440,6 +1773,14 @@ do_install() {
   say_info "内存：${MEM_MB:-未知}MB    已有虚拟内存：${SWAP_MB}MB    磁盘剩余：${DISK_MB}MB    CPU：${NCPU}"
   webui_asset "$ARCH" >/dev/null || die "这个网页程序没有 $ARCH 的版本，32 位系统装不了。"
   ytdlp_asset "$ARCH" "$LIBC" >/dev/null || die "没有适合 $ARCH / $LIBC 的 yt-dlp。"
+
+  while true; do
+    ask_settings "$reset_pass"
+    show_plan
+    ask_menu PLAN_OK 1 2
+    [ "$PLAN_OK" = 1 ] && break
+    printf '%s\n' "好，我们再答一遍。"
+  done
 
   say_step "准备内存和软件源"
   prepare_workdir
@@ -1455,30 +1796,29 @@ do_install() {
   stop_service
   install_webui
 
-  mkdir -p "$DATA/downloads" "$DATA/tmp" "$DATA/cache" "$DATA/home" /etc/yt-dlp-webui /usr/local/sbin
-  DL=$(downloader_for "${MEM_MB:-1024}")
+  mkdir -p "$DATA/downloads" "$DATA/tmp" "$DATA/cache" "$DATA/home" "$DIR_CHOSEN" /etc/yt-dlp-webui /usr/local/sbin
+  DL=$(downloader_for_choice "$QUEUE_CHOSEN")
   if [ "$DL" = /usr/local/bin/yt-dlp-one ]; then
     write_one_wrapper
-    say_ok "内存不到 768MB，下载会一个接一个跑"
+    say_ok "按你的选择，视频会一个接一个下载"
   else
     rm -f /usr/local/bin/yt-dlp-one
+    say_ok "按你的选择，可以同时下两个"
   fi
 
-  user=admin
-  pass=
-  hash=
-  if [ "$reset_pass" != 1 ]; then
-    pass=$(read_saved_password 2>/dev/null || true)
+  user=$USER_CHOSEN
+  if [ "$PASS_MODE" = keep ]; then
+    pass=$PASS_CHOSEN
     hash=$(config_get password_hash 2>/dev/null || true)
-    saved_user=$(config_get username 2>/dev/null || true)
-    [ -n "$saved_user" ] && user=$saved_user
-  fi
-  if [ -z "$pass" ] || [ -z "$hash" ]; then
+    [ -n "$hash" ] || die "原来的密码记录坏了。请重新运行，并选择换一把新密码。"
+    say_ok "沿用原来的登录密码"
+  elif [ "$PASS_MODE" = custom ]; then
+    pass=$PASS_CHOSEN
+    hash=$(hash_password "$user" "$pass")
+  else
     say_step "生成登录密码"
     pass=$(rand_hex 8) || die "随机密码没生成。"
     hash=$(hash_password "$user" "$pass")
-  else
-    say_ok "沿用原来的登录密码"
   fi
 
   secret=$(env_get JWT_SECRET 2>/dev/null || true)
@@ -1489,18 +1829,18 @@ do_install() {
   write_env_file "$secret" "$gomem"
   write_runner
 
-  old_port=$(config_get port 2>/dev/null || true)
-  port=$(pick_port "${old_port:-3033}") || die "3033 附近的端口都被占了。"
-  if [ -n "$old_port" ] && [ "$port" != "$old_port" ]; then
-    say_warn "端口 $old_port 被占用，改用 $port"
-  fi
-  q=$(queue_for "${MEM_MB:-1024}")
-  write_config /etc/yt-dlp-webui/config.yml "$port" "$user" "$hash" "$DL" "$JS_RUNTIME" "$q" "$DATA"
+  port=$PORT_CHOSEN
+  q=$QUEUE_CHOSEN
+  write_config /etc/yt-dlp-webui/config.yml "$port" "$user" "$hash" "$DL" "$JS_RUNTIME" "$q" "$DATA" "$DIR_CHOSEN"
   chmod 600 /etc/yt-dlp-webui/config.yml
   write_install_note "$user" "$pass" "$port"
   write_service
   install_cli
-  open_firewall "$port"
+  if [ "$OPEN_CHOSEN" = 1 ]; then
+    open_firewall "$port"
+  else
+    say_info "按你的选择，没有把端口放开到公网。"
+  fi
 
   say_step "启动"
   start_service || true
@@ -1513,14 +1853,14 @@ do_install() {
     show_fail_log
     die "网页没能在端口 $port 上打开。"
   fi
-  say_ok "网页已在端口 $port 运行"
+  say_ok "网页已在端口 ${port} 运行"
   rm -rf "$WORK"
-  print_how_to_open "$port" "$user" "$pass"
+  print_how_to_open "$port" "$user" "$pass" "$OPEN_CHOSEN" "$DIR_CHOSEN"
 }
 
 usage() {
   printf '%s\n' "用法："
-  printf '%s\n' "  ytdlp-web                 安装或更新"
+  printf '%s\n' "  ytdlp-web                 安装或更新（会用大白话问几个问题，直接回车就是推荐项）"
   printf '%s\n' "  ytdlp-web --status        查看"
   printf '%s\n' "  ytdlp-web --reset-password  换一把登录密码"
   printf '%s\n' "  ytdlp-web --uninstall     卸掉程序，留下已经下好的视频"
@@ -1548,6 +1888,7 @@ main() {
   if [ "$(id -u)" -ne 0 ]; then
     die "请用 root 运行。可以先输入：sudo -i"
   fi
+  prepare_stdin
   maybe_self_update "$@"
   case "$action" in
     uninstall) uninstall_all ;;
