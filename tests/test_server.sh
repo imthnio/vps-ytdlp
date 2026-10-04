@@ -1,6 +1,7 @@
 #!/bin/sh
 # 把 install.sh 里内嵌的网页服务拿出来，配一个假的 yt-dlp 真跑一遍：
-# 登录、贴链接、下载到“Mac”、断点续传、传完自动删、被拦换办法、cookies、中文报错。
+# 登录、贴链接、下载到“Mac”、断点续传、传完自动删、被拦换办法、cookies、中文报错，
+# 还有多平台：分享文字、抖音/小红书/推特走插件、图文打包 zip、纯文字帖、VP9 转码、存好后自动收起。
 # 需要 perl 和 curl。不碰系统，所有东西都在一个临时目录里。
 # 用法：sh tests/test_server.sh
 cd "$(dirname "$0")/.." || exit 1
@@ -18,7 +19,10 @@ has() { if printf '%s' "$2" | grep -q -- "$3"; then ok "$1"; else bad "$1: [$2] 
 
 sed -n "/<<'YTDLP_WEB_SERVER_EOF'$/,/^YTDLP_WEB_SERVER_EOF$/p" install.sh | sed '1d;$d' > "$T/server.pl"
 hash=$(perl -e 'print crypt("testpass1", "\$6\$testsalt\$")')
-mkdir -p "$T/mac"
+mkdir -p "$T/mac" "$T/plugins" "$T/bin"
+cp tests/fake-ffmpeg.sh "$T/bin/ffmpeg"
+cp tests/fake-ffmpeg.sh "$T/bin/ffprobe"
+chmod +x "$T/bin/ffmpeg" "$T/bin/ffprobe"
 cat > "$T/web.conf" <<EOF
 port=$PORT
 listen=127.0.0.1
@@ -27,6 +31,8 @@ pass_hash=$hash
 data=$T/data
 ytdlp=$PWD/tests/fake-ytdlp.sh
 cookies=$T/cookies.txt
+plugins=$T/plugins
+ffmpeg=$T/bin/ffmpeg
 log=$T/server.log
 grace=2
 sweep_secs=2
@@ -91,13 +97,24 @@ has cn-name "$(cat "$T/headers")" "filename\*=UTF-8''%E6%B5%8B%E8%AF%95%E8%A7%86
 check size "$(wc -c < "$T/mac/$f" | tr -d ' ')" 3145728
 check range-416 "$($C -b "$J" -o /dev/null -w '%{http_code}' -r 99999999- "$B/dl/$id")" 416
 
-# 送达以后自动删
+# 送达以后：网页说收起来，列表里就没有它了
+has delivered "$($C -b "$J" "$B/api/jobs")" '已存到 Mac'
+has dismiss "$($C -b "$J" -H 'X-YTW: 1' -d "id=$id" "$B/api/dismiss")" '"ok":true'
+if $C -b "$J" "$B/api/jobs" | grep -q "\"id\":\"$id\""; then bad hidden-after-dismiss; else ok hidden-after-dismiss; fi
+# 送达以后自动删（文件和任务记录一起删）
 n=0
 while [ -d "$T/data/jobs/$id" ] && ls "$T/data/jobs/$id"/*.mp4 >/dev/null 2>&1 && [ "$n" -lt 40 ]; do
   sleep 0.5
   n=$((n + 1))
 done
 if ls "$T/data/jobs/$id"/*.mp4 >/dev/null 2>&1; then bad auto-delete; else ok auto-delete; fi
+n=0
+while [ -d "$T/data/jobs/$id" ] && [ "$n" -lt 20 ]; do sleep 0.5; n=$((n + 1)); done
+if [ -d "$T/data/jobs/$id" ]; then bad auto-delete-record; else ok auto-delete-record; fi
+# 还没拿的任务不能被收起来
+id3=$(add 'https://www.youtube.com/watch?v=notyetgot01' | job_id)
+wait_job "$id3" > /dev/null
+has no-dismiss-undelivered "$($C -b "$J" -H 'X-YTW: 1' -d "id=$id3" "$B/api/dismiss")" '还没传完'
 has delete-log "$(cat "$T/server.log")" '已送达'
 
 # 断点续传：分两段下，拼起来和一次下完一样
@@ -137,6 +154,70 @@ id2=$(add 'https://www.youtube.com/watch?v=delete00001' | job_id)
 wait_job "$id2" > /dev/null
 $C -b "$J" -H 'X-YTW: 1' -d "id=$id2" "$B/api/delete" > /dev/null
 if [ -d "$T/data/jobs/$id2" ]; then bad delete-job; else ok delete-job; fi
+
+# ---------- 多平台 ----------
+# 抖音分享文字：自动挑出网址，交给插件；不登录拿不到时，中文提示上传抖音 cookies
+id=$(add '6.99 复制打开抖音，看看【测试的作品】这是标题 # 话题 https://v.douyin.com/needck01/ 8@5.com :2pm' | job_id)
+[ -n "$id" ] && ok douyin-share-text || bad douyin-share-text
+has douyin-meta "$(cat "$T/data/jobs/$id/meta")" 'plat=douyin'
+has douyin-url "$(cat "$T/data/jobs/$id/meta")" 'url=https://v.douyin.com/needck01/'
+js=$(wait_job "$id")
+has douyin-error "$js" '抖音'
+has douyin-hint "$js" '"hint":"cookies"'
+has douyin-plugin "$(cat "$T/calls.log")" 'ytweb:douyin:https://v.douyin.com/needck01/'
+has douyin-ipnote "$(cat "$T/data/jobs/$id/log" 2>/dev/null)" '网络：IPv'
+# 上传抖音 cookies：YouTube 的 cookies 还在
+printf '.douyin.com\tTRUE\t/\tFALSE\t2000000000\tttwid\txyz\n' > "$T/ck2"
+has ck-douyin "$($C -b "$J" -H 'X-YTW: 1' --data-urlencode "text@$T/ck2" "$B/api/cookies")" '抖音'
+has ck-keep-yt "$(cat "$T/cookies.txt")" 'SID'
+js=$($C -b "$J" "$B/api/jobs")
+has ck-sites-yt "$js" '"key":"youtube","name":"YouTube"'
+has ck-sites-dy "$js" '"key":"douyin","name":"抖音"'
+id=$(add 'https://v.douyin.com/needck02/' | job_id)
+has douyin-cookies-done "$(wait_job "$id")" '"state":"done"'
+has sticky-douyin "$(cat "$T/data/state/sticky-douyin" 2>/dev/null)" 'cookies'
+$C -b "$J" -H 'X-YTW: 1' -d 'plat=douyin' "$B/api/cookies/delete" > /dev/null
+if grep -q ttwid "$T/cookies.txt"; then bad ck-del-plat; else ok ck-del-plat; fi
+has ck-del-keep "$(cat "$T/cookies.txt")" 'SID'
+
+# 小红书图文：三张图打成一个 zip
+id=$(add '一口气带你认识各种各样的楼 http://xhslink.cn/o/imgimg01 复制后打开【小红书】查看笔记！' | job_id)
+js=$(wait_job "$id")
+has xhs-done "$js" '"state":"done"'
+has xhs-zip "$js" '.zip"'
+has xhs-note "$js" '3 张图片'
+$C -b "$J" -o "$T/x.zip" "$B/dl/$id"
+if command -v python3 >/dev/null 2>&1; then
+  check zip-ok "$(python3 -c 'import sys,zipfile;z=zipfile.ZipFile(sys.argv[1]);print(z.testzip() is None,len(z.namelist()))' "$T/x.zip")" 'True 3'
+elif command -v unzip >/dev/null 2>&1; then
+  if unzip -tq "$T/x.zip" >/dev/null 2>&1; then ok zip-ok; else bad zip-ok; fi
+fi
+# 推特：没有视频就去拿图片；纯文字推文给白话提示
+id=$(add 'https://x.com/someone/status/1234567890123/photo/1?s=46' | job_id)
+has x-url "$(cat "$T/data/jobs/$id/meta")" 'url=https://x.com/someone/status/1234567890123$'
+js=$(wait_job "$id")
+has x-images "$js" '"state":"done"'
+has x-plugin "$(cat "$T/calls.log")" 'ytweb:ximg:https://x.com/someone/status/1234567890123'
+has x-text "$(wait_job "$(add 'https://twitter.com/someone/status/999text999' | job_id)")" '没有视频也没有图片'
+# B站：追踪参数剥掉，只留 BV 号，交给插件
+id=$(add 'https://www.bilibili.com/video/BV1tHaA6qEXL/?trackid=web_pegasus_0.router&spm_id_from=333.1007&vd_source=bb26' | job_id)
+has bili-clean "$(cat "$T/data/jobs/$id/meta")" 'url=https://www.bilibili.com/video/BV1tHaA6qEXL/$'
+has bili-done "$(wait_job "$id")" '"state":"done"'
+has bili-plugin "$(cat "$T/calls.log")" 'ytweb:bili:https://www.bilibili.com/video/BV1tHaA6qEXL/'
+# 只有 VP9：转码成 H.264，先告诉你大概要多久
+id=$(add 'https://www.tiktok.com/@a/video/vp9vp9vp9?is_from_webapp=1' | job_id)
+js=$(wait_job "$id")
+has vp9-done "$js" '"state":"done"'
+has vp9-mp4 "$js" '"file":"[^"]*\.mp4"'
+has vp9-note "$js" 'VP9'
+has vp9-x264 "$(cat "$T/calls.log")" 'libx264'
+has vp9-estimate "$(cat "$T/data/jobs/$id/log")" '转换格式'
+has h264-format "$(grep 'tiktok.com/@a/video/vp9vp9vp9' "$T/calls.log" | head -n 1)" 'vcodec^=avc'
+# YouTube 的画质参数没变
+has yt-format "$(grep 'okokokokoko' "$T/calls.log" | head -n 1)" '-S vcodec:h264,res,acodec:aac'
+if grep 'okokokokoko' "$T/calls.log" | head -n 1 | grep -q 'vcodec^=avc'; then bad yt-format-same; else ok yt-format-same; fi
+# 页面是通用说法
+has page-generic "$($C -b "$J" "$B/")" '整段分享文字'
 
 if [ "$fail" -ne 0 ]; then
   printf '\n有测试没通过。日志：\n' >&2
