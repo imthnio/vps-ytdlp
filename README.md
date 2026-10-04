@@ -19,7 +19,7 @@
 | TikTok | 一般不用 | 短链接 `tiktok.com/t/...` 也行，一般有现成的 H.264 |
 | 推特/X | 一般不用 | 视频帖：画面和声音分开的流会合成 mp4（不转码）。**图片帖**：存原图，多张打成 zip。纯文字帖：提示「这条没有视频也没有图片」。敏感内容要登录 |
 | Instagram | 有时要 | 只下视频（Reels/视频帖），自动挑 Mac 能放的 H.264 那一份；一条里有好几段视频时打成 zip。纯图片帖暂不支持。频繁下载会被要求登录 |
-| 抖音 | 可能要 | yt-dlp 自带的抖音下载现在要「新鲜 cookies」。网页先用抖音分享页（不登录）拿无水印视频，拿不到就请你上传抖音 cookies |
+| 抖音 | 可能要 | yt-dlp 自带的抖音下载现在要「新鲜 cookies」。网页先用抖音分享页（不登录）拿无水印、原分辨率的视频，文件名用作品描述（没写描述就用「作者 的抖音 作品编号」），拿不到就请你上传抖音 cookies |
 | 小红书 | 可能要 | yt-dlp 自带的不能用。网页用手机版分享页拿视频（优先 H.264）或图文笔记里的全部图片；被要求登录时请上传小红书 cookies |
 | B站 | 可能要 | 电脑版页面会对海外 IP 报 412。网页改用手机版页面，不登录能下 720p 的 MP4；要更高画质或大会员视频请上传 B 站 cookies |
 
@@ -33,7 +33,7 @@
 sh -c 'c(){ command -v "$1" >/dev/null 2>&1; }; c curl || c wget || { for pm in "apk add --no-cache" "apt-get install -y" "dnf install -y" "yum install -y" "pacman -Sy --noconfirm" "zypper --non-interactive install" "opkg install"; do b=${pm%% *}; c $b || continue; [ "$b" = apt-get ] && { apt-get update -qq 2>/dev/null || sudo apt-get update -qq 2>/dev/null; }; $pm curl wget ca-certificates 2>/dev/null || sudo $pm curl wget ca-certificates 2>/dev/null; break; done; c curl || c wget || { echo "装不上 curl / wget，请手动装一个"; exit 1; }; }; ok=""; for u in https://raw.githubusercontent.com/imthnio/vps-ytdlp/main/install.sh https://cdn.jsdelivr.net/gh/imthnio/vps-ytdlp@main/install.sh; do (wget -qO /tmp/ytdlp-install.sh "$u" || curl -fsSL -o /tmp/ytdlp-install.sh "$u") 2>/dev/null && [ -s /tmp/ytdlp-install.sh ] && head -n 1 /tmp/ytdlp-install.sh | grep -q "^#!/bin/sh" && grep -q ytdlp-onekey-begin /tmp/ytdlp-install.sh && { ok=1; break; }; rm -f /tmp/ytdlp-install.sh; done; [ -n "$ok" ] || { echo "下载 install.sh 失败，请检查网络"; exit 1; }; sh /tmp/ytdlp-install.sh'
 ```
 
-这一行会先确认有 curl 或 wget（没有就自动装），再从 GitHub 或 jsDelivr 下载脚本运行。VPS 要能打开 YouTube 和 GitHub。大陆机器通常打不开 YouTube。
+这一行会先确认有 curl 或 wget（没有就自动装），再从 GitHub 或 jsDelivr 下载脚本运行。VPS 要能打开 GitHub 和你要下的网站。大陆机器通常打不开 YouTube、推特、Instagram、TikTok。
 
 ### 全自动安装（一个问题都不问）
 
@@ -55,7 +55,7 @@ PORT=15346 sh -c 'c(){ command -v "$1" >/dev/null 2>&1; }; c curl || c wget || {
 | 2. 登录名字 | 直接回车，就是 `admin` |
 | 3. 登录密码 | 直接回车，随机生成一把（装完会显示）。也可以选 2 自己设 |
 | 4. Mac 怎么打开 | 直接回车，浏览器直接打开。选 2 是只用 SSH 转发，更安全但每次要先敲一行命令 |
-| 5. 被拦时用 Cloudflare WARP | 直接回车，要。平时不开，被 YouTube 拦住时才临时打开 |
+| 5. 被拦时用 Cloudflare WARP | 直接回车，要。平时不开，被网站拦住时才临时打开 |
 
 最后会把你的选择列出来，回车开始装。装完会显示网址、名字和密码。
 
@@ -134,7 +134,7 @@ ytdlp-web --uninstall       # 先问一句再卸。直接回车不卸
 - **报「内存不够」？** 运行 `ytdlp-web` 回车更新一次，脚本会重新配虚拟内存。或者换低一点的画质
 - **年龄限制或会员视频？** 必须登录才能看，需要上传 cookies
 - **图片帖存成了 zip？** 好几张图会打成一个 zip，在 Mac 上双击就解开。只有一张就直接是图片
-- **从 2.0.x 升级到 2.1.0？** 在 VPS 上输入 `ytdlp-web`，直接回车就行。端口、密码、已上传的 YouTube cookies 都保留
+- **从 2.0.x / 2.1.x 升级到最新版（2.1.1）？** 在 VPS 上输入 `ytdlp-web`，直接回车就行。端口、密码、已上传的 cookies 都保留
 
 ## 文件放在哪
 

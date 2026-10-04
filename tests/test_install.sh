@@ -106,6 +106,14 @@ check newer "$(yes_no x version_newer 2.0.1 2.0.0)" yes
 check newer-equal "$(yes_no x version_newer 2.0.0 2.0.0)" no
 check newer-major "$(yes_no x version_newer 2.0.0 1.9.9)" yes
 check ver-file "$(version_from_file ./install.sh)" "$VERSION"
+check ver-211 "$VERSION" 2.1.1
+check newer-211 "$(yes_no x version_newer 2.1.1 2.1.0)" yes
+# 网页服务里的版本号要和脚本一致（网页 /health 会显示它）
+check ver-server "$(sed -n "s/^my \$VERSION = '\(.*\)';/\1/p" install.sh)" "$VERSION"
+# 装完/更新完印出来的「怎么用」是通用说法，不再只说 YouTube
+usage=$( collect_addrs() { :; }; print_how_to_use 15346 admin pw 2 '装好了' 2>&1 )
+case "$usage" in *'把视频链接粘贴到框里'*'抖音、小红书、B站、TikTok、推特、IG'*'整段分享文字'*) check usage-generic yes yes ;; *) check usage-generic "$usage" generic ;; esac
+case "$usage" in *'把 YouTube 视频链接'*) check usage-no-yt-only bad ok ;; *) check usage-no-yt-only ok ok ;; esac
 check script-marker "$(yes_no x remote_script_ok ./install.sh)" yes
 tmpd=$(mktemp -d)
 printf '<html>404</html>\n' > "$tmpd/bad.sh"
@@ -143,6 +151,7 @@ check cfg-hash "$(config_get pass_hash "$cfg")" '$6$salt$abc/DEF.ghi'
 check cfg-js "$(config_get js "$cfg")" 'quickjs:/usr/local/bin/qjs'
 check cfg-pot "$(config_get pot "$cfg")" /usr/local/bin/bgutil-pot
 check cfg-potdir "$(config_get pot_plugins "$cfg")" /usr/local/lib/ytdlp-web/pot-plugins
+check cfg-plugins "$(config_get plugins "$cfg")" /usr/local/lib/ytdlp-web/plugins
 check cfg-wireproxy "$(config_get wireproxy "$cfg")" /usr/local/bin/wireproxy
 check cfg-warp-port "$(config_get warp_port "$cfg")" 40001
 check cfg-warp "$(config_get warp "$cfg")" 1
