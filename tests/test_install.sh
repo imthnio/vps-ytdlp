@@ -112,7 +112,7 @@ if version_newer 1.0.0 1.0.0; then
 else
   printf 'ok version-equal\n'
 fi
-check ver-file "$(version_from_file ./install.sh)" 1.0.1
+check ver-file "$(version_from_file ./install.sh)" 1.0.2
 if remote_script_ok ./install.sh; then
   printf 'ok script-marker\n'
 else
@@ -198,6 +198,20 @@ ask_line "端口题" "3033" ASK_ENTER <<EOF
 
 EOF
 check ask-enter "$ASK_ENTER" 3033
+check port-saved "$(port_prompt_default 8080)" 8080
+check port-norm-saved "$(port_prompt_default 08080)" 8080
+if port_prompt_default "" >/dev/null 2>&1; then
+  printf 'FAIL port-no-default should fail\n' >&2
+  fail=1
+else
+  printf 'ok port-no-default\n'
+fi
+if port_prompt_default 22 >/dev/null 2>&1; then
+  printf 'FAIL port-no-ssh should fail\n' >&2
+  fail=1
+else
+  printf 'ok port-no-ssh\n'
+fi
 ask_menu ASK_MENU 1 2 <<EOF
 9
 2
