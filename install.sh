@@ -1,9 +1,10 @@
 #!/bin/sh
 #======================================================================
-# yt-dlp 一键脚本：在 Mac 浏览器里贴 YouTube 链接，视频自动存进 Mac
+# yt-dlp 一键脚本：在 Mac 浏览器里贴视频链接，视频（或图片）自动存进 Mac
+# 支持 YouTube、抖音、小红书、B站、TikTok、推特/X、Instagram，可以直接粘 App 里复制的整段分享文字
 #----------------------------------------------------------------------
 # 在 Linux VPS（小鸡）上装好一个小网页。Mac 浏览器打开它，贴链接、点开始，
-# VPS 帮你从 YouTube 下好，马上让浏览器存进 Mac 的「下载」文件夹，
+# VPS 帮你从这些网站下好，马上让浏览器存进 Mac 的「下载」文件夹，
 # 传完以后自动把 VPS 上的文件删掉。VPS 上不留视频。
 #
 # 64MB 内存也能装：不用 Docker，网页是一个只用系统自带 Perl 的小程序，
@@ -19,11 +20,11 @@
 #   VPS / 小鸡     你租的那台 Linux 服务器
 #   网页服务       一直在 VPS 上跑的小网页程序（server.pl），Mac 浏览器打开的就是它
 #   端口           网页地址里冒号后面的数字，例如 http://1.2.3.4:15346 里的 15346
-#   yt-dlp         真正去 YouTube 下视频的程序。YouTube 经常改，它每天自动更新
+#   yt-dlp         真正去各个网站下视频的程序。网站经常改，它每天自动更新
 #   ffmpeg         把画面和声音合成一个文件的程序
 #   QuickJS        很小的 JavaScript 程序。YouTube 现在要算一道 JavaScript 题才给视频
 #   PO 令牌        YouTube 用来确认“你是真浏览器”的一串码。bgutil-pot 程序会自动算
-#   WARP           Cloudflare 的免费线路。被 YouTube 拦时，换一个不被拦的出口 IP
+#   WARP           Cloudflare 的免费线路。被网站拦时，换一个不被拦的出口 IP
 #   wireproxy      不用改系统网络就能连 WARP 的小程序（容器里也能用）
 #   cookies        浏览器里的登录记录。实在被拦时上传一份，yt-dlp 就像登录了你的小号
 #   虚拟内存 swap  拿一块硬盘当内存用。慢，但小内存机器不会因为内存不够被杀掉
@@ -32,7 +33,7 @@
 #   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=2.1.0
+VERSION=2.1.1
 # ytdlp-onekey-begin
 
 #----------------------------------------------------------------------
@@ -1378,7 +1379,7 @@ ensure_ffmpeg() {
     say_ok "已装上静态 ffmpeg"
     return 0
   fi
-  say_warn "ffmpeg 没装上。YouTube 的高画质要合并，会下载失败。"
+  say_warn "ffmpeg 没装上。画面和声音分开的视频（YouTube 高画质、推特等）合并不了，会下载失败。"
   return 0
 }
 
@@ -1512,7 +1513,7 @@ install_qjs() {
 }
 
 #----------------------------------------------------------------------
-# yt-dlp：去 YouTube 下视频的主角。装官方版本，网页服务每天自己更新它。
+# yt-dlp：去各个网站下视频的主角。装官方版本，网页服务每天自己更新它。
 #----------------------------------------------------------------------
 ytdlp_runs() {
   [ -x /usr/local/bin/yt-dlp ] || return 1
@@ -1730,7 +1731,7 @@ install_warp() {
     rm -f /usr/local/bin/wireproxy
     return 0
   fi
-  say_step "准备 Cloudflare WARP 线路（被 YouTube 拦时换出口 IP 用）"
+  say_step "准备 Cloudflare WARP 线路（被网站拦时换出口 IP 用）"
   asset=$(wireproxy_asset "$ARCH" 2>/dev/null || true)
   [ -n "$asset" ] || { say_warn "这个架构没有 wireproxy，跳过 WARP"; return 0; }
   tag=$(latest_tag whyvl/wireproxy)
@@ -2050,19 +2051,40 @@ class YtdlpWebIE(InfoExtractor):
             time.sleep(1)
         if not item:
             _fail('YTWEB_NEED_COOKIES', 'douyin share page has no data')
-        title = (item.get('desc') or '抖音').strip()[:80] or '抖音'
+        # 文件名：优先用作品的文字描述；没写描述的，用「作者 的抖音 作品编号」。
+        title = re.sub(r'\s+', ' ', item.get('desc') or '').strip()[:80].strip()
+        if not title:
+            nick = re.sub(r'\s+', ' ', (item.get('author') or {}).get('nickname') or '').strip()[:40]
+            title = f'{nick} 的抖音 {aid}' if nick else f'抖音 {aid}'
         hdr = {'User-Agent': MOBILE_UA, 'Referer': 'https://www.douyin.com/'}
         imgs = item.get('images') or []
         if imgs:
             return self._images(aid, title, [(i.get('url_list') or [''])[-1] for i in imgs], hdr)
         v = item.get('video') or {}
+        fmts = []
+        # 分享页有时会带 bit_rate 列表（不同清晰度、H.264/H.265 各一份）。有就全列出来，让 yt-dlp 按 H.264 优先挑。
+        for b in v.get('bit_rate') or []:
+            pa = b.get('play_addr') or {}
+            bu = (pa.get('url_list') or [None])[0]
+            if not bu:
+                continue
+            h265 = bool(b.get('is_h265') or b.get('is_bytevc1'))
+            fmts.append({'url': bu.replace('playwm', 'play'), 'ext': 'mp4', 'format_id': f'br-{b.get("gear_name") or len(fmts)}',
+                         'vcodec': 'hvc1' if h265 else 'avc1', 'acodec': 'mp4a', 'tbr': (b.get('bit_rate') or 0) / 1000 or None,
+                         'width': pa.get('width'), 'height': pa.get('height'), 'filesize': pa.get('data_size'), 'http_headers': hdr})
         urls = (v.get('play_addr') or {}).get('url_list') or []
-        if not urls:
+        if urls:
+            # 去水印：playwm → play。清晰度参数实测（2026-10）：
+            #   ratio=default  原视频的分辨率和码率（样例 496x864、2.4Mbps）←— 优先用它
+            #   ratio=720p/1080p/2160p  其实是压缩过的一档（样例 480x836、0.8Mbps），留着备用
+            base = urls[0].replace('playwm', 'play')
+            for ratio, q in (('default', 2), ('1080p', 1)):
+                u = re.sub(r'ratio=\w+', f'ratio={ratio}', base) if 'ratio=' in base else f'{base}&ratio={ratio}'
+                fmts.append({'url': u, 'ext': 'mp4', 'format_id': f'nowm-{ratio}', 'vcodec': 'avc1', 'acodec': 'mp4a',
+                             'quality': q, 'height': v.get('height'), 'width': v.get('width'), 'http_headers': hdr})
+        if not fmts:
             _fail('YTWEB_NO_MEDIA')
-        u = re.sub(r'ratio=\w+', 'ratio=1080p', urls[0].replace('playwm', 'play'))  # 去水印，并要最高的 1080p（没有就自动给低一档）
-        return {'id': aid, 'title': title, 'duration': (v.get('duration') or 0) / 1000 or None,
-                'formats': [{'url': u, 'ext': 'mp4', 'format_id': 'nowm', 'vcodec': 'avc1', 'acodec': 'mp4a',
-                             'height': v.get('height'), 'width': v.get('width'), 'http_headers': hdr}]}
+        return {'id': aid, 'title': title, 'duration': (v.get('duration') or 0) / 1000 or None, 'formats': fmts}
 
     # ---------------- 推特/X 图片 ----------------
     def _ximg(self, link):
@@ -2145,7 +2167,7 @@ use POSIX qw(:sys_wait_h setsid strftime setlocale LC_ALL);
 use Fcntl qw(:flock O_WRONLY O_CREAT O_APPEND);
 use File::Path qw(make_path remove_tree);
 
-my $VERSION = '2.1.0';
+my $VERSION = '2.1.1';
 setlocale(LC_ALL, 'C');
 $SIG{PIPE} = 'IGNORE';
 
@@ -4232,7 +4254,7 @@ write_service() {
     systemd)
       cat > /etc/systemd/system/ytdlp-web.service <<EOF
 [Unit]
-Description=ytdlp-web (YouTube to Mac)
+Description=ytdlp-web (save videos to Mac)
 After=network-online.target
 Wants=network-online.target
 
@@ -4254,7 +4276,7 @@ EOF
       cat > /etc/init.d/ytdlp-web <<EOF
 #!/sbin/openrc-run
 name="ytdlp-web"
-description="ytdlp-web (YouTube to Mac)"
+description="ytdlp-web (save videos to Mac)"
 command="$RUNNER"
 command_background=true
 pidfile="/run/ytdlp-web.pid"
@@ -4289,7 +4311,7 @@ EOF
 # Required-Start:    \$network
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
-# Short-Description: ytdlp-web (YouTube to Mac)
+# Short-Description: ytdlp-web (save videos to Mac)
 ### END INIT INFO
 PIDFILE=/run/ytdlp-web.pid
 case "\$1" in
@@ -4970,8 +4992,8 @@ ask_settings() {
   printf '%s\n' "  2) 只用 SSH 转发（更安全，但每次都要先在 Mac 终端敲一行命令）"
   ask_menu OPEN_CHOSEN 1 2
 
-  printf '\n%s\n' "第 5 题：被 YouTube 拦住时，要不要自动换 Cloudflare WARP 线路？"
-  printf '%s\n' "VPS 是机房 IP，YouTube 有时会说「请登录，确认你不是机器人」。"
+  printf '\n%s\n' "第 5 题：被网站拦住时，要不要自动换 Cloudflare WARP 线路？"
+  printf '%s\n' "VPS 是机房 IP，YouTube 等网站有时会说「请登录，确认你不是机器人」。"
   printf '%s\n' "网页会自动试好几种不用账号的办法，WARP 是其中一招：换成 Cloudflare 的出口 IP。"
   printf '%s\n' "选「要」会在 Cloudflare 免费匿名注册一个 WARP（不用邮箱、不花钱）。平时不开，被拦时才临时打开。"
   saved_warp=$(config_get warp 2>/dev/null || true)
@@ -5096,11 +5118,12 @@ print_how_to_use() {
     fi
   fi
   printf '\n%s\n' "怎么用："
-  printf '%s\n' "  1. 登录后，把 YouTube 视频链接粘贴到框里，点「开始」。"
-  printf '%s\n' "  2. 等进度走完，视频会自动存进 Mac 的「下载」文件夹。"
+  printf '%s\n' "  1. 登录后，把视频链接粘贴到框里，点「开始」。"
+  printf '%s\n' "     支持 YouTube、抖音、小红书、B站、TikTok、推特、IG，可以直接粘 App 里复制的整段分享文字。"
+  printf '%s\n' "  2. 等进度走完，视频（或图片）会自动存进 Mac 的「下载」文件夹。"
   printf '%s\n' "     Safari 第一次会问「是否允许下载」，点「允许」。"
   printf '%s\n' "  3. 传完以后 VPS 上的文件会自动删掉，不用管。"
-  printf '%s\n' "  被 YouTube 拦住时，网页会自动换办法；实在不行会用中文告诉你怎么上传 cookies。"
+  printf '%s\n' "  被网站拦住时，网页会自动换办法（IPv6/IPv4、WARP 等）；实在不行会用中文告诉你上传哪个平台的 cookies。"
   printf '\n%s\n' "以后再运行一次安装命令，或者输入 ytdlp-web ，直接回车就是更新到最新版本。"
   printf '%s\n' "查看：ytdlp-web --status    运行记录：ytdlp-web --log    换密码：ytdlp-web --reset-password    卸载：ytdlp-web --uninstall"
   # 最后醒目地印出：网址、登录名、密码。
