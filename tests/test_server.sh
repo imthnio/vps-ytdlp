@@ -219,6 +219,62 @@ if grep 'okokokokoko' "$T/calls.log" | head -n 1 | grep -q 'vcodec^=avc'; then b
 # 页面是通用说法
 has page-generic "$($C -b "$J" "$B/")" '整段分享文字'
 
+# 升级时：安装脚本挂了牌子（里面是活着的进程号），新任务照收但先不开始，网页显示安心的话
+st_of() { $C -b "$J" "$B/api/jobs" | perl -ne 'while(/(\{"[^{}]*?"id":"'"$1"'"[^{}]*\})/g){print $1}'; }
+echo "$$" > "$T/data/state/upgrading"
+sleep 1.5
+r=$(add 'https://www.youtube.com/watch?v=upgradewait')
+has upg-note "$r" '服务器正在升级'
+id=$(printf '%s' "$r" | job_id)
+# 每天的 yt-dlp 更新到点了也先不做
+sed -i 's/^last_update=.*/last_update=1/' "$T/data/state/info"
+nu=$(grep -c '检查 yt-dlp 更新' "$T/server.log")
+sleep 2.5
+check upg-no-update "$(grep -c '检查 yt-dlp 更新' "$T/server.log")" "$nu"
+js=$(st_of "$id")
+has upg-queued "$js" '"state":"queued"'
+has upg-line "$js" '服务器正在升级，等一会儿会自动开始'
+has upg-info "$($C -b "$J" "$B/api/jobs")" '"upgrading":true'
+has upg-banner "$($C -b "$J" "$B/")" 'id="upg"'
+# 牌子撤了：自动开始
+rm -f "$T/data/state/upgrading"
+has upg-resume "$(wait_job "$id")" '"state":"done"'
+if [ "$(grep -c '检查 yt-dlp 更新' "$T/server.log")" -gt "$nu" ]; then ok upg-update-later; else bad upg-update-later; fi
+has upg-info-off "$($C -b "$J" "$B/api/jobs")" '"upgrading":false'
+# 安装脚本早就退出了（进程号不在了）：当没有牌子
+dead=$(sh -c 'echo $$')
+echo "$dead" > "$T/data/state/upgrading"
+r=$(add 'https://www.youtube.com/watch?v=staleflag01')
+case "$r" in *'服务器正在升级'*) bad upg-stale-note ;; *) ok upg-stale-note ;; esac
+has upg-stale-runs "$(wait_job "$(printf '%s' "$r" | job_id)")" '"state":"done"'
+rm -f "$T/data/state/upgrading"
+
+# 重启网页服务：下好了还没传到 Mac 的、还在排队的，重启后都还在
+idk=$(add 'https://www.youtube.com/watch?v=keepafterrs' | job_id)
+has rs-done-before "$(wait_job "$idk")" '"state":"done"'
+echo "$$" > "$T/data/state/upgrading"
+sleep 1.5
+idq=$(add 'https://www.youtube.com/watch?v=queuedacros' | job_id)
+kill "$(cat "$T/data/state/server.pid")"
+n=0
+while curl -s --noproxy 127.0.0.1 -m 2 "$B/health" >/dev/null 2>&1 && [ "$n" -lt 50 ]; do sleep 0.2; n=$((n + 1)); done
+rm -f "$T/data/state/upgrading"
+FAKE_LOG=$T/calls.log perl "$T/server.pl" "$T/web.conf" >> "$T/server.log" 2>&1 &
+spid=$!
+n=0
+until curl -s --noproxy 127.0.0.1 "$B/health" 2>/dev/null | grep -q 'ytdlp-web ok'; do
+  n=$((n + 1))
+  [ "$n" -gt 50 ] && { bad rs-restart; break; }
+  sleep 0.2
+done
+js=$(st_of "$idk")
+has rs-kept "$js" '"state":"done"'
+has rs-kept-file "$js" '"has_file":true'
+rm -rf "$T/mac2" && mkdir -p "$T/mac2"
+(cd "$T/mac2" && $C -b "$J" -OJ "$B/dl/$idk")
+check rs-fetch-size "$(wc -c < "$T/mac2/$(ls "$T/mac2" | head -n 1)" | tr -d ' ')" 3145728
+has rs-queued-runs "$(wait_job "$idq")" '"state":"done"'
+
 if [ "$fail" -ne 0 ]; then
   printf '\n有测试没通过。日志：\n' >&2
   cat "$T/server.log" >&2
