@@ -1,11 +1,11 @@
 #!/bin/sh
 #======================================================================
-# yt-dlp 一键脚本：在 Mac 浏览器里贴视频链接，视频（或图片）自动存进 Mac
+# yt-dlp 一键脚本：在浏览器里贴视频链接，视频先留在 VPS
 # 支持 YouTube、抖音、小红书、B站、TikTok、推特/X、Instagram，可以直接粘 App 里复制的整段分享文字
 #----------------------------------------------------------------------
-# 在 Linux VPS（小鸡）上装好一个小网页。Mac 浏览器打开它，贴链接、点开始，
-# VPS 帮你从这些网站下好，马上让浏览器存进 Mac 的「下载」文件夹，
-# 传完以后自动把 VPS 上的文件删掉。VPS 上不留视频。
+# 在 Linux VPS（小鸡）上装好一个小网页。浏览器打开它，贴链接、点开始，
+# VPS 帮你从这些网站下好，文件先留在 VPS。点「保存到本地」才下载到你正在用的电脑，
+# 浏览器完整收下以后再删掉 VPS 上的视频。视频还可以压缩，或加上水印再压缩，然后保存到本地。
 #
 # 64MB 内存也能装：不用 Docker，网页是一个只用系统自带 Perl 的小程序，
 # 内存小的机器会先做一块硬盘上的虚拟内存，下载一个接一个来。
@@ -21,7 +21,7 @@
 #   网页服务       一直在 VPS 上跑的小网页程序（server.pl），Mac 浏览器打开的就是它
 #   端口           网页地址里冒号后面的数字，例如 http://1.2.3.4:15346 里的 15346
 #   yt-dlp         真正去各个网站下视频的程序。网站经常改，它每天自动更新
-#   ffmpeg         把画面和声音合成一个文件的程序
+#   ffmpeg         把画面和声音合成一个文件，也用来按 HEVC 压缩、变速、加水印
 #   QuickJS        很小的 JavaScript 程序。YouTube 现在要算一道 JavaScript 题才给视频
 #   PO 令牌        YouTube 用来确认“你是真浏览器”的一串码。bgutil-pot 程序会自动算
 #   WARP           Cloudflare 的免费线路。被网站拦时，换一个不被拦的出口 IP
@@ -33,7 +33,7 @@
 #   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=2.1.2
+VERSION=2.2.0
 # ytdlp-onekey-begin
 
 #----------------------------------------------------------------------
@@ -189,7 +189,7 @@ set_quit_traps() {
 #   做法：先在 $DATA/state/upgrading 挂一块「正在升级」的牌子（里面写安装脚本的进程号），
 #   网页服务看到牌子就不再开始新的任务（排队的先等着，重启后自动接着下；新贴的链接照收），
 #   脚本等「正在下载的」和「正在传给浏览器的」都结束了，才停掉网页服务、换新版本、再启动。
-#   已经下好、还没传到 Mac 的文件记在硬盘上，重启以后照样在，浏览器会接着自动保存。
+#   已经下好、还没点保存的文件记在硬盘上，重启以后照样在。打开网页再点保存。
 #   安装脚本中途退出时，牌子会被撤掉；就算没撤掉，网页服务发现那个进程号已经不在了，也会当它不存在。
 #----------------------------------------------------------------------
 UPGRADE_FLAG=
@@ -242,10 +242,14 @@ count_busy() {
       queued|'') nq=$((nq + 1)) ;;
       done)
         da=$(sed -n 's/^done_at=//p' "$d/status" | head -n 1 | tr -cd '0-9')
-        if [ -n "$da" ] && [ $((now - da)) -lt "${FRESH_SECS:-45}" ] && [ ! -s "$d/sent" ] &&
+        if [ -n "$da" ] && [ $((now - da)) -lt "${FRESH_SECS:-45}" ] && [ ! -s "$d/sent" ] && [ ! -s "$d/sent-export" ] &&
           [ -n "$(sed -n 's/^file=//p' "$d/status" | head -n 1)" ]; then
           nf=$((nf + 1))
         fi
+        ex=$(sed -n 's/^export_state=//p' "$d/status" | head -n 1)
+        case "$ex" in
+          queued|running) nr=$((nr + 1)) ;;
+        esac
         ;;
     esac
     for a in "$d"/active.*; do
@@ -301,7 +305,7 @@ wait_for_idle() {
       if [ "$nr" -gt 0 ]; then
         say_step "有 ${nr} 个视频正在下载，等它们下完再重启……"
       elif [ "$ns" -gt 0 ]; then
-        say_step "有 ${ns} 个文件正在传到 Mac，等传完再重启……"
+        say_step "有 ${ns} 个文件正在传到你的电脑，等传完再重启……"
       else
         say_step "有 ${nf} 个视频刚下好，等浏览器拿走再重启……"
       fi
@@ -323,7 +327,7 @@ wait_for_idle() {
       break
     fi
     if [ $((waited % 30)) -eq 0 ]; then
-      printf '%s\n' "  已经等了 $((waited / 60)) 分 $((waited % 60)) 秒：正在下 ${nr} 个，正在传到 Mac ${ns} 个"
+      printf '%s\n' "  已经等了 $((waited / 60)) 分 $((waited % 60)) 秒：正在下 ${nr} 个，正在传到你的电脑 ${ns} 个"
       busy_lines "$dd/jobs"
     fi
     sleep "$step" || true
@@ -1509,23 +1513,57 @@ install_apk_ffmpeg_onebyone() {
   need_tool ffmpeg
 }
 
+ffmpeg_has_libx265() {
+  bin=$1
+  [ -n "$bin" ] && [ -x "$bin" ] || return 1
+  "$bin" -hide_banner -encoders 2>/dev/null | grep -q libx265
+}
+
+# 压缩按钮要 HEVC。系统自带的 ffmpeg 经常没编进 libx265，amd64/arm64 就换 John Van Sickle 的静态包。
+ensure_libx265() {
+  bin=$(command -v ffmpeg 2>/dev/null || true)
+  if ffmpeg_has_libx265 "$bin"; then
+    say_ok "ffmpeg 可以压 HEVC（libx265），网页上的压缩按钮可以用"
+    return 0
+  fi
+  if [ -n "${MEM_MB:-}" ] && [ "$MEM_MB" -le 128 ]; then
+    say_warn "ffmpeg 没有 HEVC 编码器（libx265）。内存大约 ${MEM_MB}MB，不换静态版。网页上只能「保存到本地」。"
+    return 0
+  fi
+  if [ -z "$bin" ]; then
+    say_warn "ffmpeg 没装上。画面和声音合并不了，压缩也用不了。"
+    return 0
+  fi
+  say_info "现在的 ffmpeg 压不了 HEVC，改换带 libx265 的静态版"
+  if install_static_ffmpeg && ffmpeg_has_libx265 /usr/local/bin/ffmpeg; then
+    say_ok "已换成带 HEVC 的 ffmpeg"
+    return 0
+  fi
+  say_warn "ffmpeg 没有 libx265。网页上的压缩和水印用不了，「保存到本地」仍然可以。"
+  return 0
+}
+
 ensure_ffmpeg() {
   if need_tool ffmpeg; then
     say_ok "ffmpeg 已经有了"
+    ensure_libx265
     return 0
   fi
-  say_step "安装 ffmpeg（合并视频和音频要用）"
+  say_step "安装 ffmpeg（合并视频和音频要用，压缩也用它）"
   # 一次装一百个包，64MB 的鸡会被杀掉。Alpine 上改成一个一个装。
   if low_mem && [ "$PM" = apk ]; then
     if install_apk_ffmpeg_onebyone; then
       say_ok "ffmpeg 已从系统软件源装上"
+      ensure_libx265
       return 0
     fi
     say_warn "内存大约 ${MEM_MB}MB，ffmpeg 没装完。高画质合并会失败。"
+    ensure_libx265
     return 0
   fi
   if ensure_tool ffmpeg; then
     say_ok "ffmpeg 已从系统软件源装上"
+    ensure_libx265
     return 0
   fi
   # 40MB 的静态包在 128MB 及以下会把后面的安装一起打死。
@@ -1536,6 +1574,7 @@ ensure_ffmpeg() {
   say_info "软件源里的 ffmpeg 没装上，改下静态版本"
   if install_static_ffmpeg; then
     say_ok "已装上静态 ffmpeg"
+    ensure_libx265
     return 0
   fi
   say_warn "ffmpeg 没装上。画面和声音分开的视频（YouTube 高画质、推特等）合并不了，会下载失败。"
@@ -2292,8 +2331,9 @@ write_server() {
 # ytdlp-web 网页服务
 #----------------------------------------------------------------------
 # 这是 install.sh 装到 VPS 上的小网页。Mac 浏览器打开的就是它。
-# 你贴一个链接（或者 App 里「分享 → 复制链接」的整段文字），它让 yt-dlp 把视频下到 VPS，
-# 下完马上让浏览器存到 Mac，传完以后自动把 VPS 上的文件删掉。只用 Perl 自带的模块，64MB 小鸡也跑得动。
+# 你贴一个链接（或者 App 里「分享 → 复制链接」的整段文字），它让 yt-dlp 把视频下到 VPS。
+# 下完先留在 VPS。点「保存到本地」才下载到你正在用的电脑，浏览器完整收下后再删。
+# 视频还可以在 VPS 上变速、加水印，并按 HEVC 600 kbps 压缩后再保存。只用 Perl 自带的模块。
 # 支持 YouTube、抖音、小红书、B站、TikTok、推特/X、Instagram（以及 yt-dlp 认得的其他网站）。
 #
 # 名词小词典
@@ -2325,7 +2365,7 @@ use POSIX qw(:sys_wait_h setsid strftime setlocale LC_ALL);
 use Fcntl qw(:flock O_WRONLY O_CREAT O_APPEND);
 use File::Path qw(make_path remove_tree);
 
-my $VERSION = '2.1.2';
+my $VERSION = '2.2.0';
 setlocale(LC_ALL, 'C');
 $SIG{PIPE} = 'IGNORE';
 
@@ -2336,7 +2376,7 @@ my $CONF_FILE = $ARGV[0] || '/etc/ytdlp-web/web.conf';
 my %C = (
   listen      => '0.0.0.0',
   data        => '/var/lib/ytdlp-web',
-  keep_hours  => 6,      # 没传到 Mac 的文件，最多在 VPS 上留几个小时
+  keep_hours  => 6,      # 旧配置里还有这个数。没点保存的视频不再按它自动删。
   grace       => 120,    # 传完以后再等几秒才删，给浏览器补最后一点的机会
   ytdlp       => '/usr/local/bin/yt-dlp',
   js          => '',
@@ -2578,10 +2618,13 @@ sub read_request {
   };
   my $len = $h{'content-length'} || 0;
   if ($len =~ /^\d+$/ && $len > 0) {
-    return { %$r, too_big => 1 } if $len > 2 * 1024 * 1024;
+    # 水印图最大 20MB。表单里是 base64，再被百分号编码，体积会胀到大约 45MB。
+    my $max = ($path eq '/api/export') ? 56 * 1024 * 1024 : 2 * 1024 * 1024;
+    return { %$r, too_big => 1 } if $len > $max;
     my $body = $rest;
+    my $body_deadline = time + ($len > 2 * 1024 * 1024 ? 180 : 30);
     while (length($body) < $len) {
-      my $left = $deadline + 20 - time;
+      my $left = $body_deadline - time;
       return undef if $left <= 0;
       return undef unless $sel->can_read($left);
       my $n = sysread($c, $body, 65536, length $body);
@@ -2837,8 +2880,9 @@ sub list_jobs {
 
 # 浏览器拿走的几段合在一起，看看有没有把整个文件都拿全。
 sub delivered_bytes {
-  my ($id, $size) = @_;
-  my $d = slurp(job_dir($id) . '/sent') || '';
+  my ($id, $size, $sent_name) = @_;
+  $sent_name = 'sent' unless defined $sent_name && $sent_name =~ /^[A-Za-z0-9._-]+$/;
+  my $d = slurp(job_dir($id) . "/$sent_name") || '';
   my @r;
   for my $l (split /\n/, $d) {
     my ($s, $e) = split / /, $l;
@@ -2882,6 +2926,231 @@ sub media_path {
   return -f $p ? $p : undef;
 }
 
+sub is_video_name {
+  my ($f) = @_;
+  return defined $f && $f =~ /\.(mp4|mkv|webm|mov|flv|m4v|ts|avi)$/i;
+}
+
+sub mem_available_mb {
+  my $t = slurp('/proc/meminfo') || '';
+  return int($1 / 1024) if $t =~ /MemAvailable:\s+(\d+)\s+kB/;
+  return int($1 / 1024) if $t =~ /MemFree:\s+(\d+)\s+kB/;
+  if (open(my $fh, '-|', 'sysctl', '-n', 'hw.memsize')) {
+    my $b = <$fh>;
+    close $fh;
+    return int($1 / 1048576) if defined $b && $b =~ /(\d+)/ && $1 > 0;
+  }
+  return -1;
+}
+
+sub ffmpeg_encoder_ok {
+  return 0 unless $C{ffmpeg} && -x $C{ffmpeg};
+  my $mt = (stat($C{ffmpeg}))[9] || 0;
+  my $cache = "$STATE/libx265";
+  my $old = slurp($cache) || '';
+  return ($2 eq 'yes') ? 1 : 0 if $old =~ /^(\d+) (yes|no)\n/ && $1 == $mt;
+  my ($o) = run_cmd_capture(20, $C{ffmpeg}, '-hide_banner', '-encoders');
+  my $yes = ($o || '') =~ /libx265/ ? 'yes' : 'no';
+  spit($cache, "$mt $yes\n");
+  return $yes eq 'yes';
+}
+
+sub compress_block_reason {
+  return '服务器上的 ffmpeg 不能压 HEVC（没有 libx265）。请先点「保存到本地」。' unless ffmpeg_encoder_ok();
+  my $mb = mem_available_mb();
+  return '可用内存不到 384MB，HEVC 两遍压缩会把机器撑死。请先点「保存到本地」。' if $mb >= 0 && $mb < 384;
+  my $free = disk_free_mb($DATA);
+  return "服务器硬盘只剩 ${free}MB，放不下压缩出来的文件。请先保存或删除已有视频。" if $free >= 0 && $free < $C{min_free_mb};
+  return '';
+}
+
+sub export_busy_id {
+  for my $id (list_jobs()) {
+    my $s = job_stat($id)->{export_state} || '';
+    return $id if $s eq 'queued' || $s eq 'running';
+  }
+  return '';
+}
+
+sub b64_decode {
+  my ($s) = @_;
+  $s = '' unless defined $s;
+  $s =~ s/\s+//g;
+  return undef if $s eq '' || length($s) % 4 == 1 || $s =~ /[^A-Za-z0-9+\/=]/;
+  my $table = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  my %v = map { substr($table, $_, 1) => $_ } 0 .. 63;
+  $s =~ s/=+$//;
+  my $out = '';
+  for (my $i = 0; $i < length($s); $i += 4) {
+    my $take = length($s) - $i;
+    $take = 4 if $take > 4;
+    return undef if $take < 2;
+    my @c;
+    for my $k (0 .. $take - 1) {
+      my $ch = substr($s, $i + $k, 1);
+      return undef unless exists $v{$ch};
+      push @c, $v{$ch};
+    }
+    my $b = ($c[0] << 18) | ($c[1] << 12) | (($c[2] || 0) << 6) | ($c[3] || 0);
+    $out .= chr(($b >> 16) & 255);
+    $out .= chr(($b >> 8) & 255) if $take >= 3;
+    $out .= chr($b & 255) if $take >= 4;
+  }
+  return $out;
+}
+
+sub write_bin {
+  my ($f, $d) = @_;
+  open(my $fh, '>', $f) or return 0;
+  binmode $fh;
+  print $fh $d or return 0;
+  close $fh or return 0;
+  return 1;
+}
+
+sub decode_watermark {
+  my ($raw) = @_;
+  $raw = '' unless defined $raw;
+  $raw =~ s/^data:image\/[a-z0-9.+-]+;base64,//i;
+  my $bin = b64_decode($raw);
+  return (undef, '水印图片读不出来。请换一张 PNG 或 JPG。') unless defined $bin && length $bin;
+  return (undef, '水印图片不能超过 20MB。') if length($bin) > 20 * 1024 * 1024;
+  return ($bin, 'png') if length($bin) >= 8 && substr($bin, 0, 8) eq "\x89PNG\r\n\x1a\n";
+  return ($bin, 'jpg') if length($bin) >= 3 && substr($bin, 0, 3) eq "\xff\xd8\xff";
+  return (undef, '只接受 PNG 或 JPG。');
+}
+
+sub parse_speed {
+  my ($s) = @_;
+  $s = '1' unless defined $s && length $s;
+  $s =~ s/\s+//g;
+  return (undef, '速度要在 0.1 到 5 之间。') unless $s =~ /^\d+(\.\d+)?$/;
+  my $n = $s + 0;
+  return (undef, '速度要在 0.1 到 5 之间。') if $n < 0.1 || $n > 5;
+  $n = int($n * 10 + 0.5) / 10;
+  $n = 0.1 if $n < 0.1;
+  $n = 5 if $n > 5;
+  return (sprintf('%.1f', $n) + 0, '');
+}
+
+sub atempo_chain {
+  my ($speed) = @_;
+  return '' if abs($speed - 1) < 0.0001;
+  my @p;
+  my $s = $speed;
+  my $guard = 0;
+  while ($s > 2.0001 && $guard++ < 8) { push @p, 2.0; $s /= 2.0; }
+  $guard = 0;
+  while ($s < 0.4999 && $guard++ < 8) { push @p, 0.5; $s /= 0.5; }
+  push @p, $s if abs($s - 1) > 0.0001 || !@p;
+  return join(',', map { sprintf('atempo=%.4f', $_) } @p);
+}
+
+sub export_vchain {
+  my ($speed, $before_overlay) = @_;
+  my @f = ('yadif=deint=interlaced');
+  push @f, sprintf('setpts=%.6f*PTS', 1 / $speed) if abs($speed - 1) > 0.0001;
+  push @f, 'fps=25',
+    'scale=min(960\\,iw):min(540\\,ih):force_original_aspect_ratio=decrease',
+    'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+    'setsar=1';
+  push @f, 'format=yuv420p' unless $before_overlay;
+  return join(',', @f);
+}
+
+sub safe_stem {
+  my ($s) = @_;
+  $s = 'video' unless defined $s && length $s;
+  $s =~ s{[/\\:*?"<>|\x00-\x1f]+}{_}g;
+  $s =~ s/\s+/ /g;
+  $s =~ s/^\s+|\s+$//g;
+  $s =~ s/^\.+//;
+  $s = substr($s, 0, 60);
+  $s =~ s/\s+$//;
+  return length($s) ? $s : 'video';
+}
+
+sub run_export {
+  my ($id) = @_;
+  $0 = 'ytdlp-web-export';
+  my $dir = job_dir($id);
+  my $st = job_stat($id);
+  my $src = $st->{file} || '';
+  my $kind = $st->{export_kind} || 'compress';
+  my $speed = ($st->{export_speed} || 1) + 0;
+  $speed = 1 if $speed < 0.1 || $speed > 5;
+  my $why = compress_block_reason();
+  if ($why || !is_video_name($src) || !-f "$dir/$src") {
+    my $msg = $why || '这个文件不能压缩。图片和纯音频请直接保存到本地。';
+    set_stat($id, export_state => 'error', export_error => $msg, line => $msg);
+    return;
+  }
+  my $suffix = $kind eq 'watermark' ? '-水印' : '-压缩';
+  my $out = safe_stem($st->{title} || $src) . $suffix . '.mov';
+  unlink "$dir/$out", "$dir/x265.stats", "$dir/x265.stats.cutree", "$dir/sent-export";
+  my $wm = '';
+  if ($kind eq 'watermark') {
+    $wm = -f "$dir/watermark.png" ? 'watermark.png' : (-f "$dir/watermark.jpg" ? 'watermark.jpg' : '');
+    if (!$wm) {
+      set_stat($id, export_state => 'error', export_error => '没有水印图。请重新上传。', line => '没有水印图。请重新上传。');
+      return;
+    }
+  }
+  my $info = probe_media("$dir/$src");
+  my $has_a = $info && $info->{a} ? 1 : 0;
+  my $dur = ($info && $info->{dur}) ? $info->{dur} / $speed : 0;
+  my $op = ($st->{export_opacity} || 0) + 0;
+  $op = 0 if $op < 0;
+  $op = 100 if $op > 100;
+  my $vchain = export_vchain($speed, $kind eq 'watermark');
+  my $aa = sprintf('%.4f', $op / 100);
+  my $fc = '';
+  if ($kind eq 'watermark') {
+    $fc = "[0:v]${vchain}[base];[1:v]format=rgba,colorchannelmixer=aa=${aa}[lg];"
+      . '[lg][base]scale2ref=w=main_w*0.18:h=ow/mdar[wm][base2];'
+      . '[base2][wm]overlay=main_w-overlay_w-main_w*0.02:main_h-overlay_h-main_w*0.02:format=auto,format=yuv420p[v]';
+  }
+  my @ff = ($C{ffmpeg}, '-hide_banner', '-nostdin', '-y', '-loglevel', 'error', '-progress', 'pipe:1', '-i', $src);
+  push @ff, '-i', $wm if $wm;
+  my @vmap = $wm ? ('-filter_complex', $fc, '-map', '[v]') : ('-vf', $vchain, '-map', '0:v:0');
+  my @venc = ('-c:v', 'libx265', '-preset', 'faster', '-pix_fmt', 'yuv420p', '-b:v', '600k');
+  my $x1 = 'bframes=4:frame-threads=1:pass=1:stats=x265.stats';
+  my $x2 = 'bframes=4:frame-threads=1:pass=2:stats=x265.stats';
+  set_stat($id, export_state => 'running', line => '正在压缩（第 1 遍，画面）…', pct => 0, export_pct => 0);
+  my $ok = run_ffmpeg($id, $dir, $dur, '正在压缩（第 1 遍，画面）',
+    'PCT', 0, 49, @ff, @vmap, '-an', @venc, '-x265-params', $x1, '-f', 'null', '/dev/null');
+  if ($ok < 0) { remove_tree($dir); logline("任务 $id 压缩已取消"); return; }
+  if (!$ok) {
+    unlink "$dir/$out", "$dir/x265.stats", "$dir/x265.stats.cutree";
+    set_stat($id, export_state => 'error', export_error => '第一遍压缩失败。原视频还在，可以再点一次，或直接保存到本地。',
+      line => '压缩没成功。原视频还在。');
+    return;
+  }
+  if (-e "$dir/cancel") { remove_tree($dir); logline("任务 $id 压缩已取消"); return; }
+  my @amap = ('-an');
+  if ($has_a) {
+    my $af = atempo_chain($speed);
+    @amap = ('-map', '0:a:0');
+    push @amap, '-filter:a', $af if $af;
+    push @amap, '-c:a', 'aac', '-b:a', '64k', '-ar', '44100', '-ac', '2';
+  }
+  set_stat($id, line => '正在压缩（第 2 遍，画面和声音）…', pct => 50, export_pct => 50);
+  $ok = run_ffmpeg($id, $dir, $dur, '正在压缩（第 2 遍，画面和声音）',
+    'PCT', 50, 49, @ff, @vmap, @amap, @venc, '-tag:v', 'hvc1', '-x265-params', $x2, '-movflags', '+faststart', $out);
+  unlink "$dir/x265.stats", "$dir/x265.stats.cutree";
+  if ($ok < 0) { remove_tree($dir); logline("任务 $id 压缩已取消"); return; }
+  if (!$ok || !-s "$dir/$out") {
+    unlink "$dir/$out";
+    set_stat($id, export_state => 'error', export_error => '第二遍压缩失败。原视频还在，可以再点一次，或直接保存到本地。',
+      line => '压缩没成功。原视频还在。');
+    return;
+  }
+  my $size = -s "$dir/$out";
+  set_stat($id, export_state => 'ready', export_file => $out, export_size => $size, export_pct => 100, pct => 100,
+    export_error => '', line => '压缩好了，正在交给浏览器保存到你的电脑…');
+  logline("任务 $id 压缩好了：$out " . human_size($size));
+}
+
 sub job_view {
   my ($id) = @_;
   my $m  = job_meta($id);
@@ -2891,21 +3160,35 @@ sub job_view {
   my $size = $st->{size} || 0;
   my $sent = ($state eq 'done' && $size) ? delivered_bytes($id, $size) : 0;
   my $line = $st->{line} || '';
-  my $delivered = ($state eq 'done' && $size && $sent >= $size) ? 1 : 0;
-  # 存到 Mac 以后，网页亮一下 ✅ 就收起来；万一网页没开着，15 秒后也不再显示。
-  my $sent_at = $delivered ? ((stat(job_dir($id) . '/sent'))[9] || 0) : 0;
+  my $ex = $st->{export_state} || '';
+  my $ex_size = $st->{export_size} || 0;
+  my $ex_sent = ($ex eq 'ready' && $ex_size) ? delivered_bytes($id, $ex_size, 'sent-export') : 0;
+  my $ex_full = ($ex eq 'ready' && $ex_size && $ex_sent >= $ex_size) ? 1 : 0;
+  my $orig_full = ($state eq 'done' && $size && $sent >= $size) ? 1 : 0;
+  my $hold = ($ex eq 'queued' || $ex eq 'running' || ($ex eq 'ready' && !$ex_full)) ? 1 : 0;
+  my $delivered = ($ex_full || ($orig_full && !$hold)) ? 1 : 0;
+  my $mark = $ex_full ? (job_dir($id) . '/sent-export') : (job_dir($id) . '/sent');
+  my $sent_at = $delivered ? ((stat($mark))[9] || 0) : 0;
   my $hidden = $st->{dismissed} || ($delivered && time - $sent_at > 15) ? 1 : 0;
   if ($state eq 'queued') {
     $line = upgrading() ? '服务器正在升级，等一会儿会自动开始' : '排队中，前面的下完就轮到它';
   } elsif ($state eq 'done') {
     if ($delivered) {
-      $line = '✅ 已存到 Mac 的「下载」文件夹';
+      $line = '✅ 已存到你的电脑';
+    } elsif ($ex eq 'running' || $ex eq 'queued') {
+      $line = $st->{line} || '正在压缩…';
+    } elsif ($ex eq 'error') {
+      $line = '压缩没成功。' . ($st->{export_error} || '原视频还在，可以再点一次。');
+    } elsif ($ex eq 'ready' && $ex_sent > 0 && $ex_size) {
+      $line = sprintf('正在传到你的电脑（%d%%）。看浏览器的下载图标', int($ex_sent * 100 / $ex_size));
+    } elsif ($ex eq 'ready') {
+      $line = '压缩好了，正在交给浏览器保存到你的电脑…';
     } elsif (!$path) {
-      $line = $st->{gone} || '已经传到你的 Mac，服务器上的文件已删除';
+      $line = $st->{gone} || '文件已经不在服务器上了';
     } elsif ($sent > 0) {
-      $line = sprintf('正在传到你的 Mac（%d%%）。看浏览器右上角的下载图标', int($sent * 100 / $size));
+      $line = sprintf('正在传到你的电脑（%d%%）。看浏览器的下载图标', int($sent * 100 / $size));
     } else {
-      $line = '服务器已下好，正在交给浏览器保存到 Mac…';
+      $line = '已留在 VPS。点「保存到本地」才会下载到你的电脑。';
     }
   }
   return {
@@ -2923,7 +3206,10 @@ sub job_view {
     file    => $st->{file} || '',
     size    => human_size($size),
     has_file => bool($path),
+    video   => bool(is_video_name($st->{file} || '')),
     delivered => bool($delivered),
+    export_state => $ex,
+    export_error => $st->{export_error} || '',
     error   => $st->{error} || '',
     hint    => $st->{hint} || '',
     created => num($m->{created} || 0),
@@ -3001,7 +3287,19 @@ my %MIME = (mp4 => 'video/mp4', m4a => 'audio/mp4', mp3 => 'audio/mpeg', webm =>
 
 sub serve_file {
   my ($c, $r, $id) = @_;
-  my $path = media_path($id);
+  my $which = $r->{query}{which} || '';
+  my $sent_name = 'sent';
+  my $path;
+  if ($which eq 'export') {
+    $sent_name = 'sent-export';
+    my $f = job_stat($id)->{export_file} || '';
+    if ($f =~ /^[^\/\\]+$/ && $f ne '.' && $f ne '..') {
+      my $p = job_dir($id) . "/$f";
+      $path = $p if -f $p;
+    }
+  } else {
+    $path = media_path($id);
+  }
   unless ($path) {
     return respond($c, $r, 404, 'text/html; charset=utf-8',
       page_simple('文件已经不在服务器上了', '这个视频已经传给浏览器，或者放太久被自动删掉了。回到首页重新贴一次链接就行。'));
@@ -3079,7 +3377,7 @@ sub serve_file {
   }
   close $fh;
   if ($done > 0) {
-    if (sysopen(my $sf, job_dir($id) . '/sent', O_WRONLY | O_CREAT | O_APPEND)) {
+    if (sysopen(my $sf, job_dir($id) . "/$sent_name", O_WRONLY | O_CREAT | O_APPEND)) {
       syswrite($sf, sprintf("%d %d\n", $start, $start + $done - 1));
       close $sf;
     }
@@ -3240,9 +3538,12 @@ sub handle {
     if ($p eq '/api/delete') {
       my $id = $f->{id};
       return respond_json($c, $r, 404, { error => '没有这个任务' }) unless valid_id($id) && -d job_dir($id);
-      my $st = job_stat($id)->{state} || 'queued';
-      if ($st eq 'running') {
+      my $st = job_stat($id);
+      my $state = $st->{state} || 'queued';
+      my $ex = $st->{export_state} || '';
+      if ($state eq 'running' || $ex eq 'running') {
         if (open(my $cf, '>', job_dir($id) . '/cancel')) { close $cf; }
+        set_stat($id, export_state => 'error', export_error => '已取消') if $ex eq 'running';
       } else {
         remove_tree(job_dir($id));
       }
@@ -3250,13 +3551,52 @@ sub handle {
       return respond_json($c, $r, 200, { ok => bool(1) });
     }
     if ($p eq '/api/dismiss') {
-      # 网页说「这个已经存到 Mac 了，收起来吧」。只收已经送达的；文件还是按原来的规则过一会儿再删。
+      # 网页说「这个已经存到电脑了，收起来吧」。只收已经送达的。
       my $id = $f->{id};
       return respond_json($c, $r, 404, { error => '没有这个任务' }) unless valid_id($id) && -d job_dir($id);
       my $st = job_stat($id);
-      return respond_json($c, $r, 200, { error => '还没传完' })
-        unless ($st->{state} || '') eq 'done' && ($st->{delivered} || ($st->{size} && delivered_bytes($id, $st->{size}) >= $st->{size}));
+      my $orig_ok = ($st->{state} || '') eq 'done' && $st->{size} && delivered_bytes($id, $st->{size}) >= $st->{size};
+      my $ex_ok = ($st->{export_state} || '') eq 'ready' && $st->{export_size}
+        && delivered_bytes($id, $st->{export_size}, 'sent-export') >= $st->{export_size};
+      return respond_json($c, $r, 200, { error => '还没传完' }) unless $orig_ok || $ex_ok;
       set_stat($id, dismissed => 1);
+      return respond_json($c, $r, 200, { ok => bool(1) });
+    }
+    if ($p eq '/api/export') {
+      my $id = $f->{id};
+      return respond_json($c, $r, 404, { error => '没有这个任务' }) unless valid_id($id) && -d job_dir($id);
+      my $st = job_stat($id);
+      return respond_json($c, $r, 200, { error => '视频还没下好。' }) unless ($st->{state} || '') eq 'done' && media_path($id);
+      return respond_json($c, $r, 200, { error => '图片和纯音频不能压缩。请点「保存到本地」。' }) unless is_video_name($st->{file} || '');
+      my $block = compress_block_reason();
+      return respond_json($c, $r, 200, { error => $block }) if $block;
+      my $cur = $st->{export_state} || '';
+      return respond_json($c, $r, 200, { error => '这条正在压缩，等它完成。' }) if $cur eq 'queued' || $cur eq 'running';
+      my $other = export_busy_id();
+      return respond_json($c, $r, 200, { error => '服务器正在压缩另一个视频，等它完成再点。' }) if $other && $other ne $id;
+      my ($speed, $bad) = parse_speed($f->{speed});
+      return respond_json($c, $r, 200, { error => $bad }) if $bad;
+      my $kind = $f->{kind} || 'compress';
+      return respond_json($c, $r, 200, { error => '不知道要做哪一种保存。' }) unless $kind eq 'compress' || $kind eq 'watermark';
+      my $opacity = 100;
+      unlink job_dir($id) . '/watermark.png', job_dir($id) . '/watermark.jpg';
+      if ($kind eq 'watermark') {
+        my $op = $f->{opacity};
+        $op = '50' unless defined $op && length $op;
+        return respond_json($c, $r, 200, { error => '透明度要在 0 到 100 之间。' }) unless $op =~ /^\d+$/ && $op <= 100;
+        $opacity = $op + 0;
+        my ($bin, $ext) = decode_watermark($f->{image});
+        return respond_json($c, $r, 200, { error => $ext }) unless defined $bin;
+        my $wf = job_dir($id) . '/watermark.' . $ext;
+        return respond_json($c, $r, 200, { error => '水印图写不进服务器。' }) unless write_bin($wf, $bin);
+      }
+      my $old = $st->{export_file} || '';
+      unlink job_dir($id) . "/$old" if $old =~ /^[^\/\\]+$/ && $old ne '.' && $old ne '..';
+      unlink job_dir($id) . '/sent-export', job_dir($id) . '/x265.stats', job_dir($id) . '/x265.stats.cutree';
+      set_stat($id, export_state => 'queued', export_kind => $kind, export_speed => $speed, export_opacity => $opacity,
+        export_file => '', export_size => 0, export_pct => 0, export_error => '', pct => 0,
+        line => '排队压缩，马上开始…');
+      logline("任务 $id 排队压缩 kind=$kind speed=$speed opacity=$opacity");
       return respond_json($c, $r, 200, { ok => bool(1) });
     }
     if ($p eq '/api/cookies') {
@@ -3297,6 +3637,9 @@ sub server_info {
     keep_hours => num($C{keep_hours}),
     grace_min  => num(int(($C{grace} + 59) / 60)),
     free       => disk_free_mb($DATA) >= 0 ? human_size(disk_free_mb($DATA) * 1048576) : '',
+    disk_low   => bool(disk_free_mb($DATA) >= 0 && disk_free_mb($DATA) < $C{min_free_mb}),
+    compress_ok => bool(compress_block_reason() eq ''),
+    compress_why => compress_block_reason(),
     version    => $VERSION,
     upgrading  => bool(upgrading()),
   };
@@ -3862,6 +4205,12 @@ sub transcode_estimate {
 
 sub run_ffmpeg {
   my ($id, $dir, $dur, $line, @cmd) = @_;
+  my ($pct_base, $pct_span) = (0, 100);
+  if (@cmd && $cmd[0] eq 'PCT') {
+    shift @cmd;
+    $pct_base = shift @cmd;
+    $pct_span = shift @cmd;
+  }
   append_log($dir, "\n===== 转换格式 =====\n" . join(' ', map { /\s/ ? "'$_'" : $_ } @cmd) . "\n");
   my $pid = open(my $out, '-|');
   return 0 unless defined $pid;
@@ -3888,9 +4237,11 @@ sub run_ffmpeg {
       next unless $l =~ /^out_time_(?:us|ms)=(\d+)/;
       next if time - $lastw < 2 || !$dur;
       $lastw = time;
-      my $pct = int($1 / 1e6 * 100 / $dur);
+      my $raw = int($1 / 1e6 * 100 / $dur);
+      $raw = 100 if $raw > 100;
+      my $pct = int($pct_base + $pct_span * $raw / 100);
       $pct = 99 if $pct > 99;
-      set_stat($id, line => "$line（$pct%）", pct => $pct);
+      set_stat($id, line => "$line（$pct%）", pct => $pct, export_pct => $pct);
     }
   }
   close $out;
@@ -4108,27 +4459,29 @@ sub sweep {
     my $created = $meta->{created} || (stat($dir))[9] || $now;
     if ($state eq 'done') {
       my $path = media_path($id);
-      if ($path) {
-        my $size = $st->{size} || -s $path || 0;
-        my $busy = active_transfers($id);
-        if (!$busy && $size && delivered_bytes($id, $size) >= $size) {
-          my $sent_at = (stat("$dir/sent"))[9] || $now;
-          if ($now - $sent_at >= $C{grace}) {
-            # 送达了：文件和这条任务记录一起删掉，网页上也不会再出现。
-            remove_tree($dir);
-            logline("已送达，删除服务器文件和任务记录 $id");
-            next;
-          }
-        } elsif (!$busy && $now - ($st->{done_at} || $created) > $C{keep_hours} * 3600) {
-          unlink $path;
-          set_stat($id, gone => "放了 $C{keep_hours} 小时没人来拿，服务器上的文件已自动删除。要的话重新贴一次链接。");
-          logline("放太久，删除服务器文件 $id");
+      my $busy = active_transfers($id);
+      my $ex = $st->{export_state} || '';
+      my $exporting = $ex eq 'queued' || $ex eq 'running';
+      my $orig_size = $st->{size} || ($path ? (-s $path || 0) : 0);
+      my $orig_full = $path && $orig_size && delivered_bytes($id, $orig_size) >= $orig_size;
+      my $ex_size = $st->{export_size} || 0;
+      my $ex_full = $ex eq 'ready' && $ex_size && delivered_bytes($id, $ex_size, 'sent-export') >= $ex_size;
+      # 浏览器把用户点的那一份完整收下以后再删。没点保存的一直留着。
+      if (!$busy && !$exporting && ($ex_full || ($orig_full && $ex ne 'ready'))) {
+        my $mark = $ex_full ? "$dir/sent-export" : "$dir/sent";
+        my $sent_at = (stat($mark))[9] || $now;
+        if ($now - $sent_at >= $C{grace}) {
+          remove_tree($dir);
+          logline("已送达，删除服务器文件和任务记录 $id");
+          next;
         }
       }
     }
-    if ($state ne 'running' && $now - $created > 86400) {
+    if ($state eq 'error' && $now - $created > 6 * 3600) {
       remove_tree($dir);
-    } elsif ($state eq 'error' && $now - $created > 6 * 3600) {
+    } elsif ($state eq 'done' && media_path($id)) {
+      # 还没保存到本地的视频不按 24 小时清掉。
+    } elsif ($state ne 'running' && $now - $created > 86400) {
       remove_tree($dir);
     }
   }
@@ -4164,6 +4517,9 @@ button.gray,.btn.gray{background:#e5e5ea;color:#1d1d1f}button.red{background:#ff
 .top{display:flex;justify-content:space-between;align-items:center}.top a{color:#666;font-size:14px}
 textarea.big{font:17px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;height:auto;min-height:56px;resize:vertical}
 .okline{color:#1b7f3b;font-weight:600}button.tiny{font-size:13px;padding:4px 10px;margin:2px 4px}
+.mask{position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;padding:16px;z-index:9}
+.mask[hidden]{display:none}.mask .card{max-width:520px;width:100%;margin:0}.mask h2{margin:0 0 8px;font-size:20px}
+.mask input[type=number]{width:120px;font-size:17px;padding:8px}
 CSS
 
 sub page_simple {
@@ -4194,7 +4550,7 @@ sub page_app {
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>存视频到 Mac</title><style>$CSS</style></head><body><main>
 <div class="top"><h1>存视频到 Mac</h1><a href="/logout">退出登录</a></div>
-<p class="sub">贴链接 → 点「开始」→ 视频（或图片）自动存进 Mac 的「下载」文件夹，传完服务器上的文件自动删掉。<br>
+<p class="sub">贴链接 → 点「开始」→ 视频先留在 VPS。点「保存到本地」才下载到你正在用的电脑，传完再删掉 VPS 上的文件。<br>
 支持 YouTube、抖音、小红书、B站、TikTok、推特/X、Instagram。App 里「分享 → 复制链接」得到的<b>整段文字</b>直接粘贴就行。</p>
 <form class="card" id="f">
 <textarea id="url" class="big" rows="2" placeholder="在这里粘贴视频链接，或整段分享文字（例如「6.99 复制打开抖音…… https://v.douyin.com/……」）" autocomplete="off" autofocus></textarea>
@@ -4205,10 +4561,11 @@ sub page_app {
 <label><input type="radio" name="q" value="m4a"> 只要声音（m4a，Mac 的「音乐」能直接放）</label>
 <label><input type="radio" name="q" value="mp3"> 只要声音（mp3）</label>
 </div>
-<div class="row"><button type="submit" id="go">开始</button><span class="small">第一次自动保存时，Safari 会问「是否允许下载」，请点「允许」。</span></div>
+<div class="row"><button type="submit" id="go">开始</button><span class="small">下好以后先留在 VPS。点保存时，Safari 第一次会问「是否允许下载」，请点「允许」。</span></div>
 <div class="msg" id="msg"></div>
 </form>
 <div class="msg" id="upg"></div>
+<div class="msg" id="disk"></div>
 <div id="jobs"></div>
 <details class="card" id="ck"><summary>被拦住了？上传 cookies（最后一招）</summary>
 <div id="ckstate" class="small"></div>
@@ -4241,15 +4598,32 @@ YouTube 年龄限制、会员视频，推特敏感内容，B站大会员视频�
 <div class="msg" id="ckmsg"></div>
 </details>
 <details class="card"><summary>常见问题</summary>
-<p><b>视频存在哪？</b> Mac 的「下载」文件夹（访达左边的「下载」）。Safari、Chrome 默认都存到这里。存好以后，网页上的那一条会显示 ✅ 然后自己消失。</p>
-<p><b>图片帖（小红书图文、推特图片）？</b> 一张图直接存成图片；好几张会打成一个 zip，在 Mac 上双击就解开。纯文字的帖子没有东西可下，网页会告诉你。</p>
-<p><b>点了开始，下好了却没有保存？</b> Safari 第一次会问「是否允许在此网站上下载」，点「允许」。Chrome 如果问「此网站想下载多个文件」，点「允许」。也可以点任务里的「保存到 Mac」按钮。</p>
-<p><b>下载到一半网断了？</b> 在浏览器的下载列表里点「继续/恢复」，会接着下，不用从头来。服务器上的文件会等你拿完再删（最多留几个小时）。</p>
+<p><b>视频存在哪？</b> 下好以后先留在 VPS。点「保存到本地」才下载到你这台电脑，位置是浏览器自己的下载文件夹（很多人设成了桌面）。浏览器完整收下以后，VPS 上的视频会删掉。网页上那一条会显示 ✅ 然后自己消失。</p>
+<p><b>压缩呢？</b> 视频旁边还有「压缩后保存到本地」和「压缩后添加水印保存到本地」。压缩按 HEVC、最大 960×540、25 帧、平均 600 kbps，声音是 44.1 kHz 立体声 AAC 64 kbps。可以选 0.1 到 5 倍速。水印用你上传的 PNG 或 JPG，自己选透明度，放在右下角。图片和纯音频不能压缩。</p>
+<p><b>图片帖（小红书图文、推特图片）？</b> 一张图直接存成图片；好几张会打成一个 zip，在电脑上双击就解开。纯文字的帖子没有东西可下，网页会告诉你。这两种只显示「保存到本地」。</p>
+<p><b>点了保存却没有文件？</b> Safari 第一次会问「是否允许在此网站上下载」，点「允许」。Chrome 如果问「此网站想下载多个文件」，点「允许」。也可以再点一次「保存到本地」或「下载压缩结果」。</p>
+<p><b>下载到一半网断了？</b> 在浏览器的下载列表里点「继续/恢复」，会接着下，不用从头来。没收完的时候，VPS 上的文件还留着。</p>
 <p><b>为什么有的要「转码」，等很久？</b> Mac 自带播放器只认 H.264。网页总是先找现成的 H.264；只有原视频只有 VP9/AV1 时才转码。这台 VPS 只有 1 核，转码大约和视频一样长甚至更久。不想等就选「最高画质」，用 IINA/VLC 播放。</p>
 <p><b>4K 视频 QuickTime 打不开？</b> 4K 一般是 VP9/AV1 格式，装一个免费的 IINA 或 VLC 就能放。想直接用 QuickTime，就选第一项。</p>
-<p><b>可以关掉网页吗？</b> 服务器下载时可以关，下好后重新打开网页，在任务里点「保存到 Mac」。</p>
+<p><b>可以关掉网页吗？</b> 服务器下载或压缩时可以关。重新打开网页，视频还在，再点保存。</p>
 </details>
 <p class="small" id="foot"></p>
+<div class="mask" id="mask" hidden>
+<div class="card">
+<h2 id="dlg-title">压缩后保存到本地</h2>
+<p>要不要改变播放速度？1 是原速，0.1 是十分之一速，5 是五倍速。声音不变调。</p>
+<label><input type="checkbox" id="dlg-speed-on"> 需要改变速度</label>
+<p>倍数 <input id="dlg-speed" type="number" min="0.1" max="5" step="0.1" value="1"></p>
+<div id="dlg-wm" hidden>
+<p>上传一张 PNG（可以透明）或 JPG。</p>
+<input type="file" id="dlg-file" accept="image/png,image/jpeg,.png,.jpg,.jpeg">
+<p>水印透明度 <input id="dlg-op" type="range" min="0" max="100" value="50"> <span id="dlg-opv">50%</span></p>
+<p class="small">水印放在画面右下角，宽度约为画面的 18%，离右边和底边约为画面宽度的 2%。</p>
+</div>
+<div class="msg" id="dlg-msg"></div>
+<div class="row"><button type="button" id="dlg-ok">开始</button><button type="button" class="gray" id="dlg-cancel">取消</button></div>
+</div>
+</div>
 </main>
 HTML
 <script>
@@ -4266,9 +4640,35 @@ $('#f').onsubmit=async e=>{e.preventDefault();const url=$('#url').value.trim();
  if(!url){say($('#msg'),'先把视频链接（或整段分享文字）粘贴到上面的框里。',1);return;}
  const q=document.querySelector('input[name=q]:checked').value;localStorage.setItem('ytw_q',q);$('#go').disabled=true;
  try{const r=await api('/api/add',{url,q});if(r.error){say($('#msg'),r.error,1);}else{mine.add(r.id);keep();$('#url').value='';
-  say($('#msg'),r.note||'收到了！下面能看到进度。下好以后会自动存到 Mac，不用一直盯着。');tick();}}
+  say($('#msg'),r.note||'收到了！下面能看到进度。下好以后先留在 VPS，点「保存到本地」才会下载到你的电脑。');tick();}}
  catch(err){say($('#msg'),'暂时连不上服务器。可能正在升级重启，等半分钟再点一次「开始」；一直不行再检查网络。',1);}finally{$('#go').disabled=false;}};
 function saveFile(id){const a=document.createElement('a');a.href='/dl/'+id;a.download='';document.body.appendChild(a);a.click();a.remove();}
+function saveExport(id){const a=document.createElement('a');a.href='/dl/'+id+'?which=export';a.download='';document.body.appendChild(a);a.click();a.remove();}
+const wantEx=load('ytw_ex'),gotEx=load('ytw_exgot');
+function keepEx(){localStorage.setItem('ytw_ex',JSON.stringify([...wantEx].slice(-60)));localStorage.setItem('ytw_exgot',JSON.stringify([...gotEx].slice(-60)));}
+let dlg={id:'',kind:'compress'};
+function openDlg(id,kind){dlg={id:id,kind:kind};$('#dlg-title').textContent=kind==='watermark'?'压缩后添加水印保存到本地':'压缩后保存到本地';$('#dlg-wm').hidden=kind!=='watermark';$('#dlg-msg').className='msg';$('#dlg-msg').textContent='';$('#mask').hidden=false;}
+$('#dlg-op').oninput=function(){$('#dlg-opv').textContent=$('#dlg-op').value+'%';};
+$('#dlg-cancel').onclick=function(){$('#mask').hidden=true;};
+$('#dlg-ok').onclick=async function(){
+ let speed='1';
+ if($('#dlg-speed-on').checked){const n=Number($('#dlg-speed').value);if(!(n>=0.1&&n<=5)){say($('#dlg-msg'),'倍数要在 0.1 到 5 之间。',1);return;}speed=String(Math.round(n*10)/10);}
+ const data={id:dlg.id,kind:dlg.kind,speed:speed};
+ if(dlg.kind==='watermark'){
+  const f=$('#dlg-file').files[0];
+  if(!f){say($('#dlg-msg'),'先选择一张 PNG 或 JPG。',1);return;}
+  const name=(f.name||'').toLowerCase();
+  if(!/\.(png|jpe?g)$/.test(name)){say($('#dlg-msg'),'只接受 PNG 或 JPG。',1);return;}
+  if(f.size>20*1024*1024){say($('#dlg-msg'),'图片不能超过 20MB。',1);return;}
+  data.opacity=$('#dlg-op').value;
+  data.image=await new Promise(function(res,rej){const r=new FileReader();r.onload=function(){res(String(r.result||''));};r.onerror=function(){rej(new Error('read'));};r.readAsDataURL(f);});
+ }
+ $('#dlg-ok').disabled=true;
+ try{const r=await api('/api/export',data);if(r.error){say($('#dlg-msg'),r.error,1);return;}wantEx.add(dlg.id);keepEx();$('#mask').hidden=true;say($('#msg'),'开始处理。好了以后会下载到你的电脑，VPS 上的视频会在传完后删掉。');}
+ catch(e){say($('#dlg-msg'),'暂时连不上服务器。等一会儿再点。',1);}
+ finally{$('#dlg-ok').disabled=false;}
+ tick();
+};
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
 // 已经存到 Mac 的：亮 1.5 秒 ✅，然后告诉服务器收起来，卡片消失。
 function dismiss(id){if(closing.has(id))return;closing.add(id);setTimeout(async()=>{try{await api('/api/dismiss',{id});}catch(e){}tick();},1500);}
@@ -4279,19 +4679,27 @@ function render(d){const box=$('#jobs');box.textContent='';
   c.appendChild(el('div','small',(j.plat?j.plat+' · ':'')+j.quality+(j.size?' · '+j.size:'')));
   if(j.state==='error'){c.appendChild(el('div','err',j.error));}
   else{c.appendChild(el('div','l'+(j.delivered?' okline':''),j.line));if(j.note)c.appendChild(el('div','small',j.note));
-   if(j.state==='running'||j.state==='queued'){const b=el('div','bar');const i=el('i');i.style.width=(j.pct||0)+'%';b.appendChild(i);c.appendChild(b);}}
+   if(j.state==='running'||j.state==='queued'||j.export_state==='running'||j.export_state==='queued'){const b=el('div','bar');const i=el('i');i.style.width=(j.pct||0)+'%';b.appendChild(i);c.appendChild(b);}}
   if(j.delivered){box.appendChild(c);dismiss(j.id);continue;}
   const row=el('div','row');
-  if(j.has_file){const b=el('button',null,'保存到 Mac');b.onclick=()=>{got.add(j.id);keep();saveFile(j.id);};row.appendChild(b);}
+  const busyEx=j.export_state==='running'||j.export_state==='queued';
+  if(j.has_file){const b=el('button',null,'保存到本地');b.onclick=function(){saveFile(j.id);};row.appendChild(b);
+   if(j.video&&!busyEx&&d.info&&d.info.compress_ok){
+    const c1=el('button',null,'压缩后保存到本地');c1.onclick=function(){openDlg(j.id,'compress');};row.appendChild(c1);
+    const c2=el('button',null,'压缩后添加水印保存到本地');c2.onclick=function(){openDlg(j.id,'watermark');};row.appendChild(c2);
+   }else if(j.video&&!busyEx&&d.info&&d.info.compress_why){row.appendChild(el('span','small',d.info.compress_why));}
+   if(j.export_state==='ready'){const b2=el('button',null,'下载压缩结果');b2.onclick=function(){gotEx.add(j.id);keepEx();saveExport(j.id);};row.appendChild(b2);}}
   if(j.hint==='cookies'){const b=el('button','gray','去上传 cookies');b.onclick=()=>{$('#ck').open=true;$('#ck').scrollIntoView({behavior:'smooth'});};row.appendChild(b);}
   if(j.state==='error'){const b=el('button','gray','再试一次');b.onclick=async()=>{const r=await api('/api/add',{url:j.url,q:j.q});if(r.id){mine.add(r.id);keep();await api('/api/delete',{id:j.id});tick();}};row.appendChild(b);}
   const del=el('button','gray',j.state==='running'?'取消':'删除');del.onclick=async()=>{await api('/api/delete',{id:j.id});tick();};row.appendChild(del);
   c.appendChild(row);box.appendChild(c);
-  if(j.state==='done'&&j.has_file&&mine.has(j.id)&&!got.has(j.id)){got.add(j.id);keep();saveFile(j.id);}}
+  if(j.export_state==='ready'&&wantEx.has(j.id)&&!gotEx.has(j.id)){gotEx.add(j.id);keepEx();saveExport(j.id);}}
  const i=d.info;let f='yt-dlp '+(i.ytdlp||'?')+(i.updated?'（'+i.updated+' 检查过更新，每天自动更新）':'（每天自动更新）');
  if(i.method)f+=' · YouTube 上次成功的办法：'+i.method;f+=' · YouTube 被拦时会依次试：'+i.methods.join(' → ');
- f+=' · 传到 Mac 后约 '+i.grace_min+' 分钟删除服务器文件，没人拿的 '+i.keep_hours+' 小时后删除';if(i.free)f+=' · 服务器硬盘剩 '+i.free;
+ f+=' · 点保存并完整传到你的电脑之后，才会删除 VPS 上的视频';if(i.free)f+=' · 服务器硬盘剩 '+i.free;
+ if(i.disk_low)f+=' · 硬盘快满了，请先保存或删除';
  $('#foot').textContent=f;
+ const disk=$('#disk');if(i.disk_low)say(disk,'服务器硬盘快满了。请先把视频保存到本地，或点删除。还没保存的视频不会被自动删掉。');else{disk.className='msg';disk.textContent='';}
  const st=$('#ckstate');st.textContent='';
  if(!i.cookie_sites.length){st.textContent='还没有上传任何 cookies。大多数时候不需要。';}
  else{st.appendChild(el('span',null,'已上传（'+i.cookies_at+' 更新）：'));
@@ -4299,7 +4707,7 @@ function render(d){const box=$('#jobs');box.textContent='';
    b.onclick=async()=>{await api('/api/cookies/delete',{plat:s.key});say($('#ckmsg'),'已删除 '+s.name+' 的 cookies。');tick();};st.appendChild(b);}
   st.appendChild(el('span',null,' 只有前面的办法都不行时才会用。'));}
  if(i.cookies_bad)$('#ck').open=true;
- return d.jobs.some(j=>j.state==='queued'||j.state==='running'||(j.state==='done'&&(j.has_file||j.delivered)));}
+ return d.jobs.some(j=>j.state==='queued'||j.state==='running'||j.export_state==='queued'||j.export_state==='running'||(j.state==='done'&&(j.has_file||j.delivered)));}
 let timer=null;
 async function tick(){clearTimeout(timer);let busy=false;try{busy=render(await api('/api/jobs'));}catch(e){}timer=setTimeout(tick,busy?1500:8000);}
 $('#ckfile').onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{$('#cktext').value=r.result;};r.readAsText(f);};
@@ -4337,10 +4745,20 @@ sub main {
   for my $id (list_jobs()) {
     my $s = job_stat($id)->{state} || '';
     fail_job($id, '服务器重启了，这个下载被打断。点「再试一次」就行。', '') if $s eq 'running';
+    my $exs = job_stat($id)->{export_state} || '';
+    if ($exs eq 'running') {
+      my $dir = job_dir($id);
+      my $f = job_stat($id)->{export_file} || '';
+      unlink "$dir/$f" if $f =~ /^[^\/\\]+$/ && $f ne '.' && $f ne '..';
+      unlink "$dir/x265.stats", "$dir/x265.stats.cutree";
+      set_stat($id, export_state => 'error', export_error => '服务器重启了，压缩被打断。可以再点一次。',
+        line => '压缩被打断了。可以再点一次。');
+    }
   }
   my $sel = IO::Select->new(@ls);
   my %handlers;
   my ($runner, $runner_job) = (0, '');
+  my ($encoder, $encoder_job) = (0, '');
   my $last_sweep = 0;
   my $stop = 0;
   $SIG{TERM} = $SIG{INT} = sub { $stop = 1; };
@@ -4369,6 +4787,7 @@ sub main {
     while ((my $k = waitpid(-1, WNOHANG)) > 0) {
       delete $handlers{$k};
       if ($k == $runner) { $runner = 0; $runner_job = ''; }
+      if ($k == $encoder) { $encoder = 0; $encoder_job = ''; }
     }
     # 每天的 yt-dlp 更新也在这里排队：和下载是同一个「跑腿」进程一件一件做，
     # 所以更新时一定没有视频在下，不会把 yt-dlp 换掉在正在下的任务脚下。
@@ -4392,6 +4811,28 @@ sub main {
         }
       }
     }
+    # 压缩和水印单独排队，一次只压一个，免得小机器同时跑两份 HEVC。
+    if (!$encoder && !upgrading()) {
+      my ($exp) = grep {
+        my $s = job_stat($_);
+        ($s->{state} || '') eq 'done' && ($s->{export_state} || '') eq 'queued';
+      } list_jobs();
+      if ($exp) {
+        set_stat($exp, export_state => 'running', line => '正在压缩…', export_pct => 0);
+        my $pid = fork();
+        if (!defined $pid) {
+          set_stat($exp, export_state => 'queued', line => '排队压缩，马上开始…');
+        } elsif ($pid == 0) {
+          $SIG{TERM} = $SIG{INT} = \&runner_stop;
+          close $_ for @ls;
+          eval { run_export($exp) };
+          set_stat($exp, export_state => 'error', export_error => "出错了：$@", line => '压缩没成功。原视频还在。') if $@;
+          POSIX::_exit(0);
+        } else {
+          ($encoder, $encoder_job) = ($pid, $exp);
+        }
+      }
+    }
     if (time - $last_sweep >= ($C{sweep_secs} || 30)) {
       $last_sweep = time;
       eval { sweep() };
@@ -4400,6 +4841,7 @@ sub main {
   }
   logline('收到停止信号，正在退出');
   kill 'TERM', $runner if $runner;
+  kill 'TERM', $encoder if $encoder;
   kill 'TERM', keys %handlers;
   exit 0;
 }
@@ -5301,9 +5743,10 @@ print_how_to_use() {
   printf '\n%s\n' "怎么用："
   printf '%s\n' "  1. 登录后，把视频链接粘贴到框里，点「开始」。"
   printf '%s\n' "     支持 YouTube、抖音、小红书、B站、TikTok、推特、IG，可以直接粘 App 里复制的整段分享文字。"
-  printf '%s\n' "  2. 等进度走完，视频（或图片）会自动存进 Mac 的「下载」文件夹。"
-  printf '%s\n' "     Safari 第一次会问「是否允许下载」，点「允许」。"
-  printf '%s\n' "  3. 传完以后 VPS 上的文件会自动删掉，不用管。"
+  printf '%s\n' "  2. 等进度走完，视频先留在 VPS，不会自动下载到你的电脑。"
+  printf '%s\n' "     点「保存到本地」才开始下载。Safari 第一次会问「是否允许下载」，点「允许」。"
+  printf '%s\n' "     视频还可以点「压缩后保存到本地」，或「压缩后添加水印保存到本地」。"
+  printf '%s\n' "  3. 浏览器把文件完整收下以后，VPS 上的视频会删掉。"
   printf '%s\n' "  被网站拦住时，网页会自动换办法（IPv6/IPv4、WARP 等）；实在不行会用中文告诉你上传哪个平台的 cookies。"
   printf '\n%s\n' "以后再运行一次安装命令，或者输入 ytdlp-web ，直接回车就是更新到最新版本。"
   printf '%s\n' "查看：ytdlp-web --status    运行记录：ytdlp-web --log    换密码：ytdlp-web --reset-password    卸载：ytdlp-web --uninstall"
@@ -5365,7 +5808,7 @@ do_install() {
     MIGRATE=1
     say_step "这台 VPS 装的是旧版"
     printf '%s\n' "旧版是先把视频下到 VPS，你再自己存回 Mac。"
-    printf '%s\n' "新版：贴链接以后视频自动存进 Mac 的「下载」文件夹，VPS 上自动删掉。"
+    printf '%s\n' "新版：视频先留在 VPS，点保存才下载到你的电脑，传完再删。"
     printf '%s\n' "  1) 升级到新版，端口和密码不变（推荐）"
     printf '%s\n' "  2) 升级到新版，重新回答问题"
     ask_menu MIGRATE_CHOICE 1 2
@@ -5430,6 +5873,9 @@ do_install() {
   mkdir -p "$CONF_DIR" "$DATA"
   chmod 700 "$CONF_DIR"
   ff=$(command -v ffmpeg 2>/dev/null || true)
+  if [ -x /usr/local/bin/ffmpeg ] && /usr/local/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx265; then
+    ff=/usr/local/bin/ffmpeg
+  fi
   [ -n "$JS_RUNTIME" ] || JS_RUNTIME=$(js_runtime_value quickjs /usr/local/bin/qjs)
   port=$PORT_CHOSEN
   write_config "$CONF_FILE" "$port" "$(listen_for_open "$OPEN_CHOSEN")" "$user" "$hash" "$DATA" \
