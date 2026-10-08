@@ -62,7 +62,11 @@ check no-login "$($C -o /dev/null -w '%{http_code}' "$B/api/jobs")" 401
 $C -c "$J" -d 'user=admin&pass=wrong' "$B/login" > "$T/r"
 has login-wrong "$(cat "$T/r")" '不对'
 check login-ok "$($C -c "$J" -o /dev/null -w '%{http_code}' -d 'user=admin&pass=testpass1' "$B/login")" 302
-has page "$($C -b "$J" "$B/")" '保存到 Mac'
+page=$($C -b "$J" "$B/")
+has page "$page" '保存到本地'
+has page-compress "$page" '压缩后保存到本地'
+has page-wm "$page" '压缩后添加水印保存到本地'
+if printf '%s' "$page" | grep -q '下好以后会自动存到 Mac'; then bad page-no-auto; else ok page-no-auto; fi
 check need-header "$($C -b "$J" -o /dev/null -w '%{http_code}' -d 'url=x' "$B/api/add")" 403
 
 add() { $C -b "$J" -H 'X-YTW: 1' --data-urlencode "url=$1" -d "q=${2:-mac}" "$B/api/add"; }
@@ -90,6 +94,8 @@ id=$(add 'https://www.youtube.com/watch?v=okokokokoko' | job_id)
 js=$(wait_job "$id")
 has 'done' "$js" '"state":"done"'
 has has-file "$js" '"has_file":true'
+has stays "$js" '已留在 VPS'
+has not-pushed "$js" '"delivered":false'
 (cd "$T/mac" && $C -b "$J" -D "$T/headers" -OJ "$B/dl/$id")
 f=$(ls "$T/mac")
 # 浏览器认 filename*= 里的中文名；curl 只认 filename=，所以存成英文的备用名。
@@ -98,7 +104,7 @@ check size "$(wc -c < "$T/mac/$f" | tr -d ' ')" 3145728
 check range-416 "$($C -b "$J" -o /dev/null -w '%{http_code}' -r 99999999- "$B/dl/$id")" 416
 
 # 送达以后：网页说收起来，列表里就没有它了
-has delivered "$($C -b "$J" "$B/api/jobs")" '已存到 Mac'
+has delivered "$($C -b "$J" "$B/api/jobs")" '已存到你的电脑'
 has dismiss "$($C -b "$J" -H 'X-YTW: 1' -d "id=$id" "$B/api/dismiss")" '"ok":true'
 if $C -b "$J" "$B/api/jobs" | grep -q "\"id\":\"$id\""; then bad hidden-after-dismiss; else ok hidden-after-dismiss; fi
 # 送达以后自动删（文件和任务记录一起删）
@@ -141,13 +147,61 @@ has gone "$(wait_job "$(add 'https://www.youtube.com/watch?v=gonegonegon' | job_
 has ck-json "$($C -b "$J" -H 'X-YTW: 1' --data-urlencode 'text=[{"name":"a"}]' "$B/api/cookies")" 'error'
 printf '.youtube.com\tTRUE\t/\tTRUE\t2000000000\tSID\tabc\n' > "$T/ck"
 has ck-ok "$($C -b "$J" -H 'X-YTW: 1' --data-urlencode "text@$T/ck" "$B/api/cookies")" '"ok":true'
-check ck-mode "$(stat -c %a "$T/cookies.txt")" 600
+check ck-mode "$(stat -c %a "$T/cookies.txt" 2>/dev/null || stat -f %OLp "$T/cookies.txt")" 600
 check ck-header "$(head -n 1 "$T/cookies.txt")" '# Netscape HTTP Cookie File'
 
 # 有了 cookies，被拦的视频能下了，并且记住这个办法
 id=$(add 'https://www.youtube.com/watch?v=botbotbotb2' | job_id)
 has bot-cookies "$(wait_job "$id")" '"state":"done"'
 has sticky "$(cat "$T/data/state/sticky" 2>/dev/null)" 'cookies'
+
+# 压缩：问过倍速以后在 VPS 上压，再下载，收完才删
+id=$(add 'https://www.youtube.com/watch?v=compress0001' | job_id)
+js=$(wait_job "$id")
+has compress-ready "$js" '已留在 VPS'
+has compress-can "$($C -b "$J" "$B/api/jobs")" '"compress_ok":true'
+has bad-speed "$($C -b "$J" -H 'X-YTW: 1' -d "id=$id&kind=compress&speed=9" "$B/api/export")" '0.1'
+has export-ok "$($C -b "$J" -H 'X-YTW: 1' -d "id=$id&kind=compress&speed=2" "$B/api/export")" '"ok":true'
+n=0
+while [ "$n" -lt 80 ]; do
+  js=$($C -b "$J" "$B/api/jobs" | perl -ne 'while(/(\{"[^{}]*?"id":"'"$id"'"[^{}]*\})/g){print $1}')
+  case "$js" in
+    *'"export_state":"ready"'*|*'"export_state":"error"'*) break ;;
+  esac
+  n=$((n + 1))
+  sleep 0.3
+done
+has export-state "$js" '"export_state":"ready"'
+has export-x265 "$(cat "$T/calls.log")" 'libx265'
+has export-bitrate "$(cat "$T/calls.log")" '600k'
+has export-tag "$(cat "$T/calls.log")" 'hvc1'
+has export-speed "$(cat "$T/calls.log")" 'atempo=2.0000'
+has export-scale "$(cat "$T/calls.log")" 'scale=min(960'
+rm -rf "$T/out" && mkdir -p "$T/out"
+(cd "$T/out" && $C -b "$J" -OJ "$B/dl/$id?which=export")
+check export-size "$(wc -c < "$T/out/$(ls "$T/out" | head -n 1)" | tr -d ' ')" 3145728
+n=0
+while [ -d "$T/data/jobs/$id" ] && [ "$n" -lt 40 ]; do sleep 0.5; n=$((n + 1)); done
+if [ -d "$T/data/jobs/$id" ]; then bad export-delete; else ok export-delete; fi
+
+# 水印：坏图拒绝；PNG 收下，命令里带透明度
+id=$(add 'https://www.youtube.com/watch?v=watermark001' | job_id)
+wait_job "$id" > /dev/null
+has wm-bad "$($C -b "$J" -H 'X-YTW: 1' --data-urlencode "id=$id" --data-urlencode 'kind=watermark' --data-urlencode 'speed=1' --data-urlencode 'opacity=40' --data-urlencode 'image=aaaa' "$B/api/export")" 'PNG'
+png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+has wm-ok "$($C -b "$J" -H 'X-YTW: 1' --data-urlencode "id=$id" --data-urlencode 'kind=watermark' --data-urlencode 'speed=1' --data-urlencode 'opacity=40' --data-urlencode "image=data:image/png;base64,$png" "$B/api/export")" '"ok":true'
+n=0
+while [ "$n" -lt 80 ]; do
+  js=$($C -b "$J" "$B/api/jobs" | perl -ne 'while(/(\{"[^{}]*?"id":"'"$id"'"[^{}]*\})/g){print $1}')
+  case "$js" in
+    *'"export_state":"ready"'*|*'"export_state":"error"'*) break ;;
+  esac
+  n=$((n + 1))
+  sleep 0.3
+done
+has wm-state "$js" '"export_state":"ready"'
+has wm-alpha "$(cat "$T/calls.log")" 'colorchannelmixer=aa=0.4000'
+has wm-place "$(cat "$T/calls.log")" 'scale2ref=w=main_w\*0.18'
 
 # 删任务
 id2=$(add 'https://www.youtube.com/watch?v=delete00001' | job_id)
@@ -227,7 +281,7 @@ r=$(add 'https://www.youtube.com/watch?v=upgradewait')
 has upg-note "$r" '服务器正在升级'
 id=$(printf '%s' "$r" | job_id)
 # 每天的 yt-dlp 更新到点了也先不做
-sed -i 's/^last_update=.*/last_update=1/' "$T/data/state/info"
+sed 's/^last_update=.*/last_update=1/' "$T/data/state/info" > "$T/data/state/info.new" && mv "$T/data/state/info.new" "$T/data/state/info"
 nu=$(grep -c '检查 yt-dlp 更新' "$T/server.log")
 sleep 2.5
 check upg-no-update "$(grep -c '检查 yt-dlp 更新' "$T/server.log")" "$nu"

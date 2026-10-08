@@ -106,7 +106,7 @@ check newer "$(yes_no x version_newer 2.0.1 2.0.0)" yes
 check newer-equal "$(yes_no x version_newer 2.0.0 2.0.0)" no
 check newer-major "$(yes_no x version_newer 2.0.0 1.9.9)" yes
 check ver-file "$(version_from_file ./install.sh)" "$VERSION"
-check ver-212 "$VERSION" 2.1.2
+check ver-220 "$VERSION" 2.2.0
 check newer-211 "$(yes_no x version_newer 2.1.1 2.1.0)" yes
 # 网页服务里的版本号要和脚本一致（网页 /health 会显示它）
 check ver-server "$(sed -n "s/^my \$VERSION = '\(.*\)';/\1/p" install.sh)" "$VERSION"
@@ -168,7 +168,7 @@ srv=$tmpd/server.pl
 write_config "$cfg" 15346 0.0.0.0 admin '$6$salt$abc' /var/lib/ytdlp-web /usr/local/bin/yt-dlp '' '' '' '' '' 1 1
 check ready-yes "$(SERVER_FILE=$srv CONF_FILE=$cfg; yes_no x install_ready)" yes
 check ready-noserver "$(SERVER_FILE=$tmpd/none CONF_FILE=$cfg; yes_no x install_ready)" no
-sed -i 's/^pass_hash=.*/pass_hash=plain/' "$cfg"
+sed 's/^pass_hash=.*/pass_hash=plain/' "$cfg" > "$cfg.new" && mv "$cfg.new" "$cfg"
 check ready-badhash "$(SERVER_FILE=$srv CONF_FILE=$cfg; yes_no x install_ready)" no
 write_config "$cfg" 15346 127.0.0.1 xiaoming '$6$salt$abc' /var/lib/ytdlp-web /usr/local/bin/yt-dlp '' '' '' '' '' 2 0
 printf 'username=xiaoming\npassword=SecretPw1\nport=15346\n' > "$tmpd/note"
