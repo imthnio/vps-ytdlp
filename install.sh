@@ -33,7 +33,7 @@
 #   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=2.2.1
+VERSION=2.2.2
 # ytdlp-onekey-begin
 
 #----------------------------------------------------------------------
@@ -1306,7 +1306,17 @@ prepare_memory() {
       { printf 'vm.overcommit_memory=1\nvm.swappiness=100\n' > /etc/sysctl.d/99-ytdlp-web-overcommit.conf; } 2>/dev/null || true
     fi
   fi
-  plan=$(swap_plan_mb "${MEM_MB:-0}" "${SWAP_MB:-0}" "${DISK_MB:-0}")
+  # 上次装的时候做的虚拟内存还挂着：它会被重做，不能算进「已经有的」，它占的硬盘也算可用。
+  own_mb=$(awk -v f="$SWAP_FILE" '$1==f {print int($3/1024)}' /proc/swaps 2>/dev/null | head -n 1)
+  case "$own_mb" in ''|*[!0-9]*) own_mb=0 ;; esac
+  other_swap=$(( ${SWAP_MB:-0} - own_mb ))
+  [ "$other_swap" -ge 0 ] || other_swap=0
+  plan=$(swap_plan_mb "${MEM_MB:-0}" "$other_swap" "$(( ${DISK_MB:-0} + own_mb ))")
+  # 已经够大了就留着，更新时不用把几百 MB 再写一遍（64MB 的鸡写一次要好几分钟）。
+  if [ "$own_mb" -gt 0 ] && [ "$own_mb" -ge $((plan - 63)) ]; then
+    say_ok "虚拟内存已经有了（${own_mb}MB），不用重做"
+    return 0
+  fi
   if [ "$plan" -eq 0 ]; then
     if [ -n "$MEM_MB" ] && [ "$MEM_MB" -lt 256 ] && [ "${SWAP_MB:-0}" -lt 64 ]; then
       say_warn "内存大约 ${MEM_MB}MB，磁盘只剩 ${DISK_MB}MB，腾不出虚拟内存。安装会继续，下载视频时有可能被系统杀掉。"
@@ -1340,7 +1350,7 @@ prepare_memory() {
     fstab_append_line /etc/fstab "$SWAP_FILE none swap sw 0 0"
     mkdir -p "$CONF_DIR"
     printf '%s\n' "$plan" > "$CONF_DIR/swap.size"
-    SWAP_MB=$((SWAP_MB + plan))
+    SWAP_MB=$((other_swap + plan))
     DISK_MB=$(disk_free_mb /)
     say_ok "虚拟内存已打开（${plan}MB），重启后也会自动挂上"
   else
@@ -1553,8 +1563,8 @@ ensure_libx265() {
     say_ok "ffmpeg 可以压 HEVC（libx265），网页上的压缩按钮可以用"
     return 0
   fi
-  if [ -n "${MEM_MB:-}" ] && [ "$MEM_MB" -le 128 ]; then
-    say_warn "ffmpeg 没有 HEVC 编码器（libx265）。内存大约 ${MEM_MB}MB，不换静态版。网页上只能「保存到本地」。"
+  if mem_too_small_for_static; then
+    say_warn "ffmpeg 没有 HEVC 编码器（libx265）。内存大约 ${MEM_MB}MB、虚拟内存 ${SWAP_MB:-0}MB，不换静态版。网页上只能「保存到本地」。"
     return 0
   fi
   if [ -z "$bin" ]; then
@@ -1568,6 +1578,12 @@ ensure_libx265() {
   fi
   say_warn "ffmpeg 没有 libx265。网页上的压缩和水印用不了，「保存到本地」仍然可以。"
   return 0
+}
+
+# 内存加虚拟内存不到 384MB 时，不解压 40MB 的静态 ffmpeg。64MB 的鸡做好虚拟内存以后可以。
+mem_too_small_for_static() {
+  [ -n "${MEM_MB:-}" ] || return 1
+  [ $((MEM_MB + ${SWAP_MB:-0})) -lt 384 ]
 }
 
 ensure_ffmpeg() {
@@ -1593,8 +1609,8 @@ ensure_ffmpeg() {
     ensure_libx265
     return 0
   fi
-  # 40MB 的静态包在 128MB 及以下会把后面的安装一起打死。
-  if [ -n "${MEM_MB:-}" ] && [ "$MEM_MB" -le 128 ]; then
+  # 40MB 的静态包在没有虚拟内存的 128MB 小鸡上会把后面的安装一起打死。
+  if mem_too_small_for_static; then
     say_warn "内存大约 ${MEM_MB}MB，软件源里的 ffmpeg 没装上。高画质合并会失败。"
     return 0
   fi
@@ -2401,7 +2417,7 @@ use POSIX qw(:sys_wait_h setsid strftime setlocale LC_ALL);
 use Fcntl qw(:flock O_WRONLY O_CREAT O_APPEND);
 use File::Path qw(make_path remove_tree);
 
-my $VERSION = '2.2.1';
+my $VERSION = '2.2.2';
 setlocale(LC_ALL, 'C');
 $SIG{PIPE} = 'IGNORE';
 
@@ -2654,11 +2670,17 @@ sub read_request {
   };
   my $len = $h{'content-length'} || 0;
   if ($len =~ /^\d+$/ && $len > 0) {
-    # 水印图最大 20MB。表单里是 base64，再被百分号编码，体积会胀到大约 45MB。
-    my $max = ($path eq '/api/export') ? 56 * 1024 * 1024 : 2 * 1024 * 1024;
+    # 水印图（最大 20MB）按原样二进制发过来，先不读，登录检查过以后直接一段段写进硬盘。
+    # 64MB 的小鸡放不下几十 MB 的请求体，所以不能整个读进内存。
+    my $raw = $path eq '/api/export' && ($h{'content-type'} || '') =~ m{^application/octet-stream}i;
+    my $max = $raw ? 20 * 1024 * 1024 + 4096 : 2 * 1024 * 1024;
     return { %$r, too_big => 1 } if $len > $max;
+    if ($raw) {
+      @$r{qw(raw raw_len raw_rest)} = (1, $len + 0, $rest);
+      return $r;
+    }
     my $body = $rest;
-    my $body_deadline = time + ($len > 2 * 1024 * 1024 ? 180 : 30);
+    my $body_deadline = time + 30;
     while (length($body) < $len) {
       my $left = $body_deadline - time;
       return undef if $left <= 0;
@@ -2669,6 +2691,33 @@ sub read_request {
     $r->{body} = substr($body, 0, $len);
   }
   return $r;
+}
+
+# 把还没读的二进制请求体一段段写进文件，内存里最多放 64KB。
+sub read_body_to_file {
+  my ($c, $r, $file) = @_;
+  open(my $fh, '>', $file) or return 0;
+  binmode $fh;
+  my $len = $r->{raw_len};
+  my $got = length $r->{raw_rest};
+  $got = $len if $got > $len;
+  print $fh substr($r->{raw_rest}, 0, $got);
+  $r->{raw_rest} = '';
+  my $sel = IO::Select->new($c);
+  my $deadline = time + 300;
+  while ($got < $len) {
+    my $left = $deadline - time;
+    return 0 if $left <= 0 || !$sel->can_read($left);
+    my $want = $len - $got;
+    $want = 65536 if $want > 65536;
+    my $buf;
+    my $n = sysread($c, $buf, $want);
+    return 0 unless $n;
+    print $fh $buf or return 0;
+    $got += $n;
+  }
+  close $fh or return 0;
+  return 1;
 }
 
 # 一直写，直到全部写完。浏览器 2 分钟都不收数据，就当它走了。
@@ -2939,6 +2988,25 @@ sub delivered_bytes {
   return $total;
 }
 
+# 用户点的那一份是不是已经完整送到。返回送达记录文件（sent 或 sent-export），没送达返回空。
+#   压缩结果收完：算送达。
+#   原视频收完：没在压缩、也没有等着拿的压缩结果，或者原视频是在压缩好以后才拿的，算送达。
+sub delivered_mark {
+  my ($id, $st) = @_;
+  $st ||= job_stat($id);
+  return '' unless ($st->{state} || '') eq 'done';
+  my $dir = job_dir($id);
+  my $ex = $st->{export_state} || '';
+  my $ex_size = $st->{export_size} || 0;
+  return "$dir/sent-export" if $ex eq 'ready' && $ex_size && delivered_bytes($id, $ex_size, 'sent-export') >= $ex_size;
+  return '' if $ex eq 'queued' || $ex eq 'running';
+  my $size = $st->{size} || 0;
+  return '' unless $size && delivered_bytes($id, $size) >= $size;
+  return "$dir/sent" if $ex ne 'ready';
+  my $sent_at = (stat("$dir/sent"))[9] || 0;
+  return ($sent_at >= ($st->{export_done_at} || 0)) ? "$dir/sent" : '';
+}
+
 sub active_transfers {
   my ($id) = @_;
   my $dir = job_dir($id);
@@ -2993,7 +3061,19 @@ sub ffmpeg_encoder_ok {
 
 sub mem_total_mb {
   my $t = slurp('/proc/meminfo') || '';
-  return int($1 / 1024) if $t =~ /MemTotal:\s+(\d+)\s+kB/;
+  # 容器里 /proc/meminfo 是宿主机的，真正的上限写在 cgroup 里。
+  my $cg = -1;
+  for my $f ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes') {
+    my $v = slurp($f);
+    next unless defined $v && $v =~ /^(\d{7,12})\s*$/;
+    $cg = int($1 / 1048576);
+    last;
+  }
+  if ($t =~ /MemTotal:\s+(\d+)\s+kB/) {
+    my $m = int($1 / 1024);
+    return ($cg > 0 && $cg < $m) ? $cg : $m;
+  }
+  return $cg if $cg > 0;
   if (open(my $fh, '-|', 'sysctl', '-n', 'hw.memsize')) {
     my $b = <$fh>;
     close $fh;
@@ -3011,9 +3091,17 @@ sub compress_note {
   return $low ? '内存很小，压缩会慢一些，但可以压。' : '';
 }
 
+# 256MB 及以下的小鸡：下载和压缩不同时跑，一次只做一件事，免得 yt-dlp 和 HEVC 编码一起把内存打满。
+my $ONE_AT_A_TIME;
+sub one_at_a_time {
+  $ONE_AT_A_TIME = do { my $t = mem_total_mb(); ($t >= 0 && $t <= 256) ? 1 : 0 } unless defined $ONE_AT_A_TIME;
+  return $ONE_AT_A_TIME;
+}
+
 sub compress_block_reason {
   return '服务器上的 ffmpeg 不能压 HEVC（没有 libx265）。请先点「保存到本地」。' unless ffmpeg_encoder_ok();
-  my $free = disk_free_mb($DATA);
+  my ($free) = @_;
+  $free = disk_free_mb($DATA) unless defined $free;
   return "服务器硬盘只剩 ${free}MB，放不下压缩出来的文件。请先保存或删除已有视频。" if $free >= 0 && $free < $C{min_free_mb};
   return '';
 }
@@ -3094,6 +3182,22 @@ sub decode_watermark {
   return ($bin, 'png') if length($bin) >= 8 && substr($bin, 0, 8) eq "\x89PNG\r\n\x1a\n";
   return ($bin, 'jpg') if length($bin) >= 3 && substr($bin, 0, 3) eq "\xff\xd8\xff";
   return (undef, '只接受 PNG 或 JPG。');
+}
+
+# 看文件开头几个字节，认出 PNG 或 JPG。返回 (扩展名, 错误)。
+sub watermark_file_kind {
+  my ($f) = @_;
+  my $size = -s $f || 0;
+  return ('', '水印图片是空的。请换一张 PNG 或 JPG。') unless $size;
+  return ('', '水印图片不能超过 20MB。') if $size > 20 * 1024 * 1024;
+  open(my $fh, '<', $f) or return ('', '水印图写不进服务器。');
+  binmode $fh;
+  my $head = '';
+  read($fh, $head, 8);
+  close $fh;
+  return ('png', '') if $head eq "\x89PNG\r\n\x1a\n";
+  return ('jpg', '') if substr($head, 0, 3) eq "\xff\xd8\xff";
+  return ('', '只接受 PNG 或 JPG。');
 }
 
 sub parse_speed {
@@ -3183,8 +3287,9 @@ sub run_export {
   my $aa = sprintf('%.4f', $op / 100);
   my $fc = '';
   if ($kind eq 'watermark') {
+    # scale2ref 里 main_w/mdar 是水印自己，iw 才是画面。宽 = 画面宽的 18%，高按水印原比例。
     $fc = "[0:v]${vchain}[base];[1:v]format=rgba,colorchannelmixer=aa=${aa}[lg];"
-      . '[lg][base]scale2ref=w=main_w*0.18:h=ow/mdar[wm][base2];'
+      . '[lg][base]scale2ref=w=iw*0.18:h=ow/mdar[wm][base2];'
       . '[base2][wm]overlay=main_w-overlay_w-main_w*0.02:main_h-overlay_h-main_w*0.02:format=auto,format=yuv420p[v]';
   }
   # 单线程解码和滤镜，64MB 的鸡才不会一上来就被线程缓冲撑死。
@@ -3227,7 +3332,7 @@ sub run_export {
     return;
   }
   my $size = -s "$dir/$out";
-  set_stat($id, export_state => 'ready', export_file => $out, export_size => $size, export_pct => 100, pct => 100,
+  set_stat($id, export_state => 'ready', export_file => $out, export_size => $size, export_done_at => time, export_pct => 100, pct => 100,
     export_error => '', line => '压缩好了，正在交给浏览器保存到你的电脑…');
   logline("任务 $id 压缩好了：$out " . human_size($size));
 }
@@ -3244,18 +3349,19 @@ sub job_view {
   my $ex = $st->{export_state} || '';
   my $ex_size = $st->{export_size} || 0;
   my $ex_sent = ($ex eq 'ready' && $ex_size) ? delivered_bytes($id, $ex_size, 'sent-export') : 0;
-  my $ex_full = ($ex eq 'ready' && $ex_size && $ex_sent >= $ex_size) ? 1 : 0;
-  my $orig_full = ($state eq 'done' && $size && $sent >= $size) ? 1 : 0;
-  my $hold = ($ex eq 'queued' || $ex eq 'running' || ($ex eq 'ready' && !$ex_full)) ? 1 : 0;
-  my $delivered = ($ex_full || ($orig_full && !$hold)) ? 1 : 0;
-  my $mark = $ex_full ? (job_dir($id) . '/sent-export') : (job_dir($id) . '/sent');
+  my $mark = delivered_mark($id, $st);
+  my $delivered = $mark ? 1 : 0;
   my $sent_at = $delivered ? ((stat($mark))[9] || 0) : 0;
   my $hidden = $st->{dismissed} || ($delivered && time - $sent_at > 15) ? 1 : 0;
   if ($state eq 'queued') {
-    $line = upgrading() ? '服务器正在升级，等一会儿会自动开始' : '排队中，前面的下完就轮到它';
+    $line = upgrading() ? '服务器正在升级，等一会儿会自动开始'
+      : (one_at_a_time() && export_busy_id()) ? '排队中。小内存机器一次只做一件事，等正在压缩的视频压完就开始下载'
+      : '排队中，前面的下完就轮到它';
   } elsif ($state eq 'done') {
     if ($delivered) {
       $line = '✅ 已存到你的电脑';
+    } elsif ($ex eq 'queued' && one_at_a_time() && grep { (job_stat($_)->{state} || '') eq 'running' } list_jobs()) {
+      $line = '排队压缩。小内存机器一次只做一件事，等正在下载的视频下完就开始压缩';
     } elsif ($ex eq 'running' || $ex eq 'queued') {
       $line = $st->{line} || '正在压缩…';
     } elsif ($ex eq 'error') {
@@ -3290,6 +3396,8 @@ sub job_view {
     video   => bool(is_video_name($st->{file} || '')),
     delivered => bool($delivered),
     export_state => $ex,
+    export_kind => $st->{export_kind} || '',
+    export_wait => ($ex eq "running" && $st->{export_started}) ? human_secs(time - $st->{export_started}) : "",
     export_error => $st->{export_error} || '',
     error   => $st->{error} || '',
     hint    => $st->{hint} || '',
@@ -3562,7 +3670,10 @@ sub handle {
   return unless $r;
   my $p = $r->{path};
   my $m = $r->{method};
-  return respond($c, $r, 413, 'text/plain; charset=utf-8', "too big\n") if $r->{too_big};
+  if ($r->{too_big}) {
+    return respond_json($c, $r, 413, { error => '上传的东西太大了。水印图不能超过 20MB。' }) if $p =~ m{^/api/};
+    return respond($c, $r, 413, 'text/plain; charset=utf-8', "too big\n");
+  }
 
   if ($p eq '/health') {
     return respond($c, $r, 200, 'text/plain; charset=utf-8', "ytdlp-web ok $VERSION\n");
@@ -3609,7 +3720,13 @@ sub handle {
   # 改东西的请求必须带上网页自己加的暗号，别的网站骗不了你的浏览器来下单。
   if ($m eq 'POST' && $p =~ m{^/api/}) {
     return respond_json($c, $r, 403, { error => '请刷新网页再试一次' }) unless ($r->{headers}{'x-ytw'} || '') eq '1';
-    my $f = parse_form($r->{body});
+    # 二进制上传（水印图）：参数在网址里，图片本身直接写进硬盘。
+    if ($r->{raw}) {
+      my $up = "$DATA/tmp/upload.$$";
+      return respond_json($c, $r, 200, { error => '水印图没有传完整，请再点一次。' }) unless read_body_to_file($c, $r, $up);
+      $r->{body_file} = $up;
+    }
+    my $f = $r->{raw} ? $r->{query} : parse_form($r->{body});
     if ($p eq '/api/add') {
       my ($id, $why) = add_job($f->{url}, $f->{q});
       my %ok = (ok => bool(1), id => $id);
@@ -3635,11 +3752,7 @@ sub handle {
       # 网页说「这个已经存到电脑了，收起来吧」。只收已经送达的。
       my $id = $f->{id};
       return respond_json($c, $r, 404, { error => '没有这个任务' }) unless valid_id($id) && -d job_dir($id);
-      my $st = job_stat($id);
-      my $orig_ok = ($st->{state} || '') eq 'done' && $st->{size} && delivered_bytes($id, $st->{size}) >= $st->{size};
-      my $ex_ok = ($st->{export_state} || '') eq 'ready' && $st->{export_size}
-        && delivered_bytes($id, $st->{export_size}, 'sent-export') >= $st->{export_size};
-      return respond_json($c, $r, 200, { error => '还没传完' }) unless $orig_ok || $ex_ok;
+      return respond_json($c, $r, 200, { error => '还没传完' }) unless delivered_mark($id);
       set_stat($id, dismissed => 1);
       return respond_json($c, $r, 200, { ok => bool(1) });
     }
@@ -3666,16 +3779,24 @@ sub handle {
         $op = '50' unless defined $op && length $op;
         return respond_json($c, $r, 200, { error => '透明度要在 0 到 100 之间。' }) unless $op =~ /^\d+$/ && $op <= 100;
         $opacity = $op + 0;
-        my ($bin, $ext) = decode_watermark($f->{image});
-        return respond_json($c, $r, 200, { error => $ext }) unless defined $bin;
-        my $wf = job_dir($id) . '/watermark.' . $ext;
-        return respond_json($c, $r, 200, { error => '水印图写不进服务器。' }) unless write_bin($wf, $bin);
+        my $up = $r->{body_file};
+        unless ($up) {
+          # 旧的表单方式（base64）仍然认，只用于小图。
+          my ($bin, $why) = decode_watermark($f->{image});
+          return respond_json($c, $r, 200, { error => $why }) unless defined $bin;
+          $up = "$DATA/tmp/upload.$$";
+          return respond_json($c, $r, 200, { error => '水印图写不进服务器。' }) unless write_bin($up, $bin);
+        }
+        my ($ext, $why) = watermark_file_kind($up);
+        return respond_json($c, $r, 200, { error => $why }) if $why;
+        return respond_json($c, $r, 200, { error => '水印图写不进服务器。' })
+          unless rename($up, job_dir($id) . '/watermark.' . $ext);
       }
       my $old = $st->{export_file} || '';
       unlink job_dir($id) . "/$old" if $old =~ /^[^\/\\]+$/ && $old ne '.' && $old ne '..';
       unlink job_dir($id) . '/sent-export', job_dir($id) . '/x265.stats', job_dir($id) . '/x265.stats.cutree';
       set_stat($id, export_state => 'queued', export_kind => $kind, export_speed => $speed, export_opacity => $opacity,
-        export_file => '', export_size => 0, export_pct => 0, export_error => '', pct => 0,
+        export_file => '', export_size => 0, export_done_at => 0, export_pct => 0, export_error => '', pct => 0,
         line => '排队压缩，马上开始…');
       logline("任务 $id 排队压缩 kind=$kind speed=$speed opacity=$opacity");
       return respond_json($c, $r, 200, { ok => bool(1) });
@@ -3705,6 +3826,8 @@ sub server_info {
   my $cp = cookie_plats();
   my @sites = map { { key => $_->{key}, name => $_->{name}, bad => bool(-e cookies_bad_file($_->{key})) } }
     grep { $cp->{ $_->{key} } } @PLATFORMS;
+  my $free = disk_free_mb($DATA);
+  my $block = compress_block_reason($free);
   return {
     ytdlp      => $st->{ytdlp_version} || '',
     updated    => $st->{last_update_text} || '',
@@ -3717,10 +3840,10 @@ sub server_info {
     plugins    => bool($C{plugins} && -d $C{plugins}),
     keep_hours => num($C{keep_hours}),
     grace_min  => num(int(($C{grace} + 59) / 60)),
-    free       => disk_free_mb($DATA) >= 0 ? human_size(disk_free_mb($DATA) * 1048576) : '',
-    disk_low   => bool(disk_free_mb($DATA) >= 0 && disk_free_mb($DATA) < $C{min_free_mb}),
-    compress_ok => bool(compress_block_reason() eq ''),
-    compress_why => compress_block_reason(),
+    free       => $free >= 0 ? human_size($free * 1048576) : '',
+    disk_low   => bool($free >= 0 && $free < $C{min_free_mb}),
+    compress_ok => bool($block eq ''),
+    compress_why => $block,
     compress_note => compress_note(),
     version    => $VERSION,
     upgrading  => bool(upgrading()),
@@ -4230,14 +4353,17 @@ sub make_zip {
   my $dtime = ($t[2] << 11) | ($t[1] << 5) | int($t[0] / 2);
   my $ddate = (($t[5] - 80) << 9) | (($t[4] + 1) << 5) | $t[3];
   for my $name (@names) {
+    # 先读一遍算校验码，再读一遍边读边写。不把整个文件放进内存（多段视频的帖子可能几百 MB）。
     open(my $in, '<', "$dir/$name") or next;
     binmode $in;
-    my ($crc, $size, $data) = (0, 0, '');
-    while (my $got = read($in, my $chunk, 65536)) { $crc = crc32_update($crc, $chunk); $size += $got; $data .= $chunk; }
-    close $in;
+    my ($crc, $size) = (0, 0);
+    while (my $got = read($in, my $chunk, 65536)) { $crc = crc32_update($crc, $chunk); $size += $got; }
     # 0x0800 = 文件名是 UTF-8（中文名不乱码）
     my $h = pack('VvvvvvVVVvv', 0x04034b50, 20, 0x0800, 0, $dtime, $ddate, $crc, $size, $size, length($name), 0);
-    print $out $h, $name, $data;
+    print $out $h, $name or return 0;
+    seek($in, 0, 0);
+    while (read($in, my $chunk, 65536)) { print $out $chunk or return 0; }
+    close $in;
     $cd .= pack('VvvvvvvVVVvvvvvVV', 0x02014b50, 20, 20, 0x0800, 0, $dtime, $ddate, $crc, $size, $size,
       length($name), 0, 0, 0, 0, 0, $off) . $name;
     $off += length($h) + length($name) + $size;
@@ -4544,17 +4670,9 @@ sub sweep {
     my $state = $st->{state} || 'queued';
     my $created = $meta->{created} || (stat($dir))[9] || $now;
     if ($state eq 'done') {
-      my $path = media_path($id);
-      my $busy = active_transfers($id);
-      my $ex = $st->{export_state} || '';
-      my $exporting = $ex eq 'queued' || $ex eq 'running';
-      my $orig_size = $st->{size} || ($path ? (-s $path || 0) : 0);
-      my $orig_full = $path && $orig_size && delivered_bytes($id, $orig_size) >= $orig_size;
-      my $ex_size = $st->{export_size} || 0;
-      my $ex_full = $ex eq 'ready' && $ex_size && delivered_bytes($id, $ex_size, 'sent-export') >= $ex_size;
       # 浏览器把用户点的那一份完整收下以后再删。没点保存的一直留着。
-      if (!$busy && !$exporting && ($ex_full || ($orig_full && $ex ne 'ready'))) {
-        my $mark = $ex_full ? "$dir/sent-export" : "$dir/sent";
+      my $mark = delivered_mark($id, $st);
+      if ($mark && !active_transfers($id)) {
         my $sent_at = (stat($mark))[9] || $now;
         if ($now - $sent_at >= $C{grace}) {
           remove_tree($dir);
@@ -4588,31 +4706,106 @@ sub sweep {
 # 网页（登录页和主页面）。不用外网的任何东西，打开就能用。
 #----------------------------------------------------------------------
 my $CSS = <<'CSS';
-*{box-sizing:border-box}body{margin:0;font:16px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;background:#f4f5f7;color:#1d1d1f}
-main{max-width:760px;margin:0 auto;padding:24px 16px 60px}h1{font-size:26px;margin:8px 0 4px}.sub{color:#555;margin:0 0 18px}
-.card{background:#fff;border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 1px 3px rgba(0,0,0,.08)}
-input[type=text],input[type=password],textarea{width:100%;font-size:17px;padding:12px;border:1px solid #c7c7cc;border-radius:10px;background:#fff}
-textarea{font:13px/1.4 ui-monospace,Menlo,monospace;height:120px}
-button,.btn{font-size:17px;padding:11px 20px;border:0;border-radius:10px;background:#0a7cff;color:#fff;cursor:pointer;text-decoration:none;display:inline-block}
-button.gray,.btn.gray{background:#e5e5ea;color:#1d1d1f}button.red{background:#ff3b30}button:disabled{opacity:.5}
-.qs label{display:block;padding:6px 2px;cursor:pointer}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}
-.msg{padding:10px 14px;border-radius:10px;margin:10px 0;display:none}.msg.ok{display:block;background:#e8f5e9}.msg.bad{display:block;background:#ffebee;color:#b00020}
-.job .t{font-weight:600;word-break:break-all}.job .l{color:#333;margin:6px 0}.bar{height:8px;background:#e5e5ea;border-radius:4px;overflow:hidden}
-.bar i{display:block;height:100%;background:#34c759;width:0}.err{background:#fff4f4;border-left:4px solid #ff3b30;padding:10px;border-radius:6px;margin:8px 0;white-space:pre-wrap}
-.small{font-size:13px;color:#666}details{margin:14px 0}summary{cursor:pointer;font-weight:600;padding:6px 0}ol{padding-left:22px}code{background:#eee;padding:1px 5px;border-radius:4px}
-.top{display:flex;justify-content:space-between;align-items:center}.top a{color:#666;font-size:14px}
-textarea.big{font:17px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;height:auto;min-height:56px;resize:vertical}
-.okline{color:#1b7f3b;font-weight:600}button.tiny{font-size:13px;padding:4px 10px;margin:2px 4px}
-.mask{position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;padding:16px;z-index:9}
-.mask[hidden]{display:none}.mask .card{max-width:520px;width:100%;margin:0}.mask h2{margin:0 0 8px;font-size:20px}
-.mask input[type=number]{width:120px;font-size:17px;padding:8px}
+:root{--bg:#f4f5f8;--card:#fff;--text:#1d1d1f;--muted:#6b6f78;--line:#e4e6eb;--field:#fff;--brand:#2563eb;--brand-ink:#fff;--soft:#eef3ff;
+--ok:#15803d;--ok-soft:#e8f6ed;--warn:#a85b00;--warn-soft:#fff3df;--bad:#c81e3a;--bad-soft:#fdecef;--gray-soft:#f0f1f4;
+--shadow:0 1px 2px rgba(16,24,40,.04),0 6px 20px rgba(16,24,40,.06);color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0e0f12;--card:#17191d;--text:#f1f2f4;--muted:#9a9fa9;--line:#2a2d33;--field:#111317;--brand:#4f8cff;
+--soft:#18243d;--ok:#4ade80;--ok-soft:#12301d;--warn:#fbbf5a;--warn-soft:#352610;--bad:#ff7489;--bad-soft:#3a171e;--gray-soft:#22252b;
+--shadow:0 1px 2px rgba(0,0,0,.3);color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Helvetica Neue","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+main{max-width:780px;margin:0 auto;padding:20px 16px 64px}
+a{color:var(--brand)}
+code{background:var(--gray-soft);padding:1px 6px;border-radius:6px;font-size:13px;word-break:break-all}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:4px 0 6px}
+.brand{display:flex;align-items:center;gap:10px}
+.logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#7c3aed);display:grid;place-items:center;flex:none}
+.logo:after{content:"";border-left:11px solid #fff;border-top:7px solid transparent;border-bottom:7px solid transparent;margin-left:3px}
+h1{font-size:22px;margin:0;letter-spacing:.2px}
+.top a{color:var(--muted);font-size:14px;text-decoration:none}.top a:hover{color:var(--text)}
+.sub{color:var(--muted);margin:0 0 16px;font-size:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px;margin:14px 0;box-shadow:var(--shadow)}
+.label{font-size:13px;font-weight:600;color:var(--muted);margin:0 0 8px;letter-spacing:.3px}
+input[type=text],input[type=password],input[type=number],textarea{width:100%;font:inherit;font-size:16px;padding:11px 13px;border:1px solid var(--line);border-radius:12px;background:var(--field);color:var(--text);outline:none;transition:border-color .15s,box-shadow .15s}
+input:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px color-mix(in srgb,var(--brand) 20%,transparent)}
+textarea{font:13px/1.45 ui-monospace,Menlo,monospace;height:120px;resize:vertical}
+textarea.big{font-family:inherit;font-size:16px;line-height:1.5;min-height:64px;height:auto}
+button,.btn{font:inherit;font-size:15px;font-weight:600;padding:10px 16px;border:1px solid transparent;border-radius:11px;background:var(--brand);color:var(--brand-ink);cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:6px;line-height:1.3;transition:filter .15s,background .15s}
+button:hover,.btn:hover{filter:brightness(1.06)}button:active{filter:brightness(.95)}
+button:disabled{opacity:.5;cursor:default}
+button.gray,.btn.gray{background:var(--gray-soft);color:var(--text)}
+button.line{background:transparent;color:var(--brand);border-color:color-mix(in srgb,var(--brand) 40%,var(--line))}
+button.line:hover{background:var(--soft);filter:none}
+button.ghost{background:transparent;color:var(--muted);padding:8px 10px;font-weight:500}button.ghost:hover{color:var(--bad);background:var(--bad-soft);filter:none}
+button.tiny{font-size:13px;padding:4px 10px;margin:2px 4px 2px 0;font-weight:500}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px}
+.spacer{flex:1}
+.small{font-size:13px;color:var(--muted)}
+.qs{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:14px}
+.qs label{position:relative;display:block;padding:9px 12px;border:1px solid var(--line);border-radius:12px;cursor:pointer;background:var(--field);transition:border-color .15s,background .15s}
+.qs label b{font-size:14px}.qs label span{display:block;font-size:12px;color:var(--muted);line-height:1.4}
+.qs input{margin:0 6px 0 0;accent-color:var(--brand);vertical-align:-1px}
+.qs label:has(input:checked){border-color:var(--brand);background:var(--soft)}
+.qs label:has(input:focus-visible){box-shadow:0 0 0 3px color-mix(in srgb,var(--brand) 25%,transparent)}
+.msg{padding:10px 14px;border-radius:12px;margin:10px 0;display:none;font-size:14px}
+.msg.ok{display:block;background:var(--ok-soft);color:var(--ok)}.msg.bad{display:block;background:var(--bad-soft);color:var(--bad)}
+.msg.info{display:block;background:var(--warn-soft);color:var(--warn)}
+.section-title{display:flex;align-items:baseline;justify-content:space-between;margin:26px 2px 4px}
+.section-title h2{font-size:16px;margin:0}
+.empty{text-align:center;color:var(--muted);padding:26px 18px;border:1px dashed var(--line);border-radius:16px;margin:12px 0;font-size:14px}
+.job{padding:16px 18px}
+.job-head{display:flex;gap:10px;align-items:flex-start;justify-content:space-between}
+.job .t{font-weight:600;font-size:15px;word-break:break-all;line-height:1.45}
+.job .meta{font-size:12.5px;color:var(--muted);margin-top:2px}
+.job .l{margin:10px 0 0;font-size:14px}
+.job .note{font-size:13px;color:var(--muted);margin-top:4px}
+.pill{flex:none;font-size:12px;font-weight:600;padding:3px 9px;border-radius:999px;white-space:nowrap;background:var(--gray-soft);color:var(--muted)}
+.pill.run{background:var(--soft);color:var(--brand)}.pill.ok{background:var(--ok-soft);color:var(--ok)}
+.pill.warn{background:var(--warn-soft);color:var(--warn)}.pill.bad{background:var(--bad-soft);color:var(--bad)}
+.okline{color:var(--ok);font-weight:600}
+.bar{height:6px;background:var(--gray-soft);border-radius:999px;overflow:hidden;margin-top:10px}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--brand),#7c3aed);width:0;border-radius:999px;transition:width .6s}
+.err{background:var(--bad-soft);color:var(--bad);padding:10px 12px;border-radius:10px;margin:10px 0 0;white-space:pre-wrap;font-size:14px}
+.job .row{margin-top:12px;gap:8px}
+.job .row button{font-size:14px;padding:8px 13px}
+.hintline{font-size:12.5px;color:var(--muted)}
+details.card{padding:0}details.card>summary{list-style:none;cursor:pointer;font-weight:600;padding:15px 18px;display:flex;justify-content:space-between;align-items:center}
+details.card>summary::-webkit-details-marker{display:none}
+details.card>summary:after{content:"";width:8px;height:8px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(45deg);transition:transform .2s;margin-right:4px}
+details[open].card>summary:after{transform:rotate(-135deg)}
+details.card .body{padding:0 18px 18px;border-top:1px solid var(--line)}
+details.card p,details.card li{font-size:14px}
+ol{padding-left:22px}
+#foot{margin-top:22px;line-height:1.7}
+.mask{position:fixed;inset:0;background:rgba(10,12,16,.5);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;padding:16px;z-index:9}
+.mask[hidden]{display:none}.mask .card{max-width:500px;width:100%;margin:0;max-height:calc(100vh - 32px);overflow:auto}
+.mask h2{margin:0 0 4px;font-size:19px}
+.step{border-top:1px solid var(--line);padding:14px 0 4px;margin-top:12px}
+.step>.label{margin-bottom:10px}
+.seg{display:flex;gap:8px;flex-wrap:wrap}
+.seg label{flex:1;min-width:130px;padding:9px 12px;border:1px solid var(--line);border-radius:12px;cursor:pointer;font-size:14px;background:var(--field)}
+.seg label:has(input:checked){border-color:var(--brand);background:var(--soft)}
+.seg input{margin:0 6px 0 0;accent-color:var(--brand)}
+.speed{display:flex;gap:12px;align-items:center;margin-top:10px}
+.speed input[type=range]{flex:1;accent-color:var(--brand)}.speed input[type=number]{width:92px;padding:8px 10px}
+.drop{display:flex;gap:12px;align-items:center;border:1.5px dashed var(--line);border-radius:12px;padding:12px;cursor:pointer;background:var(--field)}
+.drop:hover{border-color:var(--brand)}
+.drop input{display:none}
+.thumb{width:56px;height:56px;border-radius:8px;flex:none;background:repeating-conic-gradient(var(--gray-soft) 0 25%,transparent 0 50%) 0 0/12px 12px;display:grid;place-items:center;overflow:hidden;color:var(--muted);font-size:22px}
+.thumb img{max-width:100%;max-height:100%}
+.op{display:flex;gap:12px;align-items:center}.op input{flex:1;accent-color:var(--brand)}.op b{min-width:44px;text-align:right}
+.login{max-width:400px;margin:8vh auto 0}
+.login .brand{justify-content:center;margin-bottom:6px}.login .sub{text-align:center}
+.login label{display:block;font-size:13px;font-weight:600;color:var(--muted);margin:12px 0 6px}
+.login button{width:100%;justify-content:center;margin-top:18px;padding:12px}
+@media (max-width:520px){main{padding:14px 12px 48px}.card{padding:15px;border-radius:14px}.job .row button{flex:1 1 auto;justify-content:center}.spacer{display:none}}
 CSS
 
 sub page_simple {
   my ($title, $text) = @_;
   return "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>"
-    . html_esc($title) . "</title><style>$CSS</style></head><body><main><div class=\"card\"><h1>" . html_esc($title)
-    . "</h1><p>" . html_esc($text) . "</p><p><a class=\"btn\" href=\"/\">回到首页</a></p></div></main></body></html>";
+    . html_esc($title) . "</title><style>$CSS</style></head><body><main class=\"login\"><div class=\"card\"><h1>" . html_esc($title)
+    . "</h1><p class=\"sub\" style=\"text-align:left;margin-top:8px\">" . html_esc($text) . "</p><a class=\"btn\" href=\"/\">回到首页</a></div></main></body></html>";
 }
 
 sub page_login {
@@ -4620,55 +4813,58 @@ sub page_login {
   my $m = $msg ? '<div class="msg bad">' . html_esc($msg) . '</div>' : '';
   return <<"HTML";
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>登录 · 存视频到 Mac</title><style>$CSS</style></head><body><main>
-<h1>存视频到 Mac</h1><p class="sub">先登录。名字和密码是安装时屏幕上显示的那一对。</p>
+<title>登录 · 存视频</title><style>$CSS</style></head><body><main class="login">
+<div class="brand"><div class="logo"></div><h1>存视频</h1></div>
+<p class="sub">名字和密码是安装时屏幕上显示的那一对。</p>
 <form class="card" method="post" action="/login">$m
-<p>登录名字<br><input type="text" name="user" value="admin" autocomplete="username" autocapitalize="off"></p>
-<p>密码<br><input type="password" name="pass" autocomplete="current-password" autofocus></p>
+<label for="u">登录名字</label><input id="u" type="text" name="user" value="admin" autocomplete="username" autocapitalize="off">
+<label for="p">密码</label><input id="p" type="password" name="pass" autocomplete="current-password" autofocus>
 <button type="submit">登录</button>
-<p class="small">忘了密码：在 VPS 上输入 <code>ytdlp-web --status</code> 查看，或 <code>ytdlp-web --reset-password</code> 换一把。</p>
-</form></main></body></html>
+</form>
+<p class="small" style="text-align:center">忘了密码：在 VPS 上输入 <code>ytdlp-web --status</code> 查看，或 <code>ytdlp-web --reset-password</code> 换一把。</p>
+</main></body></html>
 HTML
 }
 
 sub page_app {
   return <<"HTML" . <<'JS';
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>存视频到 Mac</title><style>$CSS</style></head><body><main>
-<div class="top"><h1>存视频到 Mac</h1><a href="/logout">退出登录</a></div>
-<p class="sub">贴链接 → 点「开始」→ 视频先留在 VPS。点「保存到本地」才下载到你正在用的电脑，传完再删掉 VPS 上的文件。<br>
-支持 YouTube、抖音、小红书、B站、TikTok、推特/X、Instagram。App 里「分享 → 复制链接」得到的<b>整段文字</b>直接粘贴就行。</p>
+<title>存视频</title><style>$CSS</style></head><body><main>
+<div class="top"><div class="brand"><div class="logo"></div><h1>存视频</h1></div><a href="/logout">退出登录</a></div>
+<p class="sub">视频先留在 VPS，点保存才会下载到你正在用的电脑，传完再删掉 VPS 上的文件。<br>
+支持 YouTube、抖音、小红书、B站、TikTok、推特/X、Instagram。App 里「分享 → 复制链接」得到的<b>整段分享文字</b>直接粘贴就行。</p>
 <form class="card" id="f">
-<textarea id="url" class="big" rows="2" placeholder="在这里粘贴视频链接，或整段分享文字（例如「6.99 复制打开抖音…… https://v.douyin.com/……」）" autocomplete="off" autofocus></textarea>
-<div class="qs" style="margin-top:10px">
-<label><input type="radio" name="q" value="mac" checked> Mac 能直接播放的最高画质（推荐。H.264 的 MP4；YouTube 一般 1080p。少数只有 VP9/AV1 的视频会自动转码，比较慢，网页会告诉你大概要等多久）</label>
-<label><input type="radio" name="q" value="best"> 最高画质（4K/8K，原格式不转码，文件大。常是 VP9/AV1，Mac 自带播放器可能放不了，要装免费的 IINA 或 VLC）</label>
-<label><input type="radio" name="q" value="p720"> 720p（文件小，下得快）</label>
-<label><input type="radio" name="q" value="m4a"> 只要声音（m4a，Mac 的「音乐」能直接放）</label>
-<label><input type="radio" name="q" value="mp3"> 只要声音（mp3）</label>
+<div class="label">视频链接</div>
+<textarea id="url" class="big" rows="2" placeholder="粘贴视频链接，或整段分享文字（例如「6.99 复制打开抖音…… https://v.douyin.com/……」）" autocomplete="off" autofocus></textarea>
+<div class="qs">
+<label><input type="radio" name="q" value="mac" checked><b>Mac 能直接播放</b><span>推荐。H.264 的 MP4，一般 1080p</span></label>
+<label><input type="radio" name="q" value="best"><b>最高画质</b><span>4K/8K 原格式，可能要 IINA/VLC</span></label>
+<label><input type="radio" name="q" value="p720"><b>720p</b><span>文件小，下得快</span></label>
+<label><input type="radio" name="q" value="m4a"><b>只要声音 m4a</b><span>「音乐」能直接放</span></label>
+<label><input type="radio" name="q" value="mp3"><b>只要声音 mp3</b><span>哪里都能放</span></label>
 </div>
-<div class="row"><button type="submit" id="go">开始</button><span class="small">下好以后先留在 VPS。点保存时，Safari 第一次会问「是否允许下载」，请点「允许」。</span></div>
+<div class="row"><button type="submit" id="go">开始下载到 VPS</button><span class="small">少数只有 VP9/AV1 的视频会自动转码，比较慢，网页会告诉你大概要等多久。</span></div>
 <div class="msg" id="msg"></div>
 </form>
 <div class="msg" id="upg"></div>
 <div class="msg" id="disk"></div>
+<div class="section-title"><h2>任务</h2><span class="small" id="count"></span></div>
 <div id="jobs"></div>
-<details class="card" id="ck"><summary>被拦住了？上传 cookies（最后一招）</summary>
-<div id="ckstate" class="small"></div>
+<details class="card" id="ck"><summary>被拦住了？上传 cookies（最后一招）</summary><div class="body">
+<p id="ckstate" class="small"></p>
 <p>VPS 是海外机房的 IP，各平台都会提防。网页会先自动换几种<b>不用账号</b>的办法（换 IPv6/IPv4、换线路……）；都不行时，才需要你上传那个平台的 cookies（浏览器里的登录记录）。</p>
-<p><b>请用小号，不要用主号</b>：平台发现账号被程序用，可能会限制甚至封号。cookies 过几周到几个月会失效，失效时网页会提醒你重新上传。
-可以分几次上传不同平台的，互不覆盖。</p>
+<p><b>请用小号，不要用主号</b>：平台发现账号被程序用，可能会限制甚至封号。cookies 过几周到几个月会失效，失效时网页会提醒你重新上传。可以分几次上传不同平台的，互不覆盖。</p>
 <p><b>大概什么时候要 cookies：</b>TikTok、推特、Instagram 的公开内容一般不用；YouTube 偶尔要；<b>抖音、小红书、B站</b>对海外服务器管得严，网页办法拿不到时就要。
 YouTube 年龄限制、会员视频，推特敏感内容，B站大会员视频，一定要登录过的 cookies。</p>
 <p><b>YouTube</b>（步骤特别一点，这样 cookies 不容易失效）：</p>
 <ol>
-<li>Mac 上用 <b>Chrome</b>（或 Firefox）。Safari 没有好用的导出工具。</li>
+<li>电脑上用 <b>Chrome</b>（或 Firefox）。Safari 没有好用的导出工具。</li>
 <li>Chrome 网上应用店搜索并安装扩展 <b>Get cookies.txt LOCALLY</b>（Firefox 装 <b>cookies.txt</b>）。在扩展的「详情」里打开「在无痕模式下启用」。</li>
-<li>打开一个<b>无痕窗口</b>（Chrome 菜单「文件 → 打开新的无痕窗口」），在里面登录你的 YouTube 小号。</li>
+<li>打开一个<b>无痕窗口</b>，在里面登录你的 YouTube 小号。</li>
 <li>在同一个标签页的地址栏打开 <code>https://www.youtube.com/robots.txt</code></li>
 <li>点浏览器右上角的扩展图标，选 <b>Export</b>（格式选 Netscape），会下载一个 <code>www.youtube.com_cookies.txt</code>。</li>
 <li>直接关掉这个无痕窗口，以后别再打开它（这样 cookies 不会被 YouTube 换掉）。</li>
-<li>回到这里，点下面「选择文件」选刚才那个 txt（或者把文件内容粘贴进框里），再点「保存 cookies」。</li>
+<li>回到这里，选刚才那个 txt（或者把文件内容粘贴进框里），再点「保存 cookies」。</li>
 </ol>
 <p><b>抖音 / 小红书 / B站 / TikTok / 推特 / Instagram</b>：</p>
 <ol>
@@ -4679,32 +4875,37 @@ YouTube 年龄限制、会员视频，推特敏感内容，B站大会员视频�
 <li>回到这里选文件 → 「保存 cookies」。以后这个平台被拦时，点任务上的「再试一次」就会用上。</li>
 </ol>
 <input type="file" id="ckfile" accept=".txt,text/plain">
-<textarea id="cktext" placeholder="也可以把 cookies.txt 的内容整个粘贴到这里"></textarea>
+<textarea id="cktext" placeholder="也可以把 cookies.txt 的内容整个粘贴到这里" style="margin-top:10px"></textarea>
 <div class="row"><button type="button" id="cksave">保存 cookies</button><button type="button" class="gray" id="ckdel">删除全部 cookies</button></div>
 <div class="msg" id="ckmsg"></div>
-</details>
-<details class="card"><summary>常见问题</summary>
+</div></details>
+<details class="card"><summary>常见问题</summary><div class="body">
 <p><b>视频存在哪？</b> 下好以后先留在 VPS。点「保存到本地」才下载到你这台电脑，位置是浏览器自己的下载文件夹（很多人设成了桌面）。浏览器完整收下以后，VPS 上的视频会删掉。网页上那一条会显示 ✅ 然后自己消失。</p>
-<p><b>压缩呢？</b> 视频旁边还有「压缩后保存到本地」和「压缩后添加水印保存到本地」。64MB 内存的小鸡也可以压，会慢一些。压缩按 HEVC、最大 960×540、25 帧、平均 600 kbps，声音是 44.1 kHz 立体声 AAC 64 kbps。可以选 0.1 到 5 倍速。水印用你上传的 PNG 或 JPG，自己选透明度，放在右下角。图片和纯音频不能压缩。</p>
+<p><b>压缩呢？</b> 视频旁边还有「压缩后保存到本地」和「压缩后添加水印保存到本地」。64MB 内存的小鸡也可以压，会慢一些。压缩按 HEVC、最大 960×540、25 帧、平均 600 kbps 两遍编码，声音是 44.1 kHz 立体声 AAC 64 kbps。可以选 0.1 到 5 倍速。水印用你上传的 PNG 或 JPG，自己选透明度，放在右下角。图片和纯音频不能压缩。</p>
 <p><b>图片帖（小红书图文、推特图片）？</b> 一张图直接存成图片；好几张会打成一个 zip，在电脑上双击就解开。纯文字的帖子没有东西可下，网页会告诉你。这两种只显示「保存到本地」。</p>
 <p><b>点了保存却没有文件？</b> Safari 第一次会问「是否允许在此网站上下载」，点「允许」。Chrome 如果问「此网站想下载多个文件」，点「允许」。也可以再点一次「保存到本地」或「下载压缩结果」。</p>
 <p><b>下载到一半网断了？</b> 在浏览器的下载列表里点「继续/恢复」，会接着下，不用从头来。没收完的时候，VPS 上的文件还留着。</p>
-<p><b>为什么有的要「转码」，等很久？</b> Mac 自带播放器只认 H.264。网页总是先找现成的 H.264；只有原视频只有 VP9/AV1 时才转码。这台 VPS 只有 1 核，转码大约和视频一样长甚至更久。不想等就选「最高画质」，用 IINA/VLC 播放。</p>
-<p><b>4K 视频 QuickTime 打不开？</b> 4K 一般是 VP9/AV1 格式，装一个免费的 IINA 或 VLC 就能放。想直接用 QuickTime，就选第一项。</p>
+<p><b>为什么有的要「转码」，等很久？</b> Mac 自带播放器只认 H.264。网页总是先找现成的 H.264；只有原视频只有 VP9/AV1 时才转码。小 VPS 只有 1 核，转码大约和视频一样长甚至更久。不想等就选「最高画质」，用 IINA/VLC 播放。</p>
 <p><b>可以关掉网页吗？</b> 服务器下载或压缩时可以关。重新打开网页，视频还在，再点保存。</p>
-</details>
+</div></details>
 <p class="small" id="foot"></p>
 <div class="mask" id="mask" hidden>
-<div class="card">
+<div class="card" role="dialog" aria-modal="true" aria-labelledby="dlg-title">
 <h2 id="dlg-title">压缩后保存到本地</h2>
-<p>要不要改变播放速度？1 是原速，0.1 是十分之一速，5 是五倍速。声音不变调。</p>
-<label><input type="checkbox" id="dlg-speed-on"> 需要改变速度</label>
-<p>倍数 <input id="dlg-speed" type="number" min="0.1" max="5" step="0.1" value="1"></p>
+<p class="small" style="margin:0">在 VPS 上按 HEVC 960×540、600 kbps 压好，再下载到你的电脑。</p>
+<div class="step"><div class="label">1 · 播放速度</div>
+<div class="seg"><label><input type="radio" name="spd" value="keep" checked>不改，原速</label><label><input type="radio" name="spd" value="change" id="dlg-speed-on">改变速度</label></div>
+<div class="speed" id="dlg-speed-box" hidden><input type="range" id="dlg-speed-r" min="0.1" max="5" step="0.1" value="1"><input id="dlg-speed" type="number" min="0.1" max="5" step="0.1" value="1"><span class="small">倍</span></div>
+<p class="small" style="margin:6px 0 0">1 是原速，小于 1 变慢，大于 1 变快（0.1～5）。声音不变调。</p>
+</div>
 <div id="dlg-wm" hidden>
-<p>上传一张 PNG（可以透明）或 JPG。</p>
-<input type="file" id="dlg-file" accept="image/png,image/jpeg,.png,.jpg,.jpeg">
-<p>水印透明度 <input id="dlg-op" type="range" min="0" max="100" value="50"> <span id="dlg-opv">50%</span></p>
-<p class="small">水印放在画面右下角，宽度约为画面的 18%，离右边和底边约为画面宽度的 2%。</p>
+<div class="step"><div class="label">2 · 水印图</div>
+<label class="drop"><input type="file" id="dlg-file" accept="image/png,image/jpeg,.png,.jpg,.jpeg"><div class="thumb" id="dlg-thumb">＋</div><div><b id="dlg-fname">选择一张 PNG 或 JPG</b><div class="small">PNG 可以带透明，最大 20MB</div></div></label>
+</div>
+<div class="step"><div class="label">3 · 水印透明度</div>
+<div class="op"><input id="dlg-op" type="range" min="0" max="100" step="1" value="50"><b id="dlg-opv">50%</b></div>
+<p class="small" style="margin:6px 0 0">100% 按图片本身来，越小越淡，0% 看不见。水印放在右下角，宽约画面的 18%。</p>
+</div>
 </div>
 <div class="msg" id="dlg-msg"></div>
 <div class="row"><button type="button" id="dlg-ok">开始</button><button type="button" class="gray" id="dlg-cancel">取消</button></div>
@@ -4715,83 +4916,120 @@ HTML
 <script>
 const $=s=>document.querySelector(s);
 const load=k=>{try{return new Set(JSON.parse(localStorage.getItem(k)||'[]'))}catch(e){return new Set()}};
-const mine=load('ytw_mine'),got=load('ytw_got'),closing=new Set();
-function keep(){localStorage.setItem('ytw_mine',JSON.stringify([...mine].slice(-60)));localStorage.setItem('ytw_got',JSON.stringify([...got].slice(-60)));}
+const store=(k,s)=>{try{localStorage.setItem(k,JSON.stringify([...s].slice(-60)))}catch(e){}};
+const mine=load('ytw_mine'),closing=new Set();
+function keep(){store('ytw_mine',mine);}
 async function api(p,data){const o={headers:{'X-YTW':'1'},cache:'no-store'};if(data){o.method='POST';o.body=new URLSearchParams(data);}
  const r=await fetch(p,o);if(r.status===401){location.href='/';throw new Error('login');}return r.json();}
-function say(el,t,bad){el.textContent=t;el.className='msg '+(bad?'bad':'ok');}
-const lastQ=localStorage.getItem('ytw_q');if(lastQ){const x=document.querySelector('input[name=q][value="'+lastQ+'"]');if(x)x.checked=true;}
+function say(el,t,kind){el.textContent=t;el.className='msg '+(kind===1||kind===true?'bad':kind||'ok');}
+let lastQ=null;try{lastQ=localStorage.getItem('ytw_q');}catch(e){}
+if(lastQ){const x=document.querySelector('input[name=q][value="'+lastQ+'"]');if(x)x.checked=true;}
 $('#url').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#f').requestSubmit();}});
 $('#f').onsubmit=async e=>{e.preventDefault();const url=$('#url').value.trim();
  if(!url){say($('#msg'),'先把视频链接（或整段分享文字）粘贴到上面的框里。',1);return;}
- const q=document.querySelector('input[name=q]:checked').value;localStorage.setItem('ytw_q',q);$('#go').disabled=true;
+ const q=document.querySelector('input[name=q]:checked').value;try{localStorage.setItem('ytw_q',q);}catch(e){}$('#go').disabled=true;
  try{const r=await api('/api/add',{url,q});if(r.error){say($('#msg'),r.error,1);}else{mine.add(r.id);keep();$('#url').value='';
   say($('#msg'),r.note||'收到了！下面能看到进度。下好以后先留在 VPS，点「保存到本地」才会下载到你的电脑。');tick();}}
- catch(err){say($('#msg'),'暂时连不上服务器。可能正在升级重启，等半分钟再点一次「开始」；一直不行再检查网络。',1);}finally{$('#go').disabled=false;}};
-function saveFile(id){const a=document.createElement('a');a.href='/dl/'+id;a.download='';document.body.appendChild(a);a.click();a.remove();}
-function saveExport(id){const a=document.createElement('a');a.href='/dl/'+id+'?which=export';a.download='';document.body.appendChild(a);a.click();a.remove();}
+ catch(err){say($('#msg'),'暂时连不上服务器。可能正在升级重启，等半分钟再点一次；一直不行再检查网络。',1);}finally{$('#go').disabled=false;}};
+function grab(href){const a=document.createElement('a');a.href=href;a.download='';document.body.appendChild(a);a.click();a.remove();}
+function saveFile(id){grab('/dl/'+id);}
+function saveExport(id){grab('/dl/'+id+'?which=export');}
 const wantEx=load('ytw_ex'),gotEx=load('ytw_exgot');
-function keepEx(){localStorage.setItem('ytw_ex',JSON.stringify([...wantEx].slice(-60)));localStorage.setItem('ytw_exgot',JSON.stringify([...gotEx].slice(-60)));}
+function keepEx(){store('ytw_ex',wantEx);store('ytw_exgot',gotEx);}
 let dlg={id:'',kind:'compress'};
-function openDlg(id,kind){dlg={id:id,kind:kind};$('#dlg-title').textContent=kind==='watermark'?'压缩后添加水印保存到本地':'压缩后保存到本地';$('#dlg-wm').hidden=kind!=='watermark';$('#dlg-msg').className='msg';$('#dlg-msg').textContent='';$('#mask').hidden=false;}
+function speedOn(){return $('#dlg-speed-on').checked;}
+function syncSpeed(){$('#dlg-speed-box').hidden=!speedOn();}
+document.querySelectorAll('input[name=spd]').forEach(x=>x.onchange=syncSpeed);
+$('#dlg-speed-r').oninput=()=>{$('#dlg-speed').value=$('#dlg-speed-r').value;};
+$('#dlg-speed').oninput=()=>{const n=Number($('#dlg-speed').value);if(n>=0.1&&n<=5)$('#dlg-speed-r').value=n;};
+let thumbUrl='';
+$('#dlg-file').onchange=()=>{const f=$('#dlg-file').files[0];const t=$('#dlg-thumb');if(thumbUrl){URL.revokeObjectURL(thumbUrl);thumbUrl='';}
+ if(!f){t.textContent='＋';$('#dlg-fname').textContent='选择一张 PNG 或 JPG';return;}
+ $('#dlg-fname').textContent=f.name;t.textContent='';thumbUrl=URL.createObjectURL(f);const im=new Image();im.src=thumbUrl;t.appendChild(im);};
+function openDlg(id,kind){dlg={id:id,kind:kind};$('#dlg-title').textContent=kind==='watermark'?'压缩后添加水印保存到本地':'压缩后保存到本地';
+ $('#dlg-wm').hidden=kind!=='watermark';$('#dlg-msg').className='msg';$('#dlg-msg').textContent='';$('#mask').hidden=false;syncSpeed();}
+function closeDlg(){$('#mask').hidden=true;}
 $('#dlg-op').oninput=function(){$('#dlg-opv').textContent=$('#dlg-op').value+'%';};
-$('#dlg-cancel').onclick=function(){$('#mask').hidden=true;};
+$('#dlg-cancel').onclick=closeDlg;
+$('#mask').addEventListener('click',e=>{if(e.target===$('#mask'))closeDlg();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#mask').hidden)closeDlg();});
+// 水印图按原样（二进制）上传，服务器边收边写进硬盘，小内存的 VPS 也不会被撑爆。
+async function apiUpload(params,file){const r=await fetch('/api/export?'+new URLSearchParams(params),{method:'POST',cache:'no-store',
+ headers:{'X-YTW':'1','Content-Type':'application/octet-stream'},body:file});if(r.status===401){location.href='/';throw new Error('login');}return r.json();}
 $('#dlg-ok').onclick=async function(){
  let speed='1';
- if($('#dlg-speed-on').checked){const n=Number($('#dlg-speed').value);if(!(n>=0.1&&n<=5)){say($('#dlg-msg'),'倍数要在 0.1 到 5 之间。',1);return;}speed=String(Math.round(n*10)/10);}
- const data={id:dlg.id,kind:dlg.kind,speed:speed};
+ if(speedOn()){const n=Number($('#dlg-speed').value);if(!(n>=0.1&&n<=5)){say($('#dlg-msg'),'倍数要在 0.1 到 5 之间。',1);return;}speed=String(Math.round(n*10)/10);}
+ const data={id:dlg.id,kind:dlg.kind,speed:speed};let file=null;
  if(dlg.kind==='watermark'){
-  const f=$('#dlg-file').files[0];
-  if(!f){say($('#dlg-msg'),'先选择一张 PNG 或 JPG。',1);return;}
-  const name=(f.name||'').toLowerCase();
-  if(!/\.(png|jpe?g)$/.test(name)){say($('#dlg-msg'),'只接受 PNG 或 JPG。',1);return;}
-  if(f.size>20*1024*1024){say($('#dlg-msg'),'图片不能超过 20MB。',1);return;}
+  file=$('#dlg-file').files[0];
+  if(!file){say($('#dlg-msg'),'先选择一张 PNG 或 JPG。',1);return;}
+  if(!/\.(png|jpe?g)$/.test((file.name||'').toLowerCase())){say($('#dlg-msg'),'只接受 PNG 或 JPG（.png、.jpg、.jpeg）。',1);return;}
+  if(file.size>20*1024*1024){say($('#dlg-msg'),'图片不能超过 20MB。',1);return;}
   data.opacity=$('#dlg-op').value;
-  data.image=await new Promise(function(res,rej){const r=new FileReader();r.onload=function(){res(String(r.result||''));};r.onerror=function(){rej(new Error('read'));};r.readAsDataURL(f);});
  }
  $('#dlg-ok').disabled=true;
- try{const r=await api('/api/export',data);if(r.error){say($('#dlg-msg'),r.error,1);return;}wantEx.add(dlg.id);keepEx();$('#mask').hidden=true;say($('#msg'),'开始处理。好了以后会下载到你的电脑，VPS 上的视频会在传完后删掉。');}
+ if(file)say($('#dlg-msg'),'正在上传水印图…','info');
+ try{const r=file?await apiUpload(data,file):await api('/api/export',data);if(r.error){say($('#dlg-msg'),r.error,1);return;}
+  wantEx.add(dlg.id);gotEx.delete(dlg.id);keepEx();closeDlg();say($('#msg'),'开始处理。好了以后会自动下载到你的电脑，VPS 上的视频会在传完后删掉。');}
  catch(e){say($('#dlg-msg'),'暂时连不上服务器。等一会儿再点。',1);}
  finally{$('#dlg-ok').disabled=false;}
  tick();
 };
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
-// 已经存到 Mac 的：亮 1.5 秒 ✅，然后告诉服务器收起来，卡片消失。
+function btn(text,cls,fn){const b=el('button',cls,text);b.type='button';b.onclick=fn;return b;}
+// 已经存到电脑的：亮 1.5 秒 ✅，然后告诉服务器收起来，卡片消失。
 function dismiss(id){if(closing.has(id))return;closing.add(id);setTimeout(async()=>{try{await api('/api/dismiss',{id});}catch(e){}tick();},1500);}
-// 服务器升级时显示一句安心的话；连不上（正在重启那几秒）时不报错，过一会儿自动接着刷新。
+function pill(j){
+ const ex=j.export_state,wm=j.export_kind==='watermark';
+ if(j.state==='error')return['失败','bad'];
+ if(j.state==='queued')return['排队中',''];
+ if(j.state==='running')return['下载到 VPS','run'];
+ if(j.delivered)return['已保存','ok'];
+ if(ex==='running')return[wm?'正在加水印':'正在压缩','warn'];
+ if(ex==='queued')return['排队压缩','warn'];
+ if(ex==='ready')return['压缩好了','ok'];
+ if(!j.has_file)return['已不在 VPS',''];
+ return['在 VPS 上','run'];}
 function render(d){const box=$('#jobs');box.textContent='';
- const u=$('#upg');if(d.info&&d.info.upgrading)say(u,'服务器正在升级：正在下载的会先下完，然后自动重启，排队的重启后自动接着下。不用管，也不用刷新网页。');else{u.className='msg';u.textContent='';}
- for(const j of d.jobs){const c=el('div','card job');c.appendChild(el('div','t',j.title||j.url));
-  c.appendChild(el('div','small',(j.plat?j.plat+' · ':'')+j.quality+(j.size?' · '+j.size:'')));
+ const u=$('#upg');if(d.info&&d.info.upgrading)say(u,'服务器正在升级：正在下载的会先下完，然后自动重启，排队的重启后自动接着下。不用管，也不用刷新网页。','info');else{u.className='msg';u.textContent='';}
+ $('#count').textContent=d.jobs.length?d.jobs.length+' 个':'';
+ if(!d.jobs.length)box.appendChild(el('div','empty','还没有任务。贴一个链接，点「开始下载到 VPS」。'));
+ for(const j of d.jobs){const c=el('div','card job');
+  const head=el('div','job-head');head.appendChild(el('div','t',j.title||j.url));const p=pill(j);head.appendChild(el('span','pill '+p[1],p[0]));c.appendChild(head);
+  c.appendChild(el('div','meta',[j.plat,j.quality,j.size].filter(Boolean).join(' · ')));
+  const busyEx=j.export_state==='running'||j.export_state==='queued';
   if(j.state==='error'){c.appendChild(el('div','err',j.error));}
-  else{c.appendChild(el('div','l'+(j.delivered?' okline':''),j.line));if(j.note)c.appendChild(el('div','small',j.note));
-   if(j.state==='running'||j.state==='queued'||j.export_state==='running'||j.export_state==='queued'){const b=el('div','bar');const i=el('i');i.style.width=(j.pct||0)+'%';b.appendChild(i);c.appendChild(b);}}
+  else{c.appendChild(el('div','l'+(j.delivered?' okline':''),j.line+(j.export_state==='running'&&j.export_wait?'（已等待 '+j.export_wait+'）':'')));if(j.note)c.appendChild(el('div','note',j.note));
+   if(j.state==='running'||j.state==='queued'||busyEx){const b=el('div','bar');const i=el('i');i.style.width=(j.pct||0)+'%';b.appendChild(i);c.appendChild(b);}}
   if(j.delivered){box.appendChild(c);dismiss(j.id);continue;}
   const row=el('div','row');
-  const busyEx=j.export_state==='running'||j.export_state==='queued';
-  if(j.has_file){const b=el('button',null,'保存到本地');b.onclick=function(){saveFile(j.id);};row.appendChild(b);
+  if(j.has_file){
+   if(j.export_state==='ready')row.appendChild(btn('下载压缩结果',null,()=>{gotEx.add(j.id);keepEx();saveExport(j.id);}));
+   row.appendChild(btn('保存到本地',j.export_state==='ready'?'line':null,()=>saveFile(j.id)));
    if(j.video&&!busyEx&&d.info&&d.info.compress_ok){
-    const c1=el('button',null,'压缩后保存到本地');c1.onclick=function(){openDlg(j.id,'compress');};row.appendChild(c1);
-    const c2=el('button',null,'压缩后添加水印保存到本地');c2.onclick=function(){openDlg(j.id,'watermark');};row.appendChild(c2);
-    if(d.info.compress_note)row.appendChild(el('span','small',d.info.compress_note));
-   }else if(j.video&&!busyEx&&d.info&&d.info.compress_why){row.appendChild(el('span','small',d.info.compress_why));}
-   if(j.export_state==='ready'){const b2=el('button',null,'下载压缩结果');b2.onclick=function(){gotEx.add(j.id);keepEx();saveExport(j.id);};row.appendChild(b2);}}
-  if(j.hint==='cookies'){const b=el('button','gray','去上传 cookies');b.onclick=()=>{$('#ck').open=true;$('#ck').scrollIntoView({behavior:'smooth'});};row.appendChild(b);}
-  if(j.state==='error'){const b=el('button','gray','再试一次');b.onclick=async()=>{const r=await api('/api/add',{url:j.url,q:j.q});if(r.id){mine.add(r.id);keep();await api('/api/delete',{id:j.id});tick();}};row.appendChild(b);}
-  const del=el('button','gray',j.state==='running'?'取消':'删除');del.onclick=async()=>{await api('/api/delete',{id:j.id});tick();};row.appendChild(del);
-  c.appendChild(row);box.appendChild(c);
+    row.appendChild(btn('压缩后保存到本地','line',()=>openDlg(j.id,'compress')));
+    row.appendChild(btn('压缩后添加水印保存到本地','line',()=>openDlg(j.id,'watermark')));
+   }}
+  if(j.hint==='cookies')row.appendChild(btn('去上传 cookies','gray',()=>{$('#ck').open=true;$('#ck').scrollIntoView({behavior:'smooth'});}));
+  if(j.state==='error')row.appendChild(btn('再试一次','gray',async()=>{const r=await api('/api/add',{url:j.url,q:j.q});if(r.id){mine.add(r.id);keep();await api('/api/delete',{id:j.id});tick();}else if(r.error){say($('#msg'),r.error,1);}}));
+  row.appendChild(el('span','spacer'));
+  row.appendChild(btn(j.state==='running'||busyEx?'取消':'删除','ghost',async()=>{if(j.has_file&&!confirm('删除后 VPS 上的这个文件会立刻删掉，确定吗？'))return;await api('/api/delete',{id:j.id});tick();}));
+  c.appendChild(row);
+  if(j.has_file&&j.video&&!busyEx&&d.info){
+   if(d.info.compress_ok&&d.info.compress_note)c.appendChild(el('div','hintline',d.info.compress_note));
+   else if(!d.info.compress_ok&&d.info.compress_why)c.appendChild(el('div','hintline',d.info.compress_why));}
+  box.appendChild(c);
   if(j.export_state==='ready'&&wantEx.has(j.id)&&!gotEx.has(j.id)){gotEx.add(j.id);keepEx();saveExport(j.id);}}
  const i=d.info;let f='yt-dlp '+(i.ytdlp||'?')+(i.updated?'（'+i.updated+' 检查过更新，每天自动更新）':'（每天自动更新）');
  if(i.method)f+=' · YouTube 上次成功的办法：'+i.method;f+=' · YouTube 被拦时会依次试：'+i.methods.join(' → ');
- f+=' · 点保存并完整传到你的电脑之后，才会删除 VPS 上的视频';if(i.free)f+=' · 服务器硬盘剩 '+i.free;
- if(i.disk_low)f+=' · 硬盘快满了，请先保存或删除';
+ f+=' · 完整传到你的电脑之后，才会删除 VPS 上的视频';if(i.free)f+=' · 服务器硬盘剩 '+i.free;
+ f+=' · v'+i.version;
  $('#foot').textContent=f;
- const disk=$('#disk');if(i.disk_low)say(disk,'服务器硬盘快满了。请先把视频保存到本地，或点删除。还没保存的视频不会被自动删掉。');else{disk.className='msg';disk.textContent='';}
+ const disk=$('#disk');if(i.disk_low)say(disk,'服务器硬盘快满了。请先把视频保存到本地，或点删除。还没保存的视频不会被自动删掉。',1);else{disk.className='msg';disk.textContent='';}
  const st=$('#ckstate');st.textContent='';
  if(!i.cookie_sites.length){st.textContent='还没有上传任何 cookies。大多数时候不需要。';}
  else{st.appendChild(el('span',null,'已上传（'+i.cookies_at+' 更新）：'));
-  for(const s of i.cookie_sites){const b=el('button','gray tiny',s.name+(s.bad?'（已失效，请重新上传）':'')+' ✕');b.title='删除 '+s.name+' 的 cookies';
-   b.onclick=async()=>{await api('/api/cookies/delete',{plat:s.key});say($('#ckmsg'),'已删除 '+s.name+' 的 cookies。');tick();};st.appendChild(b);}
+  for(const s of i.cookie_sites){const b=btn(s.name+(s.bad?'（已失效，请重新上传）':'')+' ✕','gray tiny',async()=>{await api('/api/cookies/delete',{plat:s.key});say($('#ckmsg'),'已删除 '+s.name+' 的 cookies。');tick();});b.title='删除 '+s.name+' 的 cookies';st.appendChild(b);}
   st.appendChild(el('span',null,' 只有前面的办法都不行时才会用。'));}
  if(i.cookies_bad)$('#ck').open=true;
  return d.jobs.some(j=>j.state==='queued'||j.state==='running'||j.export_state==='queued'||j.export_state==='running'||(j.state==='done'&&(j.has_file||j.delivered)));}
@@ -4867,6 +5105,7 @@ sub main {
         close $_ for @ls;
         eval { handle($c); };
         logline("请求出错：$@") if $@;
+        unlink "$DATA/tmp/upload.$$";
         close $c;
         POSIX::_exit(0);
       }
@@ -4881,7 +5120,7 @@ sub main {
     # 每天的 yt-dlp 更新也在这里排队：和下载是同一个「跑腿」进程一件一件做，
     # 所以更新时一定没有视频在下，不会把 yt-dlp 换掉在正在下的任务脚下。
     # 安装脚本在升级（挂了牌子）时，什么新活都先不派。
-    if (!$runner && !upgrading()) {
+    if (!$runner && !upgrading() && !(one_at_a_time() && $encoder)) {
       my ($next) = grep { (job_stat($_)->{state} || 'queued') eq 'queued' } list_jobs();
       my $task = $next ? "job:$next" : (update_due($C{update_hours}) ? 'update' : '');
       if ($task) {
@@ -4901,13 +5140,13 @@ sub main {
       }
     }
     # 压缩和水印单独排队，一次只压一个，免得小机器同时跑两份 HEVC。
-    if (!$encoder && !upgrading()) {
+    if (!$encoder && !upgrading() && !(one_at_a_time() && $runner_job && $runner_job ne 'update')) {
       my ($exp) = grep {
         my $s = job_stat($_);
         ($s->{state} || '') eq 'done' && ($s->{export_state} || '') eq 'queued';
       } list_jobs();
       if ($exp) {
-        set_stat($exp, export_state => 'running', line => '正在压缩…', export_pct => 0);
+        set_stat($exp, export_state => 'running', export_started => time, line => '正在压缩…', export_pct => 0);
         my $pid = fork();
         if (!defined $pid) {
           set_stat($exp, export_state => 'queued', line => '排队压缩，马上开始…');

@@ -106,7 +106,7 @@ check newer "$(yes_no x version_newer 2.0.1 2.0.0)" yes
 check newer-equal "$(yes_no x version_newer 2.0.0 2.0.0)" no
 check newer-major "$(yes_no x version_newer 2.0.0 1.9.9)" yes
 check ver-file "$(version_from_file ./install.sh)" "$VERSION"
-check ver-221 "$VERSION" 2.2.1
+check ver-222 "$VERSION" 2.2.2
 check mem-gate "$(grep -c '可用内存不到 384MB' install.sh || true)" 0
 check newer-211 "$(yes_no x version_newer 2.1.1 2.1.0)" yes
 # 网页服务里的版本号要和脚本一致（网页 /health 会显示它）
@@ -385,7 +385,7 @@ rm -rf "$wd/jobs/e" "$wd/jobs/f" "$wd/jobs/g" "$wd/jobs/d"
 
 # 网页服务没在跑：不用等
 waitrun() {
-  YTD_TEST=1 CONF_FILE=$tmpd/none.conf DATA=$wd WAIT_SETTLE_SECS=0 WAIT_STEP_SECS=1 "$@"
+  YTD_TEST=1 YTD_CONFIG_FILE=$tmpd/none.conf DATA=$wd WAIT_SETTLE_SECS=0 WAIT_STEP_SECS=1 "$@"
 }
 out=$(waitrun sh -c '. ./install.sh; wait_for_idle; echo end' 2>&1)
 check wait-no-server "$out" end

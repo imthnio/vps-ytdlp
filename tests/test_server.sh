@@ -204,7 +204,17 @@ while [ "$n" -lt 80 ]; do
 done
 has wm-state "$js" '"export_state":"ready"'
 has wm-alpha "$(cat "$T/calls.log")" 'colorchannelmixer=aa=0.4000'
-has wm-place "$(cat "$T/calls.log")" 'scale2ref=w=main_w\*0.18'
+has wm-place "$(cat "$T/calls.log")" 'scale2ref=w=iw\*0.18'
+
+# 水印：网页现在按二进制上传，服务器边收边写硬盘；不是 PNG/JPG 的拒绝；临时文件不留
+id=$(add 'https://www.youtube.com/watch?v=watermark002' | job_id)
+wait_job "$id" > /dev/null
+perl -MMIME::Base64 -e 'print decode_base64($ARGV[0])' "$png" > "$T/wm.png"
+printf 'GIF89a not a png' > "$T/wm.gif"
+has wm-raw-bad "$($C -b "$J" -H 'X-YTW: 1' -H 'Content-Type: application/octet-stream' --data-binary "@$T/wm.gif" "$B/api/export?id=$id&kind=watermark&speed=1&opacity=40")" 'PNG'
+has wm-raw-ok "$($C -b "$J" -H 'X-YTW: 1' -H 'Content-Type: application/octet-stream' --data-binary "@$T/wm.png" "$B/api/export?id=$id&kind=watermark&speed=1.5&opacity=70")" '"ok":true'
+if [ -f "$T/data/jobs/$id/watermark.png" ]; then ok wm-raw-saved; else bad wm-raw-saved; fi
+check wm-raw-tmp "$(ls "$T/data/tmp" | grep -c '^upload\.' || true)" 0
 
 # 删任务
 id2=$(add 'https://www.youtube.com/watch?v=delete00001' | job_id)
