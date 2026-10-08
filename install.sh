@@ -224,9 +224,8 @@ web_running() {
 
 # 数一数网页服务手上的活。打印四个数：
 #   正在下载的  排队的  正在传给浏览器的  刚下好、浏览器马上就会来拿的
-# 「刚下好」指下好不到 FRESH_SECS 秒（默认 45 秒）、一个字节都还没传的：网页开着的话，
-# 1～2 秒内浏览器就会来拿，等一下免得刚好在重启那一刻来拿、浏览器报「下载失败」。
-# 下好很久都没人拿的（网页没开），不用等：文件在硬盘上，重启后照样在，打开网页会接着自动保存。
+# 「刚下好」指下好不到 FRESH_SECS 秒（默认 45 秒）、一个字节都还没传的。
+# 升级时先等这几秒，免得刚好打断。视频留在 VPS，用户点保存才会下载到电脑。
 count_busy() {
   jd=${1:-$(upgrade_data_dir)/jobs}
   nr=0
@@ -1483,9 +1482,25 @@ install_static_ffmpeg() {
     rm -rf "$dir"
     return 1
   fi
-  # 先拷成新文件再改名替换：正在下载的任务还在用旧的 ffmpeg 也不怕（直接覆盖会报「文件忙」）。
-  place_elf "$ff" /usr/local/bin/ffmpeg || { rm -rf "$dir"; return 1; }
-  place_elf "$fp" /usr/local/bin/ffprobe || { rm -rf "$dir"; return 1; }
+  # 先放到旁边试跑。John Van Sickle 的包是 glibc 的，Alpine 这种 musl 系统上会直接起不来。
+  # 起不来就删掉，不能盖住系统里还能用的 ffmpeg。
+  try_ff=/usr/local/bin/ffmpeg.static-new
+  try_fp=/usr/local/bin/ffprobe.static-new
+  rm -f "$try_ff" "$try_fp"
+  cp "$ff" "$try_ff" && cp "$fp" "$try_fp" && chmod 755 "$try_ff" "$try_fp" || {
+    rm -f "$try_ff" "$try_fp"
+    rm -rf "$dir"
+    return 1
+  }
+  if ! "$try_ff" -hide_banner -encoders 2>/dev/null | grep -q libx265; then
+    rm -f "$try_ff" "$try_fp"
+    rm -rf "$dir"
+    say_warn "静态 ffmpeg 在这台系统上跑不起来，不换掉现在的"
+    return 1
+  fi
+  # 试过能压 HEVC 再替换。正在下载的任务还在用旧文件也不怕（直接覆盖会报「文件忙」）。
+  mv "$try_ff" /usr/local/bin/ffmpeg || { rm -f "$try_ff" "$try_fp"; rm -rf "$dir"; return 1; }
+  mv "$try_fp" /usr/local/bin/ffprobe || { rm -f "$try_fp"; rm -rf "$dir"; return 1; }
   mkdir -p "$CONF_DIR"
   printf '%s\n' static > "$CONF_DIR/ffmpeg-static"
   rm -rf "$dir"
@@ -1738,10 +1753,13 @@ ytdlp_try_asset() {
   cp "$tmp" /usr/local/bin/yt-dlp.new || return 1
   chmod 755 /usr/local/bin/yt-dlp.new || return 1
   rm -f "$tmp"
-  if ! /usr/local/bin/yt-dlp.new --version >/dev/null 2>&1; then
-    rm -f /usr/local/bin/yt-dlp.new
+  if ! /usr/local/bin/yt-dlp.new --version >/tmp/ytdlp-try.err 2>&1; then
+    why=$(tr '\n' ' ' < /tmp/ytdlp-try.err 2>/dev/null | cut -c1-160)
+    say_warn "这个 yt-dlp 起不来。${why}"
+    rm -f /usr/local/bin/yt-dlp.new /tmp/ytdlp-try.err
     return 1
   fi
+  rm -f /tmp/ytdlp-try.err
   mv /usr/local/bin/yt-dlp.new /usr/local/bin/yt-dlp
   return 0
 }
@@ -1805,6 +1823,12 @@ install_ytdlp() {
       say_ok "yt-dlp 已装上"
       return 0
     fi
+  fi
+  # 新的独立程序按很新的 musl 编译（要用 pwritev2）。Alpine 3.19 这种老系统上会直接起不来。
+  # 这时改用小的 Python 版，系统自带的 Python 跑得动。
+  say_warn "官方独立程序在这台系统上跑不起来，改用 Python 版"
+  if install_ytdlp_zipapp; then
+    return 0
   fi
   if ytdlp_runs; then
     say_warn "新的 yt-dlp 没换上，继续用现在的"
@@ -3302,7 +3326,7 @@ sub serve_file {
   }
   unless ($path) {
     return respond($c, $r, 404, 'text/html; charset=utf-8',
-      page_simple('文件已经不在服务器上了', '这个视频已经传给浏览器，或者放太久被自动删掉了。回到首页重新贴一次链接就行。'));
+      page_simple('文件已经不在服务器上了', '这个视频已经保存到你的电脑并从服务器删掉了，或者你在网页上点过删除。回到首页可以再贴一次链接。'));
   }
   open(my $fh, '<', $path) or return respond($c, $r, 404, 'text/plain; charset=utf-8', "not found\n");
   binmode $fh;
@@ -3794,7 +3818,7 @@ sub classify_base {
   my $e = lc(join("\n", @err) || $t);
   return ('fatal', '服务器内存不够，下载程序被系统杀掉了。换一个小一点的画质（比如 720p）再试，或者给 VPS 加内存。', '')
     if $sig && $sig == 9;
-  return ('fatal', '服务器硬盘满了。等一会儿让旧文件自动删掉，或者清一清 VPS 的硬盘。', '') if $t =~ /no space left/;
+  return ('fatal', '服务器硬盘满了。请先把已有视频保存到本地或点删除，腾出空间后再试。', '') if $t =~ /no space left/;
   return ('cookies_bad', '你上传的 cookies 已经失效了（过期或者 YouTube 让它下线了）。请按下面的步骤重新导出一份再上传。', 'cookies')
     if $e =~ /cookies are no longer valid|cookies (have|has) (expired|been rotated)/;
   return ('need_cookies', '这个视频有年龄限制，YouTube 要求登录才能看。请上传一个已满 18 岁的 YouTube 小号的 cookies。', 'cookies')
@@ -4311,7 +4335,7 @@ sub run_job {
   update_ytdlp('每天一次') if update_due($C{update_hours});
   my $free = disk_free_mb($DATA);
   if ($free >= 0 && $free < $C{min_free_mb}) {
-    return fail_job($id, "服务器硬盘只剩 ${free}MB，放不下视频。等旧文件自动删掉，或者清一清 VPS 的硬盘。", '');
+    return fail_job($id, "服务器硬盘只剩 ${free}MB，放不下视频。请先把已有视频保存到本地或点删除，腾出空间后再试。", '');
   }
   my @ms = method_order($plat);
   my $updated = 0;
@@ -4446,7 +4470,7 @@ sub trim_log {
 }
 
 #----------------------------------------------------------------------
-# 定时清理：传完的文件过一会儿删，放太久没人拿的也删，旧任务记录也删。
+# 定时清理：浏览器完整收下的文件过一会儿删。没点保存的视频不按时间删。
 #----------------------------------------------------------------------
 sub sweep {
   my $now = time;
