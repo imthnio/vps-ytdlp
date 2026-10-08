@@ -66,6 +66,7 @@ page=$($C -b "$J" "$B/")
 has page "$page" '保存到本地'
 has page-compress "$page" '压缩后保存到本地'
 has page-wm "$page" '压缩后添加水印保存到本地'
+has page-64mb "$page" '64MB 内存的小鸡也可以压'
 if printf '%s' "$page" | grep -q '下好以后会自动存到 Mac'; then bad page-no-auto; else ok page-no-auto; fi
 check need-header "$($C -b "$J" -o /dev/null -w '%{http_code}' -d 'url=x' "$B/api/add")" 403
 
@@ -177,6 +178,8 @@ has export-bitrate "$(cat "$T/calls.log")" '600k'
 has export-tag "$(cat "$T/calls.log")" 'hvc1'
 has export-speed "$(cat "$T/calls.log")" 'atempo=2.0000'
 has export-scale "$(cat "$T/calls.log")" 'scale=min(960'
+has export-lowmem "$(cat "$T/calls.log")" 'pools=none:lookahead-slices=0:wpp=0'
+has export-onethread "$(cat "$T/calls.log")" '-threads 1 -filter_threads 1'
 rm -rf "$T/out" && mkdir -p "$T/out"
 (cd "$T/out" && $C -b "$J" -OJ "$B/dl/$id?which=export")
 check export-size "$(wc -c < "$T/out/$(ls "$T/out" | head -n 1)" | tr -d ' ')" 3145728

@@ -33,7 +33,7 @@
 #   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=2.2.0
+VERSION=2.2.1
 # ytdlp-onekey-begin
 
 #----------------------------------------------------------------------
@@ -1284,14 +1284,26 @@ write_swap_file() {
 prepare_memory() {
   if [ -n "$MEM_MB" ] && [ "$MEM_MB" -le 512 ]; then
     oc=$(tr -d ' \r\n' < /proc/sys/vm/overcommit_memory 2>/dev/null || true)
+    sw=$(tr -d ' \r\n' < /proc/sys/vm/swappiness 2>/dev/null || true)
+    tuned=0
+    # 很多容器的 /proc/sys 是只读的。[ -w ] 仍会说能写，直接重定向还会把报错打到屏幕上。
     if [ "$oc" != 1 ]; then
-      # 很多容器的 /proc/sys 是只读的。[ -w ] 仍会说能写，直接重定向还会把报错打到屏幕上。
       if sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 \
         || { printf '1\n' > /proc/sys/vm/overcommit_memory; } 2>/dev/null; then
-        mkdir -p /etc/sysctl.d 2>/dev/null || true
-        { printf 'vm.overcommit_memory=1\n' > /etc/sysctl.d/99-ytdlp-web-overcommit.conf; } 2>/dev/null || true
+        tuned=1
         say_ok "小内存机器已放开内存申请限制"
       fi
+    fi
+    # 64MB 的鸡靠虚拟内存压 HEVC。更愿意用 swap，免得系统先把压缩进程杀掉。
+    if [ "$sw" != 100 ]; then
+      if sysctl -w vm.swappiness=100 >/dev/null 2>&1 \
+        || { printf '100\n' > /proc/sys/vm/swappiness; } 2>/dev/null; then
+        tuned=1
+      fi
+    fi
+    if [ "$tuned" = 1 ]; then
+      mkdir -p /etc/sysctl.d 2>/dev/null || true
+      { printf 'vm.overcommit_memory=1\nvm.swappiness=100\n' > /etc/sysctl.d/99-ytdlp-web-overcommit.conf; } 2>/dev/null || true
     fi
   fi
   plan=$(swap_plan_mb "${MEM_MB:-0}" "${SWAP_MB:-0}" "${DISK_MB:-0}")
@@ -2389,7 +2401,7 @@ use POSIX qw(:sys_wait_h setsid strftime setlocale LC_ALL);
 use Fcntl qw(:flock O_WRONLY O_CREAT O_APPEND);
 use File::Path qw(make_path remove_tree);
 
-my $VERSION = '2.2.0';
+my $VERSION = '2.2.1';
 setlocale(LC_ALL, 'C');
 $SIG{PIPE} = 'IGNORE';
 
@@ -2979,13 +2991,53 @@ sub ffmpeg_encoder_ok {
   return $yes eq 'yes';
 }
 
+sub mem_total_mb {
+  my $t = slurp('/proc/meminfo') || '';
+  return int($1 / 1024) if $t =~ /MemTotal:\s+(\d+)\s+kB/;
+  if (open(my $fh, '-|', 'sysctl', '-n', 'hw.memsize')) {
+    my $b = <$fh>;
+    close $fh;
+    return int($1 / 1048576) if defined $b && $b =~ /(\d+)/ && $1 > 0;
+  }
+  return -1;
+}
+
+# 64MB 的小鸡也要能压。此刻内存很紧只说明会慢，不因此藏起压缩按钮。
+# 安装时已经按内存把虚拟内存补到大约 768MB，压缩会慢，但能跑完。
+sub compress_note {
+  my $total = mem_total_mb();
+  my $avail = mem_available_mb();
+  my $low = ($total >= 0 && $total <= 512) || ($avail >= 0 && $avail < 384);
+  return $low ? '内存很小，压缩会慢一些，但可以压。' : '';
+}
+
 sub compress_block_reason {
   return '服务器上的 ffmpeg 不能压 HEVC（没有 libx265）。请先点「保存到本地」。' unless ffmpeg_encoder_ok();
-  my $mb = mem_available_mb();
-  return '可用内存不到 384MB，HEVC 两遍压缩会把机器撑死。请先点「保存到本地」。' if $mb >= 0 && $mb < 384;
   my $free = disk_free_mb($DATA);
   return "服务器硬盘只剩 ${free}MB，放不下压缩出来的文件。请先保存或删除已有视频。" if $free >= 0 && $free < $C{min_free_mb};
   return '';
+}
+
+# 数字越大，内存不够时越先被系统杀掉。网页调低，下载恢复成普通，压缩调到很高。
+# 没这个文件、或没有权限时，写失败也没关系。
+sub oom_adjust {
+  my ($n) = @_;
+  if (open(my $oh, '>', '/proc/self/oom_score_adj')) {
+    print $oh "$n\n";
+    close $oh;
+  }
+}
+
+# 压之前丢掉页缓存，把内存让给 ffmpeg。失败也没关系（没权限或没有这个文件）。
+sub reclaim_memory {
+  return unless -e '/proc/sys/vm/drop_caches';
+  for my $sync ('/bin/sync', '/usr/bin/sync') {
+    if (-x $sync) { system($sync); last; }
+  }
+  if (open(my $fh, '>', '/proc/sys/vm/drop_caches')) {
+    print $fh "1\n";
+    close $fh;
+  }
 }
 
 sub export_busy_id {
@@ -3104,6 +3156,7 @@ sub run_export {
   my $speed = ($st->{export_speed} || 1) + 0;
   $speed = 1 if $speed < 0.1 || $speed > 5;
   my $why = compress_block_reason();
+  reclaim_memory();
   if ($why || !is_video_name($src) || !-f "$dir/$src") {
     my $msg = $why || '这个文件不能压缩。图片和纯音频请直接保存到本地。';
     set_stat($id, export_state => 'error', export_error => $msg, line => $msg);
@@ -3134,12 +3187,15 @@ sub run_export {
       . '[lg][base]scale2ref=w=main_w*0.18:h=ow/mdar[wm][base2];'
       . '[base2][wm]overlay=main_w-overlay_w-main_w*0.02:main_h-overlay_h-main_w*0.02:format=auto,format=yuv420p[v]';
   }
-  my @ff = ($C{ffmpeg}, '-hide_banner', '-nostdin', '-y', '-loglevel', 'error', '-progress', 'pipe:1', '-i', $src);
+  # 单线程解码和滤镜，64MB 的鸡才不会一上来就被线程缓冲撑死。
+  my @ff = ($C{ffmpeg}, '-hide_banner', '-nostdin', '-y', '-loglevel', 'error', '-threads', '1', '-filter_threads', '1', '-progress', 'pipe:1', '-i', $src);
   push @ff, '-i', $wm if $wm;
   my @vmap = $wm ? ('-filter_complex', $fc, '-map', '[v]') : ('-vf', $vchain, '-map', '0:v:0');
   my @venc = ('-c:v', 'libx265', '-preset', 'faster', '-pix_fmt', 'yuv420p', '-b:v', '600k');
-  my $x1 = 'bframes=4:frame-threads=1:pass=1:stats=x265.stats';
-  my $x2 = 'bframes=4:frame-threads=1:pass=2:stats=x265.stats';
+  # 关掉线程池和波前并行，少占内存。画质参数仍是 faster、600kbps、两遍、bframes=4。
+  my $xcommon = 'bframes=4:frame-threads=1:pools=none:lookahead-slices=0:wpp=0';
+  my $x1 = "$xcommon:pass=1:stats=x265.stats";
+  my $x2 = "$xcommon:pass=2:stats=x265.stats";
   set_stat($id, export_state => 'running', line => '正在压缩（第 1 遍，画面）…', pct => 0, export_pct => 0);
   my $ok = run_ffmpeg($id, $dir, $dur, '正在压缩（第 1 遍，画面）',
     'PCT', 0, 49, @ff, @vmap, '-an', @venc, '-x265-params', $x1, '-f', 'null', '/dev/null');
@@ -3151,6 +3207,7 @@ sub run_export {
     return;
   }
   if (-e "$dir/cancel") { remove_tree($dir); logline("任务 $id 压缩已取消"); return; }
+  reclaim_memory();
   my @amap = ('-an');
   if ($has_a) {
     my $af = atempo_chain($speed);
@@ -3664,6 +3721,7 @@ sub server_info {
     disk_low   => bool(disk_free_mb($DATA) >= 0 && disk_free_mb($DATA) < $C{min_free_mb}),
     compress_ok => bool(compress_block_reason() eq ''),
     compress_why => compress_block_reason(),
+    compress_note => compress_note(),
     version    => $VERSION,
     upgrading  => bool(upgrading()),
   };
@@ -3924,6 +3982,7 @@ sub run_cmd_capture {
   if ($pid == 0) {
     child_env();
     open(STDERR, '>&', \*STDOUT);
+    oom_adjust(0);
     exec { $cmd[0] } @cmd or POSIX::_exit(127);
   }
   my $buf = '';
@@ -4037,6 +4096,7 @@ sub run_ytdlp {
     chdir $dir;
     open(STDERR, '>&', \*STDOUT);
     eval { setpriority(0, 0, 10) };
+    oom_adjust(0);
     exec { $cmd[0] } @cmd or do { print "ERROR: 启动不了 $cmd[0]：$!\n"; POSIX::_exit(127); };
   }
   $CUR_CHILD = $pid;
@@ -4244,6 +4304,8 @@ sub run_ffmpeg {
     chdir $dir;
     open(STDERR, '>>', "$dir/log");
     eval { setpriority(0, 0, 10) };
+    # 内存不够时先杀掉压缩，别杀掉网页。这个值会跟着 exec 带到 ffmpeg。
+    oom_adjust(800);
     exec { $cmd[0] } @cmd or POSIX::_exit(127);
   }
   $CUR_CHILD = $pid;
@@ -4623,7 +4685,7 @@ YouTube 年龄限制、会员视频，推特敏感内容，B站大会员视频�
 </details>
 <details class="card"><summary>常见问题</summary>
 <p><b>视频存在哪？</b> 下好以后先留在 VPS。点「保存到本地」才下载到你这台电脑，位置是浏览器自己的下载文件夹（很多人设成了桌面）。浏览器完整收下以后，VPS 上的视频会删掉。网页上那一条会显示 ✅ 然后自己消失。</p>
-<p><b>压缩呢？</b> 视频旁边还有「压缩后保存到本地」和「压缩后添加水印保存到本地」。压缩按 HEVC、最大 960×540、25 帧、平均 600 kbps，声音是 44.1 kHz 立体声 AAC 64 kbps。可以选 0.1 到 5 倍速。水印用你上传的 PNG 或 JPG，自己选透明度，放在右下角。图片和纯音频不能压缩。</p>
+<p><b>压缩呢？</b> 视频旁边还有「压缩后保存到本地」和「压缩后添加水印保存到本地」。64MB 内存的小鸡也可以压，会慢一些。压缩按 HEVC、最大 960×540、25 帧、平均 600 kbps，声音是 44.1 kHz 立体声 AAC 64 kbps。可以选 0.1 到 5 倍速。水印用你上传的 PNG 或 JPG，自己选透明度，放在右下角。图片和纯音频不能压缩。</p>
 <p><b>图片帖（小红书图文、推特图片）？</b> 一张图直接存成图片；好几张会打成一个 zip，在电脑上双击就解开。纯文字的帖子没有东西可下，网页会告诉你。这两种只显示「保存到本地」。</p>
 <p><b>点了保存却没有文件？</b> Safari 第一次会问「是否允许在此网站上下载」，点「允许」。Chrome 如果问「此网站想下载多个文件」，点「允许」。也可以再点一次「保存到本地」或「下载压缩结果」。</p>
 <p><b>下载到一半网断了？</b> 在浏览器的下载列表里点「继续/恢复」，会接着下，不用从头来。没收完的时候，VPS 上的文件还留着。</p>
@@ -4711,6 +4773,7 @@ function render(d){const box=$('#jobs');box.textContent='';
    if(j.video&&!busyEx&&d.info&&d.info.compress_ok){
     const c1=el('button',null,'压缩后保存到本地');c1.onclick=function(){openDlg(j.id,'compress');};row.appendChild(c1);
     const c2=el('button',null,'压缩后添加水印保存到本地');c2.onclick=function(){openDlg(j.id,'watermark');};row.appendChild(c2);
+    if(d.info.compress_note)row.appendChild(el('span','small',d.info.compress_note));
    }else if(j.video&&!busyEx&&d.info&&d.info.compress_why){row.appendChild(el('span','small',d.info.compress_why));}
    if(j.export_state==='ready'){const b2=el('button',null,'下载压缩结果');b2.onclick=function(){gotEx.add(j.id);keepEx();saveExport(j.id);};row.appendChild(b2);}}
   if(j.hint==='cookies'){const b=el('button','gray','去上传 cookies');b.onclick=()=>{$('#ck').open=true;$('#ck').scrollIntoView({behavior:'smooth'});};row.appendChild(b);}
@@ -4763,6 +4826,8 @@ sub open_listeners {
 sub main {
   my @ls = open_listeners();
   $0 = 'ytdlp-web';
+  # 内存不够时优先杀掉 ffmpeg（它自己会把分数调高），网页留着。
+  oom_adjust(-200);
   spit("$STATE/server.pid", "$$\n");
   logline("网页已启动，端口 $C{port}，版本 $VERSION");
   # 上次没下完就被重启的任务，标成失败，免得一直卡在“下载中”。
