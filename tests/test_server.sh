@@ -65,9 +65,9 @@ check login-ok "$($C -c "$J" -o /dev/null -w '%{http_code}' -d 'user=admin&pass=
 page=$($C -b "$J" "$B/")
 has page "$page" '保存到本地'
 has page-start "$page" '开始下载到 VPS'
-has page-compress "$page" '下载并压缩'
-if printf '%s' "$page" | grep -q '水印\|压缩后保存到本地'; then bad page-no-old; else ok page-no-old; fi
-has page-64mb "$page" '64MB 内存的小鸡也可以压'
+has page-480 "$page" 'value="p480"'
+has page-144 "$page" 'value="p144"'
+if printf '%s' "$page" | grep -q '水印\|压缩\|倍速'; then bad page-no-compress; else ok page-no-compress; fi
 if printf '%s' "$page" | grep -q '下好以后会自动存到 Mac'; then bad page-no-auto; else ok page-no-auto; fi
 check need-header "$($C -b "$J" -o /dev/null -w '%{http_code}' -d 'url=x' "$B/api/add")" 403
 
@@ -157,72 +157,28 @@ id=$(add 'https://www.youtube.com/watch?v=botbotbotb2' | job_id)
 has bot-cookies "$(wait_job "$id")" '"state":"done"'
 has sticky "$(cat "$T/data/state/sticky" 2>/dev/null)" 'cookies'
 
-# 下载并压缩：在 VPS 上压好，只留压缩后的，原视频删掉；保存到本地收完就删
-wait_ex() {
-  n=0
-  while [ "$n" -lt 100 ]; do
-    js=$($C -b "$J" "$B/api/jobs" | perl -ne 'while(/(\{"[^{}]*?"id":"'"$1"'"[^{}]*\})/g){print $1}')
-    case "$js" in
-      *'"export_state":"done"'*|*'"export_state":"error"'*|*'"state":"error"'*) printf '%s' "$js"; return 0 ;;
-    esac
-    n=$((n + 1))
-    sleep 0.3
-  done
-  printf '%s' "$js"
-}
-addc() { $C -b "$J" -H 'X-YTW: 1' --data-urlencode "url=$1" -d "q=${2:-mac}" -d compress=1 --data-urlencode "speed=$3" "$B/api/add"; }
-has compress-can "$($C -b "$J" "$B/api/jobs")" '"compress_ok":true'
-has c-audio "$(addc 'https://www.youtube.com/watch?v=compressaud' m4a 1)" '只要声音'
-has c-speed-step "$(addc 'https://www.youtube.com/watch?v=compressbad' mac 1.23)" '最多一位小数'
-has c-speed-range "$(addc 'https://www.youtube.com/watch?v=compressbad' mac 9)" '0.1 到 5'
-has c-speed-zero "$(addc 'https://www.youtube.com/watch?v=compressbad' mac 0)" '0.1 到 5'
+# 画质：480p / 360p / 240p / 144p 都按高度挑 H.264，网页上显示对应的名字
+for r in 480 360 240 144; do
+  mark=$(wc -l < "$T/calls.log")
+  id=$(add "https://www.youtube.com/watch?v=res${r}x${r}x" "p$r" | job_id)
+  js=$(wait_job "$id")
+  has "q$r-done" "$js" '"state":"done"'
+  has "q$r-label" "$js" "\"quality\":\"${r}p\""
+  has "q$r-args" "$(sed -n "$((mark + 1)),\$p" "$T/calls.log" | grep "res${r}x" | head -n 1)" "-S vcodec:h264,res:$r,acodec:aac"
+  $C -b "$J" -H 'X-YTW: 1' -d "id=$id" "$B/api/delete" > /dev/null
+done
+# 不认识的画质按推荐的处理
+js=$(wait_job "$(add 'https://www.youtube.com/watch?v=qbadqbadqba' p999 | job_id)")
+has q-unknown "$js" 'Mac 能直接播放'
+# 压缩已经彻底去掉：旧接口没有了，旧参数也不会触发压缩
+has no-compress-api "$($C -b "$J" -H 'X-YTW: 1' -d "id=x" "$B/api/compress")" 'not found'
+has no-export-api "$($C -b "$J" -H 'X-YTW: 1' -d "id=x" "$B/api/export")" 'not found'
 mark=$(wc -l < "$T/calls.log")
-id=$(addc 'https://www.youtube.com/watch?v=compress0001' mac 1.5 | job_id)
-js=$(wait_ex "$id")
-sed -n "$((mark + 1)),\$p" "$T/calls.log" > "$T/c.log"
-has c-done "$js" '"export_state":"done"'
-has c-line "$js" '压缩好了'
-has c-meta "$js" '1.5 倍速'
-has c-note "$js" '原视频已删除'
-has c-hasfile "$js" '"has_file":true'
-has c-x265 "$(cat "$T/c.log")" 'libx265'
-has c-bitrate "$(cat "$T/c.log")" '600k'
-has c-tag "$(cat "$T/c.log")" 'hvc1'
-has c-atempo "$(cat "$T/c.log")" 'atempo=1.5000'
-has c-setpts "$(cat "$T/c.log")" 'setpts=0.666667\*PTS'
-has c-scale "$(cat "$T/c.log")" 'scale=min(960'
-has c-lowmem "$(cat "$T/c.log")" 'pools=none:lookahead-slices=0:wpp=0'
-has c-onethread "$(cat "$T/c.log")" '-threads 1 -filter_threads 1'
-check c-files "$(ls "$T/data/jobs/$id" | grep -c -E '\.(mp4|mov)$')" 1
-check c-only-mov "$(ls "$T/data/jobs/$id" | grep -c -- '-压缩\.mov$')" 1
-rm -rf "$T/out" && mkdir -p "$T/out"
-(cd "$T/out" && $C -b "$J" -OJ "$B/dl/$id")
-check c-dl-size "$(wc -c < "$T/out/$(ls "$T/out" | head -n 1)" | tr -d ' ')" 3145728
-n=0
-while [ -d "$T/data/jobs/$id" ] && [ "$n" -lt 40 ]; do sleep 0.5; n=$((n + 1)); done
-if [ -d "$T/data/jobs/$id" ]; then bad c-delete-after-save; else ok c-delete-after-save; fi
-
-# 原速：不加 setpts/atempo；VP9 的视频选了压缩就不先转 H.264
-mark=$(wc -l < "$T/calls.log")
-id=$(addc 'https://www.youtube.com/watch?v=compressvp9' mac 1 | job_id)
-js=$(wait_ex "$id")
-sed -n "$((mark + 1)),\$p" "$T/calls.log" > "$T/c.log"
-has c1-done "$js" '"export_state":"done"'
-has c1-meta "$js" '原速'
-if grep -q 'setpts\|atempo' "$T/c.log"; then bad c1-no-speed; else ok c1-no-speed; fi
-if grep -q 'libx264' "$T/c.log"; then bad c1-no-mac-fix; else ok c1-no-mac-fix; fi
-has c1-again "$($C -b "$J" -H 'X-YTW: 1' -d "id=$id" "$B/api/compress")" '已经压缩好了'
-$C -b "$J" -H 'X-YTW: 1' -d "id=$id" "$B/api/delete" > /dev/null
-if [ -d "$T/data/jobs/$id" ]; then bad c1-delete; else ok c1-delete; fi
-
-# 普通下载的视频也能补一次压缩（压缩失败后的「重新压缩」走同一个接口）
-id=$(add 'https://www.youtube.com/watch?v=compresslat' | job_id)
-wait_job "$id" > /dev/null
-has c2-plain "$($C -b "$J" "$B/api/jobs")" '已留在 VPS'
-has c2-ok "$($C -b "$J" -H 'X-YTW: 1' -d "id=$id" "$B/api/compress")" '"ok":true'
-js=$(wait_ex "$id")
-has c2-done "$js" '"export_state":"done"'
-check c2-only-mov "$(ls "$T/data/jobs/$id" | grep -c -E '\.mp4$')" 0
+id=$($C -b "$J" -H 'X-YTW: 1' --data-urlencode 'url=https://www.youtube.com/watch?v=oldcompress' -d q=mac -d compress=1 -d speed=2 "$B/api/add" | job_id)
+js=$(wait_job "$id")
+has old-param-done "$js" '"state":"done"'
+check old-param-mp4 "$(ls "$T/data/jobs/$id" | grep -c '\.mp4$')" 1
+if sed -n "$((mark + 1)),\$p" "$T/calls.log" | grep -q 'libx265\|setpts\|atempo'; then bad old-param-no-compress; else ok old-param-no-compress; fi
 $C -b "$J" -H 'X-YTW: 1' -d "id=$id" "$B/api/delete" > /dev/null
 
 # 删任务
