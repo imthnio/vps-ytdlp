@@ -1,7 +1,7 @@
 #!/bin/sh
 # 假的 ffmpeg / ffprobe（看自己的名字决定扮演哪个），只给 test_server.sh 用。
 # 文件名里有 .webm 的，假装是 VP9 + Opus（Mac 放不了，要转码）；其他假装是 H.264 + AAC。
-# -encoders 时报有 libx265，给压缩按钮的检查用。两遍编码的第一遍输出是 /dev/null 或 -，不拷文件。
+# 输出是 /dev/null 或 - 时不拷文件。
 [ -n "${FAKE_LOG:-}" ] && echo "$(basename "$0") $*" >> "$FAKE_LOG"
 case " $* " in
   *" -encoders "*|*" -encoders")
