@@ -33,7 +33,7 @@
 #   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=2.4.0
+VERSION=2.5.0
 # ytdlp-onekey-begin
 
 #----------------------------------------------------------------------
@@ -2378,7 +2378,7 @@ use POSIX qw(:sys_wait_h setsid strftime setlocale LC_ALL);
 use Fcntl qw(:flock O_WRONLY O_CREAT O_APPEND);
 use File::Path qw(make_path remove_tree);
 
-my $VERSION = '2.4.0';
+my $VERSION = '2.5.0';
 setlocale(LC_ALL, 'C');
 $SIG{PIPE} = 'IGNORE';
 
@@ -2978,12 +2978,27 @@ sub job_view {
   my $mark = delivered_mark($id, $st);
   my $delivered = $mark ? 1 : 0;
   my $sent_at = $delivered ? ((stat($mark))[9] || 0) : 0;
-  my $hidden = $st->{dismissed} || ($delivered && time - $sent_at > 15) ? 1 : 0;
+  my $ps = $st->{push_state} || '';
+  my $push_err = '';
+  if ($ps eq 'running' && !push_alive($st)) {
+    $ps = 'error';
+    $push_err = '上传被打断了（服务器可能重启过），可以再传一次。';
+  } elsif ($ps eq 'error') {
+    $push_err = $st->{push_error} || '上传没成功，可以再传一次。';
+  }
+  my $pushed = $ps eq 'done' ? 1 : 0;
+  my $ptitle = $st->{push_title} || '';
+  my $hidden = $st->{dismissed} || ($delivered && time - $sent_at > 15)
+    || ($pushed && time - ($st->{pushed} || 0) > 15) ? 1 : 0;
   if ($state eq 'queued') {
     $line = upgrading() ? '服务器正在升级，等一会儿会自动开始' : '排队中，前面的下完就轮到它';
   } elsif ($state eq 'done') {
     if ($delivered) {
       $line = '✅ 已存到你的电脑，VPS 上的文件马上删除';
+    } elsif ($pushed) {
+      $line = "✅ 已上传到文件传输「$ptitle」，VPS 上这份已删除";
+    } elsif ($ps eq 'running') {
+      $line = sprintf('正在上传到文件传输「%s」（%d%%）', $ptitle, $st->{push_pct} || 0);
     } elsif (!$path) {
       $line = $st->{gone} || '文件已经不在服务器上了';
     } elsif ($sent > 0) {
@@ -3008,10 +3023,158 @@ sub job_view {
     size    => human_size($size),
     has_file => bool($path),
     delivered => bool($delivered),
+    pushing => bool($ps eq 'running'),
+    pushed  => bool($pushed),
+    push_pct => num($ps eq 'running' ? ($st->{push_pct} || 0) : 0),
+    push_error => $push_err,
     error   => $st->{error} || '',
     hint    => $st->{hint} || '',
     created => num($m->{created} || 0),
   };
+}
+
+#----------------------------------------------------------------------
+# 上传到文件传输（minishare）。同一台 VPS 上装了 minishare 时，任务上多一个
+# 「上传到文件传输」按钮：选一个分享，视频直接进那个分享，传完就从这里删掉。
+# 不用填地址和密钥：去 minishare 的服务文件里找端口和数据目录，
+# 再读数据目录里的 ext-key（minishare 1.7.0 起启动时自动生成）。
+# 也可以在配置文件里写 share_url=http://主机:端口 和 share_key=密钥 手动指定。
+#----------------------------------------------------------------------
+sub share_target {
+  my ($host, $port, $key) = ('', 0, '');
+  if (($C{share_url} || '') =~ m{^http://\[?([0-9A-Za-z.:-]+?)\]?:(\d+)/?$}) {
+    ($host, $port, $key) = ($1, $2, $C{share_key} || '');
+  } else {
+    my ($sh, $sp, $sd);
+    for my $f ('/etc/systemd/system/minishare.service', '/etc/init.d/minishare') {
+      my $t = slurp($f);
+      next unless defined $t;
+      ($sh) = $t =~ /^\s*(?:Environment=|export\s+)SHARE_HOST="?([^"\s]*)"?/m;
+      ($sp) = $t =~ /^\s*(?:Environment=|export\s+)SHARE_PORT="?(\d+)"?/m;
+      ($sd) = $t =~ /^\s*(?:Environment=|export\s+)SHARE_DATA="?([^"\n]+?)"?\s*$/m;
+      last;
+    }
+    return undef unless $sp && $sd;
+    $sh = '' unless defined $sh;
+    $host = ($sh eq '' || $sh eq '0.0.0.0') ? '127.0.0.1' : $sh eq '::' ? '::1' : $sh;
+    ($port, $key) = ($sp, slurp("$sd/ext-key") || '');
+  }
+  $key =~ s/\s+//g;
+  return undef unless $host && $port && $key =~ /^[0-9A-Za-z_-]{16,128}$/;
+  return { host => $host, port => $port, key => $key };
+}
+
+# 连 minishare，发一个请求，返回 (状态码, 正文)。连不上时状态码是 0，正文是原因。
+# $send 负责写请求体，出错时返回原因（这时还会试着读一下 minishare 的回复，
+# 它提前拒绝时——比如空间不够——回复里有真正的原因）。
+sub share_request {
+  my ($t, $method, $path, $len, $send) = @_;
+  my $s;
+  if ($t->{host} =~ /:/ && eval { require IO::Socket::IP; 1 }) {
+    $s = IO::Socket::IP->new(PeerHost => $t->{host}, PeerPort => $t->{port}, Proto => 'tcp', Timeout => 10);
+  } else {
+    $s = IO::Socket::INET->new(PeerAddr => $t->{host}, PeerPort => $t->{port}, Proto => 'tcp', Timeout => 10);
+  }
+  return (0, '连不上文件传输，它可能没在运行') unless $s;
+  binmode $s;
+  my $hh = $t->{host} =~ /:/ ? "[$t->{host}]" : $t->{host};
+  my $h = "$method $path HTTP/1.1\r\nHost: $hh:$t->{port}\r\nAuthorization: Bearer $t->{key}\r\nConnection: close\r\n";
+  $h .= "Content-Type: application/octet-stream\r\nContent-Length: $len\r\n" if defined $len;
+  my $err = write_all($s, "$h\r\n") ? '' : '连不上文件传输';
+  $err = $send->($s) || '' if !$err && $send;
+  my ($resp, $buf) = ('', '');
+  my $sel = IO::Select->new($s);
+  while ($sel->can_read(120)) {
+    my $n = sysread($s, $buf, 65536);
+    last unless $n;
+    $resp .= $buf;
+    last if length($resp) > 4 * 1024 * 1024;
+  }
+  close $s;
+  my ($code) = $resp =~ m{^HTTP/1\.[01] (\d{3})};
+  my $body = $resp =~ /\r\n\r\n(.*)\z/s ? $1 : '';
+  return (0, $err) if $err && !$code;
+  return (0, '文件传输没有回应') unless $code;
+  return ($code, $body);
+}
+
+# 从 minishare 的 JSON 回复里挑出 error 那句话。
+sub share_error {
+  my ($code, $body) = @_;
+  return $body if !$code;
+  return '文件传输的密钥对不上。重启一下文件传输（minishare）再试。' if $code == 401;
+  if (($body || '') =~ /"error":\s*"((?:[^"\\]|\\.)*)"/) {
+    my $e = $1;
+    $e =~ s/\\(["\\\/])/$1/g;
+    return $e;
+  }
+  return $code == 404 ? '文件传输版本太旧，不支持这个功能。请先更新文件传输（minishare）。' : "文件传输出错了（$code）";
+}
+
+sub share_list {
+  my $t = share_target() or return (undef, '这台 VPS 上没找到文件传输（minishare 1.7.0 以上）。');
+  my ($code, $body) = share_request($t, 'GET', '/api/ext/shares?fmt=tsv');
+  return (undef, share_error($code, $body)) unless $code == 200;
+  my @s;
+  for my $l (split /\n/, $body) {
+    my ($sid, $n, $size, $exp, $owner, $title) = split /\t/, $l, 6;
+    next unless defined $title && $sid =~ /^[A-Za-z0-9_-]{1,40}$/;
+    push @s, { id => $sid, files => num($n), size => $size, owner => $owner, title => $title, expires => num($exp) };
+  }
+  return (\@s, '');
+}
+
+sub push_alive {
+  my ($st) = @_;
+  return 0 unless ($st->{push_state} || '') eq 'running';
+  my $pid = $st->{push_pid} || 0;
+  return 1 if !$pid && time - ($st->{push_at} || 0) < 30;
+  return ($pid && kill(0, $pid)) ? 1 : 0;
+}
+
+sub push_fail {
+  my ($id, $why) = @_;
+  set_stat($id, push_state => 'error', push_error => $why) if -d job_dir($id);
+  logline("上传到文件传输失败 $id：$why");
+}
+
+# 在后台进程里跑：把文件推给 minishare，每秒记一次进度。
+sub push_run {
+  my ($id, $sid) = @_;
+  my $t = share_target() or return push_fail($id, '这台 VPS 上没找到文件传输。');
+  my $path = media_path($id) or return push_fail($id, '文件已经不在 VPS 上了。');
+  my $name = job_stat($id)->{file};
+  my $size = -s $path;
+  open(my $fh, '<', $path) or return push_fail($id, '读不了这个文件。');
+  binmode $fh;
+  my $last = time;
+  my ($code, $body) = share_request($t, 'POST',
+    '/api/ext/upload?share=' . pct_encode($sid) . '&name=' . pct_encode($name), $size, sub {
+      my ($s) = @_;
+      my ($done, $buf) = (0, '');
+      while (1) {
+        my $n = read($fh, $buf, 262144);
+        return '读文件出错了。' unless defined $n;
+        last unless $n;
+        write_all($s, $buf) or return '传到一半断开了，可以再传一次。';
+        $done += $n;
+        if (time - $last >= 1) {
+          $last = time;
+          return '已取消' unless -d job_dir($id);
+          set_stat($id, push_pct => $size ? int($done * 100 / $size) : 0);
+        }
+      }
+      return $done == $size ? '' : '文件在上传过程中变了，请再传一次。';
+    });
+  close $fh;
+  return unless -d job_dir($id);
+  return push_fail($id, share_error($code, $body)) unless $code == 200 && $body =~ /"ok":\s*true/;
+  my ($title) = $body =~ /"title":\s*"((?:[^"\\]|\\.)*)"/;
+  unlink $path;
+  my %up = (push_state => 'done', pushed => time, push_pct => 100);
+  $up{push_title} = $title if defined $title && length $title;
+  set_stat($id, %up);
+  logline("已上传到文件传输 $id -> $sid");
 }
 
 #----------------------------------------------------------------------
@@ -3315,6 +3478,10 @@ sub handle {
     delete $_->{hidden} for @v;
     return respond_json($c, $r, 200, { jobs => \@v, info => server_info() });
   }
+  if ($p eq '/api/shares' && $m eq 'GET') {
+    my ($list, $why) = share_list();
+    return respond_json($c, $r, 200, $list ? { shares => $list } : { error => $why });
+  }
   # 改东西的请求必须带上网页自己加的暗号，别的网站骗不了你的浏览器来下单。
   if ($m eq 'POST' && $p =~ m{^/api/}) {
     return respond_json($c, $r, 403, { error => '请刷新网页再试一次' }) unless ($r->{headers}{'x-ytw'} || '') eq '1';
@@ -3325,10 +3492,44 @@ sub handle {
       $ok{note} = '收到了。服务器正在升级，等正在下的视频下完会自动重启，这个会在重启后自动开始下载，不用管。' if $id && upgrading();
       return respond_json($c, $r, 200, $id ? \%ok : { error => $why });
     }
+    if ($p eq '/api/push') {
+      my ($id, $sid) = ($f->{id}, $f->{share} || '');
+      return respond_json($c, $r, 404, { error => '没有这个任务' }) unless valid_id($id) && -d job_dir($id);
+      return respond_json($c, $r, 200, { error => '请选一个分享' }) unless $sid =~ /^[A-Za-z0-9_-]{1,40}$/;
+      my $st = job_stat($id);
+      return respond_json($c, $r, 200, { error => '还没下好' }) unless ($st->{state} || '') eq 'done';
+      return respond_json($c, $r, 200, { error => '文件已经不在 VPS 上了' }) unless media_path($id);
+      return respond_json($c, $r, 200, { error => '正在上传了' }) if push_alive($st);
+      return respond_json($c, $r, 200, { error => '正在保存到本地，等它传完再上传' }) if active_transfers($id);
+      return respond_json($c, $r, 200, { error => '这台 VPS 上没找到文件传输' }) unless share_target();
+      my $title = defined $f->{title} ? $f->{title} : '';
+      $title =~ s/[\x00-\x1f\x7f]//g;
+      $title = substr($title, 0, 120);
+      set_stat($id, push_state => 'running', push_at => time, push_pct => 0, push_title => $title,
+        push_share => $sid, push_error => '', push_pid => '');
+      my $pid = fork();
+      if (!defined $pid) {
+        set_stat($id, push_state => 'error', push_error => '服务器忙，请再试一次。');
+        return respond_json($c, $r, 200, { error => '服务器忙，请再试一次' });
+      }
+      if ($pid == 0) {
+        # 后台进程：和网页断开关系，网页重启也不影响它传完。
+        close $c;
+        setsid();
+        $0 = 'ytdlp-web-push';
+        eval { push_run($id, $sid) };
+        push_fail($id, "出错了：$@") if $@;
+        POSIX::_exit(0);
+      }
+      set_stat($id, push_pid => $pid);
+      logline("开始上传到文件传输 $id -> $sid");
+      return respond_json($c, $r, 200, { ok => bool(1) });
+    }
     if ($p eq '/api/delete') {
       my $id = $f->{id};
       return respond_json($c, $r, 404, { error => '没有这个任务' }) unless valid_id($id) && -d job_dir($id);
       my $st = job_stat($id);
+      kill('TERM', $st->{push_pid}) if push_alive($st) && $st->{push_pid};
       my $state = $st->{state} || 'queued';
       if ($state eq 'running') {
         if (open(my $cf, '>', job_dir($id) . '/cancel')) { close $cf; }
@@ -3342,7 +3543,8 @@ sub handle {
       # 网页说「这个已经存到电脑了，收起来吧」。只收已经送达的。
       my $id = $f->{id};
       return respond_json($c, $r, 404, { error => '没有这个任务' }) unless valid_id($id) && -d job_dir($id);
-      return respond_json($c, $r, 200, { error => '还没传完' }) unless delivered_mark($id);
+      return respond_json($c, $r, 200, { error => '还没传完' })
+        unless delivered_mark($id) || (job_stat($id)->{push_state} || '') eq 'done';
       set_stat($id, dismissed => 1);
       return respond_json($c, $r, 200, { ok => bool(1) });
     }
@@ -3388,6 +3590,7 @@ sub server_info {
     disk_low   => bool($free >= 0 && $free < $C{min_free_mb}),
     version    => $VERSION,
     upgrading  => bool(upgrading()),
+    share      => bool(share_target()),
   };
 }
 
@@ -4213,6 +4416,11 @@ sub sweep {
     my $meta = job_meta($id);
     my $state = $st->{state} || 'queued';
     my $created = $meta->{created} || (stat($dir))[9] || $now;
+    if ($state eq 'done' && ($st->{push_state} || '') eq 'done' && $now - ($st->{pushed} || 0) >= $C{grace}) {
+      # 已经上传到文件传输，这里的文件早删了，记录也收掉。
+      remove_tree($dir);
+      next;
+    }
     if ($state eq 'done') {
       # 浏览器把用户点的那一份完整收下以后再删。没点保存的一直留着。
       my $mark = delivered_mark($id, $st);
@@ -4313,6 +4521,12 @@ button.tiny{font-size:13px;padding:4px 10px;margin:2px 4px 2px 0;font-weight:500
 .job .row{margin-top:12px;gap:8px}
 .job .row button{font-size:14px;padding:8px 13px}
 .hintline{font-size:12.5px;color:var(--muted)}
+.pick{margin-top:12px;border:1px solid var(--line);border-radius:12px;padding:12px;background:var(--field)}
+.pick .ph{display:flex;justify-content:space-between;align-items:center;font-size:13px;font-weight:600;color:var(--muted);margin-bottom:8px}
+.pick .list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px}
+.pick .list button{display:block;text-align:left;background:var(--card);color:var(--text);border:1px solid var(--line);font-weight:600;padding:9px 12px}
+.pick .list button:hover{border-color:var(--brand);background:var(--soft);filter:none}
+.pick .list button span{display:block;font-size:12px;font-weight:400;color:var(--muted)}
 details.card{padding:0}details.card>summary{list-style:none;cursor:pointer;font-weight:600;padding:15px 18px;display:flex;justify-content:space-between;align-items:center}
 details.card>summary::-webkit-details-marker{display:none}
 details.card>summary:after{content:"";width:8px;height:8px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(45deg);transition:transform .2s;margin-right:4px}
@@ -4413,6 +4627,7 @@ YouTube 年龄限制、会员视频，推特敏感内容，B站大会员视频�
 <details class="card"><summary>常见问题</summary><div class="body">
 <p><b>视频存在哪？</b> 下好以后先留在 VPS。点「保存到本地」才下载到你这台电脑，位置是浏览器自己的下载文件夹（很多人设成了桌面）。浏览器完整收下以后，VPS 上的视频就删掉，网页上那一条会显示 ✅ 然后自己消失。</p>
 <p><b>图片帖（小红书图文、推特图片）？</b> 一张图直接存成图片；好几张会打成一个 zip，在电脑上双击就解开。纯文字的帖子没有东西可下，网页会告诉你。</p>
+<p><b>「上传到文件传输」是什么？</b> 这台 VPS 上也装了文件传输（minishare）时才有这个按钮。点它，选一个分享（比如「动态壁纸」），视频就直接放进那个分享里，不用先下到电脑再传上去。传完以后存视频这边的文件就删掉。想放进新的分享，先去文件传输里新建一个，再回来点。</p>
 <p><b>点了保存却没有文件？</b> Safari 第一次会问「是否允许在此网站上下载」，点「允许」。也可以再点一次「保存到本地」。</p>
 <p><b>下载到一半网断了？</b> 在浏览器的下载列表里点「继续/恢复」，会接着下，不用从头来。没收完的时候，VPS 上的文件还留着。</p>
 <p><b>为什么有的要「转码」，等很久？</b> Mac 自带播放器只认 H.264。网页总是先找现成的 H.264；只有原视频只有 VP9/AV1 时才转码。不想等就选「最高画质」，用 IINA/VLC 播放。</p>
@@ -4445,14 +4660,41 @@ function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className
 function btn(text,cls,fn){const b=el('button',cls,text);b.type='button';b.onclick=fn;return b;}
 // 已经存到电脑的：亮 1.5 秒 ✅，然后告诉服务器收起来，卡片消失。
 function dismiss(id){if(closing.has(id))return;closing.add(id);setTimeout(async()=>{try{await api('/api/dismiss',{id});}catch(e){}tick();},1500);}
+// 上传到文件传输：点按钮后在卡片里展开分享列表。列表放在 pick 里，
+// 网页每隔几秒重画一次，靠它记住是哪一条展开着。
+const pick={id:'',shares:null,err:'',busy:false};
+async function openPick(id){if(pick.id===id){pick.id='';tick();return;}
+ Object.assign(pick,{id,shares:null,err:'',busy:false});tick();
+ try{const r=await api('/api/shares');if(pick.id!==id)return;if(r.error)pick.err=r.error;else pick.shares=r.shares;}
+ catch(e){if(pick.id===id)pick.err='暂时连不上服务器，等一下再点。';}tick();}
+async function pushTo(j,s){if(pick.busy)return;pick.busy=true;
+ try{const r=await api('/api/push',{id:j.id,share:s.id,title:s.title||s.id});
+  if(r.error){pick.err=r.error;pick.busy=false;}else{pick.id='';}}
+ catch(e){pick.err='暂时连不上服务器，等一下再点。';pick.busy=false;}tick();}
+function pickBox(j){const b=el('div','pick');const h=el('div','ph');h.appendChild(el('span',null,'上传到哪个分享？传完就从 VPS 这里删除'));
+ h.appendChild(btn('取消','ghost tiny',()=>{pick.id='';tick();}));b.appendChild(h);
+ if(pick.err){b.appendChild(el('div','err',pick.err));return b;}
+ if(!pick.shares){b.appendChild(el('div','small','正在读文件传输里的分享…'));return b;}
+ if(!pick.shares.length){b.appendChild(el('div','small','文件传输里还没有发送分享。先去文件传输新建一个（比如「英语学习资料」），再回来点。'));return b;}
+ const l=el('div','list');
+ for(const s of pick.shares){const x=btn(s.title||('分享 '+s.id),null,()=>pushTo(j,s));x.disabled=pick.busy;
+  x.appendChild(el('span',null,[s.files+' 个文件',s.size,s.owner].filter(Boolean).join(' · ')));l.appendChild(x);}
+ b.appendChild(l);return b;}
 function pill(j){
  if(j.state==='error')return['失败','bad'];
+ if(j.pushed)return['已上传','ok'];
+ if(j.pushing)return['上传中','run'];
  if(j.state==='queued')return['排队中',''];
  if(j.state==='running')return['下载到 VPS','run'];
  if(j.delivered)return['已保存','ok'];
  if(!j.has_file)return['已不在 VPS',''];
  return['在 VPS 上','run'];}
-function render(d){const box=$('#jobs');box.textContent='';
+// 网页每隔一会儿重画一次。内容没变就不重画：重画会换掉按钮，
+// 正好在按下和松开之间换掉的话，这一下点击就丢了。
+let lastSig='';
+function render(d){const busy=d.jobs.some(j=>j.state==='queued'||j.state==='running'||j.pushing||(j.state==='done'&&(j.has_file||j.delivered)));
+ const sig=JSON.stringify([d,pick]);if(sig===lastSig)return busy;lastSig=sig;
+ const box=$('#jobs');box.textContent='';
  const u=$('#upg');if(d.info&&d.info.upgrading)say(u,'服务器正在升级：正在下载的会先下完，然后自动重启，排队的重启后自动接着下。不用管，也不用刷新网页。','info');else{u.className='msg';u.textContent='';}
  $('#count').textContent=d.jobs.length?d.jobs.length+' 个':'';
  if(!d.jobs.length)box.appendChild(el('div','empty','还没有任务。贴一个链接，点「开始下载到 VPS」。'));
@@ -4460,16 +4702,18 @@ function render(d){const box=$('#jobs');box.textContent='';
   const head=el('div','job-head');head.appendChild(el('div','t',j.title||j.url));const p=pill(j);head.appendChild(el('span','pill '+p[1],p[0]));c.appendChild(head);
   c.appendChild(el('div','meta',[j.plat,j.quality,j.size].filter(Boolean).join(' · ')));
   if(j.state==='error'){c.appendChild(el('div','err',j.error));}
-  else{c.appendChild(el('div','l'+(j.delivered?' okline':''),j.line));if(j.note)c.appendChild(el('div','note',j.note));
-   if(j.state==='running'||j.state==='queued'){const b=el('div','bar');const i=el('i');i.style.width=(j.pct||0)+'%';b.appendChild(i);c.appendChild(b);}}
-  if(j.delivered){box.appendChild(c);dismiss(j.id);continue;}
+  else{c.appendChild(el('div','l'+(j.delivered||j.pushed?' okline':''),j.line));if(j.note)c.appendChild(el('div','note',j.note));
+   if(j.push_error)c.appendChild(el('div','err','上传到文件传输没成功：'+j.push_error));
+   if(j.state==='running'||j.state==='queued'||j.pushing){const b=el('div','bar');const i=el('i');i.style.width=((j.pushing?j.push_pct:j.pct)||0)+'%';b.appendChild(i);c.appendChild(b);}}
+  if(j.delivered||j.pushed){box.appendChild(c);dismiss(j.id);continue;}
   const row=el('div','row');
-  if(j.has_file)row.appendChild(btn('保存到本地',null,()=>saveFile(j.id)));
+  if(j.has_file&&!j.pushing){row.appendChild(btn('保存到本地',null,()=>saveFile(j.id)));
+   if(d.info&&d.info.share)row.appendChild(btn('上传到文件传输',pick.id===j.id?'gray':'line',()=>openPick(j.id)));}
   if(j.hint==='cookies')row.appendChild(btn('去上传 cookies','gray',()=>{$('#ck').open=true;$('#ck').scrollIntoView({behavior:'smooth'});}));
   if(j.state==='error')row.appendChild(btn('再试一次','gray',async()=>{const r=await api('/api/add',{url:j.url,q:j.q});if(r.id){mine.add(r.id);keep();await api('/api/delete',{id:j.id});tick();}else if(r.error){say($('#msg'),r.error,1);}}));
   row.appendChild(el('span','spacer'));
-  row.appendChild(btn(j.state==='running'?'取消':'删除','ghost',async()=>{if(j.has_file&&!confirm('删除后 VPS 上的这个文件会立刻删掉，确定吗？'))return;await api('/api/delete',{id:j.id});tick();}));
-  c.appendChild(row);box.appendChild(c);}
+  row.appendChild(btn(j.state==='running'||j.pushing?'取消':'删除','ghost',async()=>{if(j.has_file&&!confirm(j.pushing?'取消上传并删除 VPS 上的这个文件，确定吗？':'删除后 VPS 上的这个文件会立刻删掉，确定吗？'))return;await api('/api/delete',{id:j.id});tick();}));
+  c.appendChild(row);if(pick.id===j.id&&j.has_file&&!j.pushing)c.appendChild(pickBox(j));box.appendChild(c);}
  const i=d.info;let f='yt-dlp '+(i.ytdlp||'?')+(i.updated?'（'+i.updated+' 检查过更新，每天自动更新）':'（每天自动更新）');
  if(i.method)f+=' · YouTube 上次成功的办法：'+i.method;f+=' · YouTube 被拦时会依次试：'+i.methods.join(' → ');
  f+=' · 完整传到你的电脑之后，才会删除 VPS 上的视频';if(i.free)f+=' · 服务器硬盘剩 '+i.free;
@@ -4482,7 +4726,7 @@ function render(d){const box=$('#jobs');box.textContent='';
   for(const s of i.cookie_sites){const b=btn(s.name+(s.bad?'（已失效，请重新上传）':'')+' ✕','gray tiny',async()=>{await api('/api/cookies/delete',{plat:s.key});say($('#ckmsg'),'已删除 '+s.name+' 的 cookies。');tick();});b.title='删除 '+s.name+' 的 cookies';st.appendChild(b);}
   st.appendChild(el('span',null,' 只有前面的办法都不行时才会用。'));}
  if(i.cookies_bad)$('#ck').open=true;
- return d.jobs.some(j=>j.state==='queued'||j.state==='running'||(j.state==='done'&&(j.has_file||j.delivered)));}
+ return busy;}
 let timer=null;
 async function tick(){clearTimeout(timer);let busy=false;try{busy=render(await api('/api/jobs'));}catch(e){}timer=setTimeout(tick,busy?1500:8000);}
 $('#ckfile').onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{$('#cktext').value=r.result;};r.readAsText(f);};
