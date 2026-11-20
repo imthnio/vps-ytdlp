@@ -106,7 +106,7 @@ check newer "$(yes_no x version_newer 2.0.1 2.0.0)" yes
 check newer-equal "$(yes_no x version_newer 2.0.0 2.0.0)" no
 check newer-major "$(yes_no x version_newer 2.0.0 1.9.9)" yes
 check ver-file "$(version_from_file ./install.sh)" "$VERSION"
-check ver-250 "$VERSION" 2.5.0
+check ver-251 "$VERSION" 2.5.1
 check mem-gate "$(grep -c '可用内存不到 384MB' install.sh || true)" 0
 check newer-211 "$(yes_no x version_newer 2.1.1 2.1.0)" yes
 # 网页服务里的版本号要和脚本一致（网页 /health 会显示它）
@@ -325,7 +325,7 @@ check link-bin "$(shortcut_link_dir /usr/bin:/bin)" /usr/bin
 if command -v perl >/dev/null 2>&1; then
   h=$(hash_password 'abc123')
   case "$h" in
-    \$6\$*|\$5\$*|\$1\$*) printf 'ok hash-format\n' ;;
+    \$6\$*|\$5\$*|\$1\$*|\$1?*) printf 'ok hash-format\n' ;;
     *) printf 'FAIL hash-format [%s]\n' "$h" >&2; fail=1 ;;
   esac
   again=$(P="abc123" H="$h" perl -e 'print crypt($ENV{P}, $ENV{H}) eq $ENV{H} ? "yes" : "no"')
@@ -381,7 +381,22 @@ check busy-fresh-old "$(FRESH_SECS=0 count_busy "$wd/jobs")" "1 2 1 0"
 kill "$live" 2>/dev/null
 wait "$live" 2>/dev/null
 check busy-dead-transfer "$(count_busy "$wd/jobs")" "1 2 0 1"
-rm -rf "$wd/jobs/e" "$wd/jobs/f" "$wd/jobs/g" "$wd/jobs/d"
+sleep 30 &
+plive=$!
+mkjob h "state=done
+file=p.mp4
+done_at=$(date +%s)
+push_state=running
+push_pid=$plive"
+mkjob i "state=done
+file=q.mp4
+done_at=$(date +%s)
+push_state=done"
+check busy-push-running "$(count_busy "$wd/jobs")" "1 2 1 1"
+kill "$plive" 2>/dev/null
+wait "$plive" 2>/dev/null
+check busy-push-dead "$(count_busy "$wd/jobs")" "1 2 0 1"
+rm -rf "$wd/jobs/e" "$wd/jobs/f" "$wd/jobs/g" "$wd/jobs/d" "$wd/jobs/h" "$wd/jobs/i"
 
 # 网页服务没在跑：不用等
 waitrun() {

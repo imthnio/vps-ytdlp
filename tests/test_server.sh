@@ -273,6 +273,9 @@ rm -f "$T/data/state/upgrading"
 has upg-resume "$(wait_job "$id")" '"state":"done"'
 if [ "$(grep -c '检查 yt-dlp 更新' "$T/server.log")" -gt "$nu" ]; then ok upg-update-later; else bad upg-update-later; fi
 has upg-info-off "$($C -b "$J" "$B/api/jobs")" '"upgrading":false'
+# /api/update：清掉上次更新时间，马上触发一次检查
+has api-update "$($C -b "$J" -H 'X-YTW: 1' -d '' "$B/api/update")" '"ok":true'
+check api-update-reset "$(sed -n 's/^last_update=//p' "$T/data/state/info")" 0
 # 安装脚本早就退出了（进程号不在了）：当没有牌子
 dead=$(sh -c 'echo $$')
 echo "$dead" > "$T/data/state/upgrading"

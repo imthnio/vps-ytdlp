@@ -28,6 +28,8 @@ YTDLP_WEB_NO_MAIN=1 T="$T" perl -e '
   is("bili-clean", (check_url("https://www.bilibili.com/video/BV1tHaA6qEXL/?trackid=web_pegasus_0.router-web-pegasus-2479516-f6fct.1791128443880.967&spm_id_from=333.1007.tianma.3-4-10.click&vd_source=bb26ce30756da1f2b9de51fa1d1980d1"))[0],
     "https://www.bilibili.com/video/BV1tHaA6qEXL/");
   is("bili-page", (check_url("https://m.bilibili.com/video/BV1bK411W797?p=2&share_source=copy"))[0], "https://www.bilibili.com/video/BV1bK411W797/?p=2");
+  is("bili-lower-bv", (check_url("https://www.bilibili.com/video/bv1tHaA6qEXL/?spm_id_from=333"))[0], "https://www.bilibili.com/video/BV1tHaA6qEXL/");
+  is("bili-av", (check_url("https://www.bilibili.com/video/AV170001/?p=3"))[0], "https://www.bilibili.com/video/av170001/?p=3");
   is("bili-share-text", (check_url("【标题】 https://b23.tv/AbCdEf1"))[0], "https://b23.tv/AbCdEf1");
   is("bili-plat", platform_of("https://b23.tv/AbCdEf1"), "bili");
   is("ig-clean", (check_url("https://www.instagram.com/p/Ddr-AMmDxqn/?stkn=MTl2emdjbXY4OGMxOQ=="))[0], "https://www.instagram.com/p/Ddr-AMmDxqn/");
@@ -83,6 +85,7 @@ YTDLP_WEB_NO_MAIN=1 T="$T" perl -e '
   like("cls-geo", (classify("ERROR: [BiliBili] 1: This video is not available in your country (geo restricted)", 0, "bili"))[1], qr/国家/);
   like("cls-timeout", (classify("ERROR: [TikTok] 1: timed out", 0, "tiktok"))[1], qr/TikTok/);
   like("cls-yt-same", (classify("ERROR: [youtube] x: Sign in to confirm you’re not a bot", 0, "youtube"))[1], qr/YouTube 认为/);
+  is("cls-extract-not-404", (classify("ERROR: [TikTok] 1: Unable to extract video url; not found", 0, "tiktok"))[0], "blocked");
   is("cls-oom", (classify("", 9, "bili"))[0], "fatal");
 
   # 方法表：YouTube 照旧以直接下载开头；其他平台每一步都写明走哪种网络

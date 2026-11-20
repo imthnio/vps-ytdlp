@@ -75,6 +75,9 @@ check('dy-br-h264', codecs.get('br-normal_720_0'), 'avc1')
 # 5) 图文：多张图
 r = run({'aweme_id': '7', 'desc': '图', 'images': [{'url_list': ['https://p/1.jpeg']}, {'url_list': ['https://p/2.jpeg']}]})
 check('dy-images', (r['_type'], len(r['entries'])), ('playlist', 2))
+# 5b) 没带问号的播放地址：自动用 ?ratio=default
+r = run({'aweme_id': '7', 'desc': '无问号', 'video': {'play_addr': {'url_list': ['https://aweme.snssdk.com/aweme/v1/playwm/']}}})
+check('dy-noquery-sep', r['formats'][0]['url'], 'https://aweme.snssdk.com/aweme/v1/play/?ratio=default')
 # 6) 分享页没数据：报 YTWEB_NEED_COOKIES
 ie = YtdlpWebIE()
 ie._get = lambda url, vid, headers=None, note=None, fatal=True: ('<html>nothing</html>', H(url))

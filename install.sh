@@ -33,7 +33,7 @@
 #   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=2.5.0
+VERSION=2.5.1
 # ytdlp-onekey-begin
 
 #----------------------------------------------------------------------
@@ -103,6 +103,9 @@ pid_alive() {
   case "$1" in
     ''|*[!0-9]*) return 1 ;;
   esac
+  if [ -r "/proc/$1/stat" ]; then
+    case "$(cat "/proc/$1/stat" 2>/dev/null)" in *") Z "*) return 1 ;; esac
+  fi
   kill -0 "$1" 2>/dev/null && return 0
   # 没权限发信号时，看 /proc 里还有没有这个进程。
   [ -d "/proc/$1" ]
@@ -236,14 +239,22 @@ count_busy() {
   for d in "$jd"/*; do
     [ -d "$d" ] || continue
     st=$(sed -n 's/^state=//p' "$d/status" 2>/dev/null | head -n 1)
+    ps=$(sed -n 's/^push_state=//p' "$d/status" 2>/dev/null | head -n 1)
     case "$st" in
       running) nr=$((nr + 1)) ;;
       queued|'') nq=$((nq + 1)) ;;
       done)
-        da=$(sed -n 's/^done_at=//p' "$d/status" | head -n 1 | tr -cd '0-9')
-        if [ -n "$da" ] && [ $((now - da)) -lt "${FRESH_SECS:-45}" ] && [ ! -s "$d/sent" ] &&
-          [ -n "$(sed -n 's/^file=//p' "$d/status" | head -n 1)" ]; then
-          nf=$((nf + 1))
+        if [ "$ps" = running ]; then
+          pp=$(sed -n 's/^push_pid=//p' "$d/status" 2>/dev/null | head -n 1 | tr -cd '0-9')
+          if [ -n "$pp" ] && pid_alive "$pp"; then
+            ns=$((ns + 1))
+          fi
+        elif [ "$ps" != done ]; then
+          da=$(sed -n 's/^done_at=//p' "$d/status" | head -n 1 | tr -cd '0-9')
+          if [ -n "$da" ] && [ $((now - da)) -lt "${FRESH_SECS:-45}" ] && [ ! -s "$d/sent" ] &&
+            [ -n "$(sed -n 's/^file=//p' "$d/status" | head -n 1)" ]; then
+            nf=$((nf + 1))
+          fi
         fi
         ;;
     esac
@@ -941,6 +952,22 @@ cgroup_mem_mb() {
   return 1
 }
 
+cgroup_swap_mb() {
+  if [ -r /sys/fs/cgroup/memory.swap.max ]; then
+    cgv=$(tr -d ' \r\n' < /sys/fs/cgroup/memory.swap.max 2>/dev/null)
+    case "$cgv" in
+      ''|max|*[!0-9]*) ;;
+      *)
+        if [ "${#cgv}" -le 13 ]; then
+          printf '%s' $((cgv / 1024 / 1024))
+          return 0
+        fi
+        ;;
+    esac
+  fi
+  return 1
+}
+
 disk_free_mb() {
   got=$(df -Pk "$1" 2>/dev/null | awk 'NR==2 {print int($4/1024)}')
   # 有些容器里 df 找不到挂载点，改问 stat。
@@ -1071,6 +1098,10 @@ detect_machine() {
   swap_kb=$(read_meminfo_kb "SwapTotal:")
   if [ -n "$swap_kb" ]; then
     SWAP_MB=$((swap_kb / 1024))
+  fi
+  cgsw_mb=$(cgroup_swap_mb 2>/dev/null || true)
+  if [ -n "$cgsw_mb" ] && [ "$cgsw_mb" -lt "$SWAP_MB" ]; then
+    SWAP_MB=$cgsw_mb
   fi
   DISK_MB=$(disk_free_mb /)
   [ -n "$DISK_MB" ] || DISK_MB=0
@@ -2135,7 +2166,7 @@ class YtdlpWebIE(InfoExtractor):
             if '你访问的页面不见了' in page or '笔记不存在' in page or 'Sorry, This Page Isn' in page:
                 _fail('YTWEB_GONE')
             _fail('YTWEB_NEED_COOKIES', 'xhs no note data')
-        title = (note.get('title') or note.get('desc') or '小红书笔记').strip()[:80] or '小红书笔记'
+        title = re.sub(r'\s+', ' ', note.get('title') or note.get('desc') or '').strip()[:80] or '小红书笔记'
         hdr = {'Referer': 'https://www.xiaohongshu.com/', 'User-Agent': MOBILE_UA}
         if note.get('type') == 'video' and note.get('video'):
             stream = ((note['video'].get('media') or {}).get('stream')) or {}
@@ -2174,21 +2205,22 @@ class YtdlpWebIE(InfoExtractor):
         if re.search(r'b23\.tv|bili2233\.cn', link):
             _, h = self._get(link, 'b23', note='展开 B 站短链接')
             link = h.url
-        m = re.search(r'(BV[0-9A-Za-z]{10})', link)
+        m = re.search(r'(BV[0-9A-Za-z]{10}|av\d+)', link, re.I)
         if not m:
             _fail('YTWEB_BAD_LINK')
-        bv = m.group(1)
+        vid = m.group(1)
+        vid = ('BV' if vid[:2].lower() == 'bv' else 'av') + vid[2:]
         p = int(self._search_regex(r'[?&]p=(\d+)', link, 'page', default='1'))
         # 先拿匿名访客 cookie（buvid3/buvid4），B 站风控会看这个。
-        self._get('https://m.bilibili.com/', bv, note='拿 B 站访客 cookie', fatal=False)
-        spi = self._download_json('https://api.bilibili.com/x/frontend/finger/spi', bv, note='拿 buvid4', fatal=False,
+        self._get('https://m.bilibili.com/', vid, note='拿 B 站访客 cookie', fatal=False)
+        spi = self._download_json('https://api.bilibili.com/x/frontend/finger/spi', vid, note='拿 buvid4', fatal=False,
                                   headers={'User-Agent': MOBILE_UA, 'Referer': 'https://m.bilibili.com/'}) or {}
         d = spi.get('data') or {}
         if d.get('b_3'):
             self._set_cookie('.bilibili.com', 'buvid3', d['b_3'])
         if d.get('b_4'):
             self._set_cookie('.bilibili.com', 'buvid4', d['b_4'])
-        page, _ = self._get(f'https://m.bilibili.com/video/{bv}', bv, note='打开 B 站手机版页面',
+        page, _ = self._get(f'https://m.bilibili.com/video/{vid}', vid, note='打开 B 站手机版页面',
                             headers={'Referer': 'https://m.bilibili.com/'})
         st = _json_after(page, '__INITIAL_STATE__') or {}
         info = (st.get('video') or {}).get('viewInfo') or {}
@@ -2196,9 +2228,12 @@ class YtdlpWebIE(InfoExtractor):
             if '视频去哪了' in page or '啊叻？视频不见了' in page:
                 _fail('YTWEB_GONE')
             _fail('YTWEB_NEED_COOKIES', 'bili no viewInfo')
+        bv = info.get('bvid') or (vid if vid.startswith('BV') else '')
+        aid = info.get('aid') or (vid[2:] if vid.startswith('av') else '')
+        id_q = f'bvid={bv}' if bv else f'avid={aid}'
         pages = info.get('pages') or []
         cid = info.get('cid')
-        title = info.get('title') or bv
+        title = info.get('title') or bv or vid
         dur = info.get('duration')
         if pages and 1 <= p <= len(pages):
             cid = pages[p - 1].get('cid') or cid
@@ -2208,9 +2243,9 @@ class YtdlpWebIE(InfoExtractor):
         hdr = {'Referer': 'https://m.bilibili.com/', 'User-Agent': MOBILE_UA}
         fmts = []
         for qn in (80, 64):
-            api = (f'https://api.bilibili.com/x/player/playurl?bvid={bv}&cid={cid}&qn={qn}'
+            api = (f'https://api.bilibili.com/x/player/playurl?{id_q}&cid={cid}&qn={qn}'
                    '&platform=html5&high_quality=1&fnval=1&fnver=0&fourk=0')
-            j = self._download_json(api, bv, note=f'问 B 站要播放地址（{qn}）', headers=hdr, fatal=False) or {}
+            j = self._download_json(api, bv or vid, note=f'问 B 站要播放地址（{qn}）', headers=hdr, fatal=False) or {}
             data = j.get('data') or {}
             for n, du in enumerate(data.get('durl') or []):
                 if n > 0:
@@ -2230,7 +2265,7 @@ class YtdlpWebIE(InfoExtractor):
                                  'height': 360, 'http_headers': hdr})
         if not fmts:
             _fail('YTWEB_NEED_COOKIES', 'bili no playurl')
-        return {'id': bv, 'title': title, 'formats': fmts, 'duration': dur}
+        return {'id': bv or vid, 'title': title, 'formats': fmts, 'duration': dur}
 
     # ---------------- 抖音 ----------------
     def _douyin(self, link):
@@ -2288,8 +2323,9 @@ class YtdlpWebIE(InfoExtractor):
             #   ratio=default  原视频的分辨率和码率（样例 496x864、2.4Mbps）←— 优先用它
             #   ratio=720p/1080p/2160p  其实是压缩过的一档（样例 480x836、0.8Mbps），留着备用
             base = urls[0].replace('playwm', 'play')
+            sep = '&' if '?' in base else '?'
             for ratio, q in (('default', 2), ('1080p', 1)):
-                u = re.sub(r'ratio=\w+', f'ratio={ratio}', base) if 'ratio=' in base else f'{base}&ratio={ratio}'
+                u = re.sub(r'ratio=\w+', f'ratio={ratio}', base) if 'ratio=' in base else f'{base}{sep}ratio={ratio}'
                 fmts.append({'url': u, 'ext': 'mp4', 'format_id': f'nowm-{ratio}', 'vcodec': 'avc1', 'acodec': 'mp4a',
                              'quality': q, 'height': v.get('height'), 'width': v.get('width'), 'http_headers': hdr})
         if not fmts:
@@ -2307,8 +2343,8 @@ class YtdlpWebIE(InfoExtractor):
             t = j['tweet']
             media = t.get('media') or {}
             tw = {'text': t.get('text') or '', 'author': (t.get('author') or {}).get('name') or '',
-                  'photos': [p.get('url') for p in media.get('photos') or []],
-                  'videos': [v.get('url') for v in media.get('videos') or []]}
+                  'photos': [p.get('url') for p in media.get('photos') or [] if p.get('url')],
+                  'videos': [v.get('url') for v in media.get('videos') or [] if v.get('url')]}
         elif j.get('code') == 404:
             _fail('YTWEB_GONE')
         if tw is None:
@@ -2316,11 +2352,12 @@ class YtdlpWebIE(InfoExtractor):
             if j.get('tweetID') or j.get('text') is not None:
                 ms = j.get('media_extended') or []
                 tw = {'text': j.get('text') or '', 'author': j.get('user_name') or '',
-                      'photos': [m.get('url') for m in ms if m.get('type') == 'image'],
-                      'videos': [m.get('url') for m in ms if m.get('type') in ('video', 'gif')]}
+                      'photos': [m.get('url') for m in ms if m.get('type') == 'image' and m.get('url')],
+                      'videos': [m.get('url') for m in ms if m.get('type') in ('video', 'gif') and m.get('url')]}
         if tw is None:
             _fail('YTWEB_NEED_COOKIES', 'x api unavailable')
-        title = (f'{tw["author"]} - ' if tw['author'] else '') + (re.sub(r'https?://\S+', '', tw['text']).strip()[:60] or tid)
+        clean_text = re.sub(r'\s+', ' ', re.sub(r'https?://\S+', '', tw['text'])).strip()[:60]
+        title = (f'{tw["author"]} - ' if tw['author'] else '') + (clean_text or tid)
         if tw['photos']:
             urls = []
             for u in tw['photos']:
@@ -2378,7 +2415,7 @@ use POSIX qw(:sys_wait_h setsid strftime setlocale LC_ALL);
 use Fcntl qw(:flock O_WRONLY O_CREAT O_APPEND);
 use File::Path qw(make_path remove_tree);
 
-my $VERSION = '2.5.0';
+my $VERSION = '2.5.1';
 setlocale(LC_ALL, 'C');
 $SIG{PIPE} = 'IGNORE';
 
@@ -2587,10 +2624,13 @@ sub disk_free_mb {
   my ($dir) = @_;
   my $out = `df -Pk '$dir' 2>/dev/null`;
   my @l = split /\n/, $out;
-  return -1 unless @l >= 2;
-  my @f = split /\s+/, $l[-1];
-  return -1 unless defined $f[3] && $f[3] =~ /^\d+$/;
-  return int($f[3] / 1024);
+  if (@l >= 2) {
+    my @f = split /\s+/, $l[-1];
+    return int($f[3] / 1024) if defined $f[3] && $f[3] =~ /^\d+$/;
+  }
+  my $st = `stat -f -c '%a %S' '$dir' 2>/dev/null`;
+  return int($1 * $2 / 1048576) if ($st || '') =~ /^(\d+)\s+(\d+)/;
+  return -1;
 }
 
 #----------------------------------------------------------------------
@@ -2870,12 +2910,14 @@ sub clean_link {
   $u =~ s{^http://}{https://}i if $plat ne 'other';
   if ($plat eq 'bili' && $u =~ m{bilibili\.com/(?:s/)?video/(BV[0-9A-Za-z]{10}|av\d+)}i) {
     my $id = $1;
+    $id =~ s/^bv/BV/i;
+    $id =~ s/^AV/av/;
     my ($pn) = $u =~ /[?&]p=(\d+)/;
     return "https://www.bilibili.com/video/$id/" . ($pn && $pn > 1 ? "?p=$pn" : '');
   }
   if ($plat eq 'x' || $plat eq 'ig' || $plat eq 'tiktok') {
     $u =~ s/[?#].*$//;
-    $u =~ s{(/status/\d+)/(?:photo|video)/\d+/?$}{$1} if $plat eq 'x';
+    $u =~ s{(/status(?:es)?/\d+)/(?:photo|video)/\d+/?$}{$1} if $plat eq 'x';
   }
   return $u;
 }
@@ -2884,7 +2926,7 @@ sub job_dir   { return "$JOBS/$_[0]"; }
 sub valid_id  { return defined $_[0] && $_[0] =~ /^[0-9a-f]{6,40}$/; }
 sub job_meta  { return kv_read(job_dir($_[0]) . '/meta'); }
 sub job_stat  { return kv_read(job_dir($_[0]) . '/status'); }
-sub set_stat  { my ($id, %h) = @_; kv_update(job_dir($id) . '/status', %h, updated => time); }
+sub set_stat  { my ($id, %h) = @_; my $d = job_dir($id); return 0 unless -d $d; kv_update("$d/status", %h, updated => time); }
 
 sub list_jobs {
   opendir(my $dh, $JOBS) or return ();
@@ -3049,9 +3091,9 @@ sub share_target {
     for my $f ('/etc/systemd/system/minishare.service', '/etc/init.d/minishare') {
       my $t = slurp($f);
       next unless defined $t;
-      ($sh) = $t =~ /^\s*(?:Environment=|export\s+)SHARE_HOST="?([^"\s]*)"?/m;
-      ($sp) = $t =~ /^\s*(?:Environment=|export\s+)SHARE_PORT="?(\d+)"?/m;
-      ($sd) = $t =~ /^\s*(?:Environment=|export\s+)SHARE_DATA="?([^"\n]+?)"?\s*$/m;
+      ($sh) = $t =~ /^\s*(?:Environment="?|export\s+)SHARE_HOST="?([^"\s]*)"?/m;
+      ($sp) = $t =~ /^\s*(?:Environment="?|export\s+)SHARE_PORT="?(\d+)"?/m;
+      ($sd) = $t =~ /^\s*(?:Environment="?|export\s+)SHARE_DATA="?([^"\r\n]+?)"?\s*$/m;
       last;
     }
     return undef unless $sp && $sd;
@@ -3170,6 +3212,7 @@ sub push_run {
   return unless -d job_dir($id);
   return push_fail($id, share_error($code, $body)) unless $code == 200 && $body =~ /"ok":\s*true/;
   my ($title) = $body =~ /"title":\s*"((?:[^"\\]|\\.)*)"/;
+  $title =~ s/\\(["\\\/])/$1/g if defined $title;
   unlink $path;
   my %up = (push_state => 'done', pushed => time, push_pct => 100);
   $up{push_title} = $title if defined $title && length $title;
@@ -3517,11 +3560,11 @@ sub handle {
         close $c;
         setsid();
         $0 = 'ytdlp-web-push';
+        set_stat($id, push_pid => $$);
         eval { push_run($id, $sid) };
         push_fail($id, "出错了：$@") if $@;
         POSIX::_exit(0);
       }
-      set_stat($id, push_pid => $pid);
       logline("开始上传到文件传输 $id -> $sid");
       return respond_json($c, $r, 200, { ok => bool(1) });
     }
@@ -3529,7 +3572,10 @@ sub handle {
       my $id = $f->{id};
       return respond_json($c, $r, 404, { error => '没有这个任务' }) unless valid_id($id) && -d job_dir($id);
       my $st = job_stat($id);
-      kill('TERM', $st->{push_pid}) if push_alive($st) && $st->{push_pid};
+      if (push_alive($st) && $st->{push_pid}) {
+        kill('TERM', $st->{push_pid});
+        for (1 .. 10) { last unless kill(0, $st->{push_pid}); select(undef, undef, undef, 0.05); }
+      }
       my $state = $st->{state} || 'queued';
       if ($state eq 'running') {
         if (open(my $cf, '>', job_dir($id) . '/cancel')) { close $cf; }
@@ -3558,6 +3604,7 @@ sub handle {
     }
     if ($p eq '/api/update') {
       unlink "$STATE/last-update";
+      kv_update("$STATE/info", last_update => 0);
       return respond_json($c, $r, 200, { ok => bool(1) });
     }
   }
@@ -3822,7 +3869,8 @@ sub classify {
   return ('blocked', "$name 不让海外服务器在不登录的情况下看这条。", 'cookies') if $e =~ /ytweb_need_cookies/;
   return ('fatal', "这个链接下载程序认不出来。请确认是单条视频/帖子的链接（在 App 里点「分享 → 复制链接」）。", '')
     if $e =~ /unsupported url|is not a valid url/;
-  return ('fatal', "这条$name内容不存在或已被删除。", '') if $e =~ /http error 404|not found/ && $e !~ /ffmpeg|ffprobe/;
+  return ('fatal', "这条$name内容不存在或已被删除。", '')
+    if $e =~ /http error 404|not found/ && $e !~ /ffmpeg|ffprobe|unable to extract|failed to extract/;
   my ($class, $msg, $hint) = classify_base($out, $sig);
   $msg =~ s/YouTube/$name/g;
   $msg =~ s/（例如 https:\/\/www\.youtube\.com\/watch\?v=\.\.\.）//;
@@ -4307,6 +4355,7 @@ sub run_job {
         set_stat($id, line => '正在把 ' . scalar(@files) . ' 个文件打成一个 zip…', pct => 100);
         my $title = job_stat($id)->{title} || 'images';
         $title =~ s{[/\\:*?"<>|\x00-\x1f]+}{_}g;
+        $title =~ s/^[.\s]+//;
         $title =~ s/\s+\d+$//;
         $title = substr($title, 0, 120) || 'images';
         my $zip = "$title.zip";
@@ -4416,11 +4465,12 @@ sub sweep {
     my $meta = job_meta($id);
     my $state = $st->{state} || 'queued';
     my $created = $meta->{created} || (stat($dir))[9] || $now;
-    if ($state eq 'done' && ($st->{push_state} || '') eq 'done' && $now - ($st->{pushed} || 0) >= $C{grace}) {
+    if ($state eq 'done' && ($st->{push_state} || '') eq 'done') {
       # 已经上传到文件传输，这里的文件早删了，记录也收掉。
-      remove_tree($dir);
+      remove_tree($dir) if $now - ($st->{pushed} || 0) >= $C{grace};
       next;
     }
+    next if push_alive($st);
     if ($state eq 'done') {
       # 浏览器把用户点的那一份完整收下以后再删。没点保存的一直留着。
       my $mark = delivered_mark($id, $st);
@@ -4775,6 +4825,10 @@ sub main {
   $SIG{TERM} = $SIG{INT} = sub { $stop = 1; };
   $SIG{HUP} = 'IGNORE';
   while (!$stop) {
+    while ((my $k = waitpid(-1, WNOHANG)) > 0) {
+      delete $handlers{$k};
+      if ($k == $runner) { $runner = 0; $runner_job = ''; }
+    }
     for my $l ($sel->can_read(1)) {
       my $c = $l->accept or next;
       if (keys(%handlers) >= 40) {
@@ -4828,6 +4882,7 @@ sub main {
     }
   }
   logline('收到停止信号，正在退出');
+  unlink "$STATE/server.pid";
   kill 'TERM', $runner if $runner;
   kill 'TERM', keys %handlers;
   exit 0;
@@ -4850,13 +4905,14 @@ YTDLP_WEB_SERVER_EOF
 #----------------------------------------------------------------------
 write_runner() {
   mkdir -p /usr/local/sbin
-  cat > "$RUNNER" <<EOF
+  cat > "$RUNNER.new" <<EOF
 #!/bin/sh
 # ytdlp-web 网页服务的启动脚本。开机时由系统调用，记录写到 $LOG_FILE
 mkdir -p "$DATA"
 exec perl "$LIB_DIR/server.pl" "$CONF_FILE" >> "$LOG_FILE" 2>&1
 EOF
-  chmod 755 "$RUNNER"
+  chmod 755 "$RUNNER.new"
+  mv "$RUNNER.new" "$RUNNER"
 }
 
 write_service() {
@@ -4883,7 +4939,22 @@ EOF
       systemctl enable ytdlp-web >/dev/null 2>&1 || true
       ;;
     openrc)
-      cat > /etc/init.d/ytdlp-web <<EOF
+      if have supervise-daemon; then
+        cat > /etc/init.d/ytdlp-web <<EOF
+#!/sbin/openrc-run
+name="ytdlp-web"
+description="ytdlp-web (save videos to Mac)"
+command="$RUNNER"
+supervisor=supervise-daemon
+respawn_delay=3
+respawn_max=0
+
+depend() {
+  use net
+}
+EOF
+      else
+        cat > /etc/init.d/ytdlp-web <<EOF
 #!/sbin/openrc-run
 name="ytdlp-web"
 description="ytdlp-web (save videos to Mac)"
@@ -4892,9 +4963,10 @@ command_background=true
 pidfile="/run/ytdlp-web.pid"
 
 depend() {
-  need net
+  use net
 }
 EOF
+      fi
       chmod 755 /etc/init.d/ytdlp-web
       rc-update add ytdlp-web default >/dev/null 2>&1 || true
       ;;
@@ -5074,6 +5146,10 @@ port_busy() {
     netstat -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"
     return $?
   fi
+  if [ -r /proc/net/tcp ]; then
+    awk -v p="$(printf ':%04X' "$port" 2>/dev/null)" '$4=="0A" && toupper($2) ~ p"$" {found=1} END{exit !found}' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+    return $?
+  fi
   return 1
 }
 
@@ -5146,6 +5222,15 @@ open_firewall() {
       fi
     fi
   fi
+  if have ip6tables; then
+    policy6=$(ip6tables -S INPUT 2>/dev/null | awk 'NR==1 && $1=="-P" && $2=="INPUT" {print $3}')
+    if [ "$policy6" = "DROP" ] || [ "$policy6" = "REJECT" ]; then
+      if ! ip6tables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+        ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+        say_ok "ip6tables 已放开 ${port}/tcp"
+      fi
+    fi
+  fi
 }
 
 #----------------------------------------------------------------------
@@ -5204,6 +5289,9 @@ hash_password() {
       "$pre"*) printf '%s\n' "$h"; return 0 ;;
     esac
   done
+  case "$h" in
+    \$1?*) printf '%s\n' "$h"; return 0 ;;
+  esac
   return 1
 }
 
