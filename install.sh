@@ -33,7 +33,7 @@
 #   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=2.5.2
+VERSION=2.5.3
 # ytdlp-onekey-begin
 
 #----------------------------------------------------------------------
@@ -167,9 +167,41 @@ lock_release() {
   LOCK_HELD=0
 }
 
+lock_takeover() {
+  old=${LOCK_OTHER:-}
+  if [ -n "$old" ] && [ "$old" != "$$" ] && pid_alive "$old"; then
+    say_warn "正在结束上次卡住的安装进程（进程号 ${old}）…"
+    kill "$old" 2>/dev/null || true
+    w=0
+    while [ "$w" -lt 4 ] && pid_alive "$old"; do
+      sleep 1
+      w=$((w + 1))
+    done
+    if pid_alive "$old"; then
+      kill -9 "$old" 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+  rm -rf "$LOCK_DIR"
+  lock_try || die "接管安装锁失败（进程号 ${LOCK_OTHER:-未知}），请手动执行：kill -9 ${LOCK_OTHER:-进程号} && rm -rf $LOCK_DIR"
+}
+
 lock_or_quit() {
   if ! lock_try; then
-    die "已经有一个安装在进行（进程号 ${LOCK_OTHER:-未知}），等它结束再运行。"
+    if [ "${FORCE_LOCK:-0}" = 1 ]; then
+      lock_takeover
+    elif [ "${YTD_TEST:-}" != 1 ] && [ -t 0 ] && [ -t 1 ] && ! auto_mode; then
+      say_warn "已经有一个安装在进行（进程号 ${LOCK_OTHER:-未知}）。"
+      printf '%s' "如果上次卡住或断开了 SSH，输入 y 强制结束它并继续，直接回车退出：[y/N] "
+      ans=
+      read -r ans || true
+      case "$ans" in
+        y|Y|yes|YES) lock_takeover ;;
+        *) die "已经有一个安装在进行（进程号 ${LOCK_OTHER:-未知}），等它结束再运行。" ;;
+      esac
+    else
+      die "已经有一个安装在进行（进程号 ${LOCK_OTHER:-未知}），等它结束再运行。如果上次卡住或断开了 SSH，可运行：ytdlp-web --force"
+    fi
   fi
   set_quit_traps
 }
@@ -1421,10 +1453,10 @@ fetch_first() {
         ok=1
       fi
     elif have wget; then
-      # BusyBox 自带的 wget 不认 --limit-rate，只有完整版 wget 才限速。
+      # BusyBox 自带的 wget 不认 --limit-rate，只有完整版 wget 才限速。-T 两边都认，防止断网一直卡死。
       if [ -n "$rate" ] && wget --help 2>&1 | grep -q -- '--limit-rate'; then
-        wget -O "$dest" --limit-rate="$rate" "$url" && [ -s "$dest" ] && ok=1
-      elif wget -O "$dest" "$url" && [ -s "$dest" ]; then
+        wget -T 30 -O "$dest" --limit-rate="$rate" "$url" && [ -s "$dest" ] && ok=1
+      elif wget -T 30 -O "$dest" "$url" && [ -s "$dest" ]; then
         ok=1
       fi
     else
@@ -1470,7 +1502,7 @@ latest_tag() {
   if have curl; then
     body=$(curl -fsSL --connect-timeout 15 --max-time 25 "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null || true)
   elif have wget; then
-    body=$(wget -qO- "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null || true)
+    body=$(wget -q -T 15 -O - "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null || true)
   fi
   printf '%s\n' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
 }
@@ -2429,7 +2461,7 @@ use POSIX qw(:sys_wait_h setsid strftime setlocale LC_ALL);
 use Fcntl qw(:flock O_WRONLY O_CREAT O_APPEND);
 use File::Path qw(make_path remove_tree);
 
-my $VERSION = '2.5.2';
+my $VERSION = '2.5.3';
 setlocale(LC_ALL, 'C');
 $SIG{PIPE} = 'IGNORE';
 
@@ -5486,9 +5518,9 @@ fetch_quiet() {
   for url in "$@"; do
     rm -f "$dest"
     if have curl; then
-      curl -fsSL --connect-timeout 10 --max-time 25 -o "$dest" "$url" && [ -s "$dest" ] && return 0
+      curl -fsSL --connect-timeout 8 --max-time 15 -o "$dest" "$url" && [ -s "$dest" ] && return 0
     elif have wget; then
-      wget -q -O "$dest" "$url" && [ -s "$dest" ] && return 0
+      wget -q -T 15 -O "$dest" "$url" && [ -s "$dest" ] && return 0
     else
       return 1
     fi
@@ -5502,6 +5534,7 @@ maybe_self_update() {
   [ "${YTD_UPDATED:-}" = 1 ] && return 0
   [ "${YTD_NO_UPDATE:-}" = 1 ] && return 0
   [ "${YTD_TEST:-}" = 1 ] && return 0
+  say_info "正在检查脚本有没有新版本…"
   tmp=/tmp/ytdlp-install.new
   fetch_quiet "$tmp" \
     "https://raw.githubusercontent.com/imthnio/vps-ytdlp/main/install.sh" \
@@ -6171,6 +6204,7 @@ reset_password_only() {
 usage() {
   printf '%s\n' "用法："
   printf '%s\n' "  ytdlp-web                   第一次安装会问几个问题。已经装过再运行，直接回车就是更新到最新版本"
+  printf '%s\n' "  ytdlp-web --force           上次安装卡住或 SSH 断开留了锁时，强制结束旧进程并重新运行"
   printf '%s\n' "  ytdlp-web --status          查看装得怎么样、网址和密码"
   printf '%s\n' "  ytdlp-web --log             查看最近的运行记录"
   printf '%s\n' "  ytdlp-web --reset-password  换一把登录密码"
@@ -6179,12 +6213,14 @@ usage() {
 
 main() {
   action=install
+  FORCE_LOCK=${FORCE_LOCK:-0}
   for arg in "$@"; do
     case "$arg" in
       --status|-s) action=status ;;
       --log|--logs) action=log ;;
       --uninstall) action=uninstall ;;
       --reset-password) action=reset ;;
+      --force|-f) FORCE_LOCK=1 ;;
       --help|-h) usage; exit 0 ;;
       *) die "不认识的参数：$arg" ;;
     esac

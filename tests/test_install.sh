@@ -106,7 +106,7 @@ check newer "$(yes_no x version_newer 2.0.1 2.0.0)" yes
 check newer-equal "$(yes_no x version_newer 2.0.0 2.0.0)" no
 check newer-major "$(yes_no x version_newer 2.0.0 1.9.9)" yes
 check ver-file "$(version_from_file ./install.sh)" "$VERSION"
-check ver-252 "$VERSION" 2.5.2
+check ver-253 "$VERSION" 2.5.3
 check mem-gate "$(grep -c '可用内存不到 384MB' install.sh || true)" 0
 check newer-211 "$(yes_no x version_newer 2.1.1 2.1.0)" yes
 # 网页服务里的版本号要和脚本一致（网页 /health 会显示它）
@@ -250,6 +250,17 @@ has_msg=no
 case "$msg" in *"已经有一个安装在进行（进程号 $$），等它结束再运行"*) has_msg=yes ;; esac
 check lock-quit-msg "$has_msg" yes
 check lock-quit-norun "$(printf '%s' "$msg" | grep -c should-not-run)" 0
+# --force / FORCE_LOCK=1：强制接管卡住的旧安装进程
+lkt=$(mktemp -d)
+sleep 30 &
+stuck_pid=$!
+mkdir -p "$lkt/lk"
+printf '%s\n' "$stuck_pid" > "$lkt/lk/pid"
+take_out=$(YTD_TEST=1 FORCE_LOCK=1 YTD_LOCK_DIR="$lkt/lk" sh -c '. ./install.sh; lock_or_quit; echo took' 2>&1)
+wait "$stuck_pid" 2>/dev/null || true
+case "$take_out" in *took*) check lock-force-takeover yes yes ;; *) check lock-force-takeover "$take_out" took ;; esac
+check lock-force-cleaned "$([ ! -d "$lkt/lk" ] && echo yes || echo no)" yes
+rm -rf "$lkt"
 lock_release
 check lock-release "$(yes_no x test -d "$LOCK_DIR")" no
 # 残留：锁里的进程已经不在了，自动清掉
