@@ -33,7 +33,7 @@
 #   断点续传       网断了，浏览器从断的地方接着下（HTTP Range）
 #======================================================================
 
-VERSION=2.5.1
+VERSION=2.5.2
 # ytdlp-onekey-begin
 
 #----------------------------------------------------------------------
@@ -1328,9 +1328,23 @@ prepare_memory() {
         tuned=1
       fi
     fi
+    dirty_conf=
+    # 小内存机器下视频时，脏页攒太多会把 64MB 撑爆。改成攒到 2MB 就开始写盘、最多 6MB。
+    if [ "$MEM_MB" -le 256 ]; then
+      if sysctl -w vm.dirty_background_bytes=2097152 >/dev/null 2>&1 \
+        || { printf '2097152\n' > /proc/sys/vm/dirty_background_bytes; } 2>/dev/null; then
+        tuned=1
+        dirty_conf="${dirty_conf}vm.dirty_background_bytes=2097152\n"
+      fi
+      if sysctl -w vm.dirty_bytes=6291456 >/dev/null 2>&1 \
+        || { printf '6291456\n' > /proc/sys/vm/dirty_bytes; } 2>/dev/null; then
+        tuned=1
+        dirty_conf="${dirty_conf}vm.dirty_bytes=6291456\n"
+      fi
+    fi
     if [ "$tuned" = 1 ]; then
       mkdir -p /etc/sysctl.d 2>/dev/null || true
-      { printf 'vm.overcommit_memory=1\nvm.swappiness=100\n' > /etc/sysctl.d/99-ytdlp-web-overcommit.conf; } 2>/dev/null || true
+      { printf "vm.overcommit_memory=1\nvm.swappiness=100\n${dirty_conf}" > /etc/sysctl.d/99-ytdlp-web-overcommit.conf; } 2>/dev/null || true
     fi
   fi
   # 上次装的时候做的虚拟内存还挂着：它会被重做，不能算进「已经有的」，它占的硬盘也算可用。
@@ -2415,7 +2429,7 @@ use POSIX qw(:sys_wait_h setsid strftime setlocale LC_ALL);
 use Fcntl qw(:flock O_WRONLY O_CREAT O_APPEND);
 use File::Path qw(make_path remove_tree);
 
-my $VERSION = '2.5.1';
+my $VERSION = '2.5.2';
 setlocale(LC_ALL, 'C');
 $SIG{PIPE} = 'IGNORE';
 
@@ -3005,6 +3019,72 @@ sub oom_adjust {
   if (open(my $oh, '>', '/proc/self/oom_score_adj')) {
     print $oh "$n\n";
     close $oh;
+  }
+}
+
+# 看这台机器的内存和虚拟内存（容器里 cgroup 上限比 /proc/meminfo 准）。
+sub mem_total_mb {
+  return int($ENV{YTDLP_WEB_MEM_MB}) if defined $ENV{YTDLP_WEB_MEM_MB} && $ENV{YTDLP_WEB_MEM_MB} =~ /^\d+$/;
+  my $mb = 0;
+  if (open(my $fh, '<', '/proc/meminfo')) {
+    while (my $l = <$fh>) {
+      if ($l =~ /^MemTotal:\s+(\d+)/) { $mb = int($1 / 1024); last; }
+    }
+    close $fh;
+  }
+  for my $cgf ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes', '/sys/fs/cgroup/memory.limit_in_bytes') {
+    next unless -r $cgf;
+    my $v = slurp($cgf);
+    next unless defined $v;
+    $v =~ s/\s+//g;
+    next if $v eq '' || $v eq 'max' || $v =~ /\D/ || length($v) > 12 || $v < 1048576;
+    my $cg = int($v / 1048576);
+    $mb = $cg if !$mb || $cg < $mb;
+    last;
+  }
+  return $mb;
+}
+
+sub swap_total_mb {
+  return int($ENV{YTDLP_WEB_SWAP_MB}) if defined $ENV{YTDLP_WEB_SWAP_MB} && $ENV{YTDLP_WEB_SWAP_MB} =~ /^\d+$/;
+  my $mb = 0;
+  if (open(my $fh, '<', '/proc/meminfo')) {
+    while (my $l = <$fh>) {
+      if ($l =~ /^SwapTotal:\s+(\d+)/) { $mb = int($1 / 1024); last; }
+    }
+    close $fh;
+  }
+  if (-r '/sys/fs/cgroup/memory.swap.max') {
+    my $v = slurp('/sys/fs/cgroup/memory.swap.max');
+    if (defined $v) {
+      $v =~ s/\s+//g;
+      if ($v =~ /^\d+$/ && length($v) <= 13) {
+        my $cg = int($v / 1048576);
+        $mb = $cg if $cg < $mb;
+      }
+    }
+  }
+  return $mb;
+}
+
+# 0=正常(>256MB)，1=小内存(129~256MB)，2=极小内存有swap(<=128MB)，3=极小内存缺swap(<=128MB且总计<256MB)。
+sub low_mem_level {
+  my $ram = mem_total_mb();
+  return 0 if !$ram || $ram > 256;
+  return 1 if $ram > 128;
+  my $swap = swap_total_mb();
+  return ($ram + $swap) < 256 ? 3 : 2;
+}
+
+# 小内存机器在下载/转码前后清一下页缓存，免得脏页和缓存把 64MB 小鸡撑爆。
+# quick=1 时不 fork sync，直接清干净的页缓存，适合下载循环里定时调用。
+sub drop_page_cache {
+  my ($quick) = @_;
+  return unless -w '/proc/sys/vm/drop_caches';
+  system('sync') unless $quick;
+  if (open(my $fh, '>', '/proc/sys/vm/drop_caches')) {
+    print $fh ($quick ? "1\n" : "3\n");
+    close $fh;
   }
 }
 
@@ -3735,9 +3815,10 @@ sub method_order {
 }
 
 sub quality_args {
-  my ($q, $plat) = @_;
+  my ($q, $plat, $opts) = @_;
   $plat ||= 'youtube';
-  my $ff = ($C{ffmpeg} && -x $C{ffmpeg}) ? 1 : 0;
+  $opts ||= {};
+  my $ff = ($C{ffmpeg} && -x $C{ffmpeg} && !$opts->{no_merge}) ? 1 : 0;
   if ($q eq 'm4a') {
     return $ff ? ('-f', 'ba[ext=m4a]/ba/b', '-x', '--audio-format', 'm4a') : ('-f', 'ba[ext=m4a]/ba');
   }
@@ -3760,7 +3841,8 @@ sub quality_args {
 }
 
 sub base_args {
-  my ($dir) = @_;
+  my ($dir, $opts) = @_;
+  $opts ||= {};
   my @a = (
     '--ignore-config', '--no-playlist', '--no-mtime', '--newline', '--progress', '--color', 'never',
     '--no-simulate', '--match-filter', '!is_live',
@@ -3776,7 +3858,34 @@ sub base_args {
   );
   push @a, '--js-runtimes', $C{js} if $C{js};
   push @a, '--ffmpeg-location', $C{ffmpeg} if $C{ffmpeg} && -x $C{ffmpeg};
+  # 64MB~256MB 小鸡：关掉 yt-dlp 自动放大读缓存（高速下载时会涨到几 MB~16MB）并限速，
+  # 避免 Python 堆内存 + Linux 脏页缓存把小鸡直接撑死。
+  my $lvl = low_mem_level();
+  if ($opts->{ultra_low}) {
+    push @a, '--no-resize-buffer', '--buffer-size', '16K', '--concurrent-fragments', '1',
+      '--http-chunk-size', '512K', '--limit-rate', '512K';
+  } elsif ($lvl >= 3) {
+    push @a, '--no-resize-buffer', '--buffer-size', '16K', '--concurrent-fragments', '1',
+      '--http-chunk-size', '1M', '--limit-rate', '512K';
+  } elsif ($lvl == 2) {
+    push @a, '--no-resize-buffer', '--buffer-size', '16K', '--concurrent-fragments', '1',
+      '--http-chunk-size', '2M', '--limit-rate', '1M';
+  } elsif ($lvl == 1) {
+    push @a, '--no-resize-buffer', '--buffer-size', '32K', '--concurrent-fragments', '1',
+      '--limit-rate', '2M';
+  }
+  if (($lvl >= 1 || $opts->{ultra_low}) && $C{ffmpeg} && -x $C{ffmpeg}) {
+    push @a, '--postprocessor-args', 'Merger+ffmpeg:-threads 1 -max_muxing_queue_size 256';
+  }
   return @a;
+}
+
+sub is_oom {
+  my ($out, $sig) = @_;
+  return 1 if $sig && $sig == 9;
+  my $t = lc($out || '');
+  return 1 if $t =~ /memoryerror|cannot allocate memory|out of memory/;
+  return 0;
 }
 
 #----------------------------------------------------------------------
@@ -3791,8 +3900,8 @@ sub classify_base {
   my $t = lc($out || '');
   my @err = grep { /^error:/i } split /\n/, ($out || '');
   my $e = lc(join("\n", @err) || $t);
-  return ('fatal', '服务器内存不够，下载程序被系统杀掉了。换一个小一点的画质（比如 720p）再试，或者给 VPS 加内存。', '')
-    if $sig && $sig == 9;
+  return ('fatal', '服务器内存不够，下载程序被系统杀掉了。换一个更低的画质（比如 360p/240p/只要声音）再试，或者给 VPS 加内存/虚拟内存。', '')
+    if is_oom($out, $sig);
   return ('fatal', '服务器硬盘满了。请先把已有视频保存到本地或点删除，腾出空间后再试。', '') if $t =~ /no space left/;
   return ('cookies_bad', '你上传的 cookies 已经失效了（过期或者 YouTube 让它下线了）。请按下面的步骤重新导出一份再上传。', 'cookies')
     if $e =~ /cookies are no longer valid|cookies (have|has) (expired|been rotated)/;
@@ -3838,7 +3947,7 @@ sub classify {
   my $t = lc($out || '');
   my @err = grep { /^error:/i } split /\n/, ($out || '');
   my $e = lc(join("\n", @err) || $t);
-  return classify_base($out, $sig) if ($sig && $sig == 9) || $t =~ /no space left/;
+  return classify_base($out, $sig) if is_oom($out, $sig) || $t =~ /no space left/;
   return ('fatal', '这条没有视频也没有图片（可能是纯文字），没有东西可以下载。', '') if $e =~ /ytweb_no_media/;
   return ('fatal', "这条内容不存在、已经被删除，或者被作者设成了私密。请在手机上确认一下还能不能打开。", '') if $e =~ /ytweb_gone/;
   return ('fatal', "看不懂这个$name链接。请在 App 里点「分享 → 复制链接」，把整段文字贴过来。", '') if $e =~ /ytweb_bad_link/;
@@ -3889,7 +3998,10 @@ sub child_env {
   $ENV{LC_ALL} = 'C.UTF-8';
   $ENV{PYTHONIOENCODING} = 'utf-8';
   $ENV{PYTHONUTF8} = '1';
-  $ENV{MALLOC_ARENA_MAX} = '2';
+  $ENV{PYTHONDONTWRITEBYTECODE} = '1';
+  $ENV{MALLOC_ARENA_MAX} = '1';
+  $ENV{MALLOC_MMAP_THRESHOLD_} = '65536';
+  $ENV{MALLOC_TRIM_THRESHOLD_} = '65536';
   $ENV{PATH} = '/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin';
 }
 
@@ -3984,16 +4096,19 @@ sub runner_stop {
 }
 
 sub run_ytdlp {
-  my ($id, $meta, $m, $n, $total) = @_;
+  my ($id, $meta, $m, $n, $total, $opts) = @_;
+  $opts ||= {};
   my $dir = job_dir($id);
   my $plat = $meta->{plat} || platform_of($meta->{url});
   my $pname = plat_name($plat);
   # 交给插件的，网址写成 ytweb:平台:原链接；插件目录也要告诉 yt-dlp。
   my $url = $m->{helper} ? "ytweb:$m->{helper}:$meta->{url}" : $meta->{url};
   my @plug = ($m->{helper} && $C{plugins}) ? ('--plugin-dirs', $C{plugins}) : ();
-  my @cmd = ($C{ytdlp}, base_args($dir), quality_args($meta->{q} || 'mac', $plat), @plug, @{ $m->{args} }, '--', $url);
+  my @cmd = ($C{ytdlp}, base_args($dir, $opts), quality_args($meta->{q} || 'mac', $plat, $opts), @plug, @{ $m->{args} }, '--', $url);
   append_log($dir, "\n===== 第 $n 种办法：$m->{label}" . ($m->{ip} ? "，网络：$m->{ip}" : '') . " =====\n"
     . join(' ', map { /\s/ ? "'$_'" : $_ } @cmd) . "\n");
+  my $low = (low_mem_level() >= 1 || $opts->{ultra_low}) ? 1 : 0;
+  drop_page_cache() if $low;
   my $warp_pid;
   if ($m->{warp}) {
     set_stat($id, line => "正在打开 Cloudflare WARP 线路…");
@@ -4020,7 +4135,7 @@ sub run_ytdlp {
   $CUR_CHILD = $pid;
   $CUR_WARP = $warp_pid;
   my $sel = IO::Select->new($out);
-  my ($buf, $tail, $file, $part, $lastb, $lastw, $lastout) = ('', '', '', 1, -1, 0, time);
+  my ($buf, $tail, $file, $part, $lastb, $lastw, $lastout, $lastdrop) = ('', '', '', 1, -1, 0, time, time);
   my @files;
   my $src = $plat eq 'youtube' ? 'YouTube' : $pname;
   my $label = $total > 1 ? "（第 $n 种办法：$m->{label}）" : '';
@@ -4028,6 +4143,7 @@ sub run_ytdlp {
   while (1) {
     if (-e "$dir/cancel") { $cancel = 1; kill 'KILL', -$pid; last; }
     if (time - $lastout > 900) { append_log($dir, "15 分钟没有动静，强制停止\n"); kill 'KILL', -$pid; last; }
+    if ($low && time - $lastdrop >= 10) { drop_page_cache(1); $lastdrop = time; }
     next unless $sel->can_read(1);
     my $n2 = sysread($out, $buf, 65536, length $buf);
     last unless $n2;
@@ -4079,6 +4195,7 @@ sub run_ytdlp {
   return (0, 'CANCEL', 0) if $cancel;
   my $sig = $st & 127;
   my $code = $st >> 8;
+  $sig = 9 if !$sig && $code == 137;
   append_log($dir, "结束：退出码 $code" . ($sig ? "，信号 $sig" : '') . "\n");
   # 图文帖会有好几个文件（一张图一个），用换行连起来交回去。
   my @have = grep { -f "$dir/$_" && -s "$dir/$_" } @files;
@@ -4097,8 +4214,10 @@ sub run_ytdlp {
 sub update_ytdlp {
   my ($why) = @_;
   logline("检查 yt-dlp 更新（$why）");
+  drop_page_cache() if low_mem_level() >= 1;
   my ($out) = run_cmd_capture(600, $C{ytdlp}, '-U');
   my ($ver) = run_cmd_capture(120, $C{ytdlp}, '--version');
+  drop_page_cache() if low_mem_level() >= 1;
   $ver =~ s/\s+$//;
   $ver = (split /\n/, $ver)[-1] || '' if $ver;
   kv_update("$STATE/info", ytdlp_version => $ver, last_update => time,
@@ -4276,15 +4395,21 @@ sub mac_fix {
   my @in = ($C{ffmpeg}, '-hide_banner', '-nostdin', '-y', '-loglevel', 'error', '-progress', 'pipe:1', '-i', $file);
   my @audio = $aok && $a ne '' ? ('-c:a', 'copy') : ('-c:a', 'aac', '-b:a', '160k');
   my ($ok, $note);
+  drop_page_cache() if low_mem_level() >= 1;
   if ($v eq 'h264' || $v eq 'hevc') {
     # 画面不用动，只换声音/封装。HEVC 加上 hvc1 标记，QuickTime 才认。
     my @tag = $v eq 'hevc' ? ('-tag:v', 'hvc1') : ();
     set_stat($id, line => '正在整理成 Mac 能直接播放的 mp4…', pct => 100);
     $ok = run_ffmpeg($id, $dir, $info->{dur}, '正在整理成 Mac 能直接播放的 mp4',
-      @in, '-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'copy', @tag, @audio, '-movflags', '+faststart', $new);
+      @in, '-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'copy', @tag, @audio,
+      '-threads', '1', '-max_muxing_queue_size', '256', '-movflags', '+faststart', $new);
   } else {
-    my $est = transcode_estimate($info->{dur}, $info->{h});
     my $vname = uc($v eq 'vp9' ? 'VP9' : $v eq 'av1' ? 'AV1' : $v);
+    # 64MB 又没有虚拟内存的容器，libx264 转码必被系统杀掉，直接保留原文件。
+    if (low_mem_level() >= 3) {
+      return ($file, "原视频是 $vname，这台 VPS 内存太小无法转码，保留了原格式（用 IINA 或 VLC 能放）");
+    }
+    my $est = transcode_estimate($info->{dur}, $info->{h});
     my $line = "这个视频只有 $vname 格式，Mac 自带播放器放不了，正在转换成 H.264。这台机器转码比较慢，预计要 " . human_secs($est)
       . '（不想等可以取消，改选「最高画质」直接下原格式，用 IINA/VLC 播放）';
     set_stat($id, line => $line, pct => 0);
@@ -4292,7 +4417,7 @@ sub mac_fix {
     my @scale = $info->{h} > 1080 ? ('-vf', 'scale=-2:1080') : ();
     $ok = run_ffmpeg($id, $dir, $info->{dur}, $line,
       @in, '-map', '0:v:0', '-map', '0:a:0?', @scale, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
-      '-threads', '1', @audio, '-movflags', '+faststart', $new);
+      '-threads', '1', '-max_muxing_queue_size', '256', @audio, '-movflags', '+faststart', $new);
     $note = "原视频是 $vname，已转成 H.264";
   }
   return ('CANCEL', '') if $ok < 0;
@@ -4326,13 +4451,20 @@ sub run_job {
   my $i = 0;
   my $src = $plat eq 'youtube' ? 'YouTube' : $pname;
   my @tried;
+  my %mem_opts;
   while ($i < @ms) {
     my $m = $ms[$i];
     $i++;
     push @tried, $m->{ip} if $m->{ip} && !$m->{cookies} && !grep { $_ eq $m->{ip} } @tried;
-    set_stat($id, line => @ms > 1 && $i > 1 ? "上一种办法不行，换第 $i 种办法：$m->{label}…" : "正在向 $src 要视频信息…", pct => 0);
+    if ($mem_opts{no_merge}) {
+      set_stat($id, line => '服务器内存太小，正在改用免合并的单文件模式重试…', pct => 0);
+    } elsif ($mem_opts{ultra_low}) {
+      set_stat($id, line => '服务器内存紧张，正在改用省内存模式重试…', pct => 0);
+    } else {
+      set_stat($id, line => @ms > 1 && $i > 1 ? "上一种办法不行，换第 $i 种办法：$m->{label}…" : "正在向 $src 要视频信息…", pct => 0);
+    }
     clean_media($dir);
-    my ($ok, $res, $sig) = run_ytdlp($id, $meta, $m, $i, scalar @ms);
+    my ($ok, $res, $sig) = run_ytdlp($id, $meta, $m, $i, scalar @ms, \%mem_opts);
     if ($res eq 'CANCEL') {
       remove_tree($dir);
       logline("任务 $id 已取消");
@@ -4368,7 +4500,7 @@ sub run_job {
         }
       } elsif ($files[0] =~ /\.(jpe?g|png|webp|gif|heic)$/i) {
         $note = '这条是图片，没有视频';
-      } else {
+      } elsif (!$mem_opts{no_merge}) {
         my ($nf, $n2) = mac_fix($id, $files[0], $q);
         if ($nf eq 'CANCEL') {
           remove_tree($dir);
@@ -4376,6 +4508,9 @@ sub run_job {
           return;
         }
         ($files[0], $note) = ($nf, $n2);
+      }
+      if ($mem_opts{no_merge}) {
+        $note = ($note ? "$note；" : '') . '这台 VPS 内存很紧，已自动改用免合并的单文件版本（清晰度可能略低）';
       }
       $res = $files[0];
       my $size = -s "$dir/$res";
@@ -4392,6 +4527,23 @@ sub run_job {
       unlink cookies_bad_file($plat) if $m->{cookies};
       logline("任务 $id 下好了（$m->{label}" . ($m->{ip} ? "，网络 $m->{ip}" : '') . "）：$res " . human_size($size));
       return;
+    }
+    # 内存不够被杀时，先自动降速省内存重跑一次；还不行再退到免合并单文件格式（不启 ffmpeg）。
+    if (is_oom($res, $sig)) {
+      if (!$mem_opts{ultra_low}) {
+        $mem_opts{ultra_low} = 1;
+        append_log($dir, "内存紧张被杀，改用省内存模式重试（限速 512KB/s，固定 16KB 缓冲）\n");
+        drop_page_cache();
+        $i--;
+        next;
+      }
+      if (!$mem_opts{no_merge} && $C{ffmpeg} && -x $C{ffmpeg} && ($meta->{q} || 'mac') ne 'mp3') {
+        $mem_opts{no_merge} = 1;
+        append_log($dir, "省内存模式仍被杀，改用免合并的单文件格式重试（不启动 ffmpeg）\n");
+        drop_page_cache();
+        $i--;
+        next;
+      }
     }
     my ($class, $msg, $hint) = classify($res, $sig, $plat);
     append_log($dir, "判断：$class / $msg\n");
@@ -4831,7 +4983,8 @@ sub main {
     }
     for my $l ($sel->can_read(1)) {
       my $c = $l->accept or next;
-      if (keys(%handlers) >= 40) {
+      my $max_h = low_mem_level() >= 1 ? 8 : 40;
+      if (keys(%handlers) >= $max_h) {
         respond($c, undef, 503, 'text/plain; charset=utf-8', "busy\n");
         close $c;
         next;

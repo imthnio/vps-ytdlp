@@ -310,6 +310,17 @@ rm -rf "$T/mac2" && mkdir -p "$T/mac2"
 check rs-fetch-size "$(wc -c < "$T/mac2/$(ls "$T/mac2" | head -n 1)" | tr -d ' ')" 3145728
 has rs-queued-runs "$(wait_job "$idq")" '"state":"done"'
 
+# 64MB 小鸡 OOM 自动降级重试：第一次被杀自动切到 512K 省内存模式；还被杀则退到免合并单文件
+ido1=$(add 'https://www.youtube.com/watch?v=oom1test001' p480 | job_id)
+js=$(wait_job "$ido1")
+has oom1-done "$js" '"state":"done"'
+has oom1-rate "$(grep 'oom1test001' "$T/calls.log" | tail -n 1)" '--limit-rate 512K'
+ido2=$(add 'https://www.youtube.com/watch?v=oom2test002' p480 | job_id)
+js=$(wait_job "$ido2")
+has oom2-done "$js" '"state":"done"'
+has oom2-nomerge "$(grep 'oom2test002' "$T/calls.log" | tail -n 1)" '-f b '
+has oom2-note "$js" '免合并的单文件版本'
+
 if [ "$fail" -ne 0 ]; then
   printf '\n有测试没通过。日志：\n' >&2
   cat "$T/server.log" >&2

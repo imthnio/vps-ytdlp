@@ -8,15 +8,21 @@ for a in "$@"; do
     --version) echo 2026.08.19; exit 0 ;;
   esac
 done
-home=; url=; ck=0; prev=
+home=; url=; ck=0; rate=; fmt=; prev=
 for a in "$@"; do
-  case "$prev" in --paths) case "$a" in home:*) home=${a#home:} ;; esac ;; esac
+  case "$prev" in
+    --paths) case "$a" in home:*) home=${a#home:} ;; esac ;;
+    --limit-rate) rate=$a ;;
+    -f) fmt=$a ;;
+  esac
   [ "$a" = --cookies ] && ck=1
   prev=$a
   url=$a
 done
 [ -n "${FAKE_LOG:-}" ] && echo "$@" >> "$FAKE_LOG"
 case "$url" in
+  *oom1*) if [ "$rate" != 512K ]; then exit 137; fi ;;
+  *oom2*) case "$fmt" in *+*) exit 137 ;; esac ;;
   *bot*) if [ "$ck" = 0 ]; then echo "ERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies"; exit 1; fi ;;
   *age*) echo "ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate for some users."; exit 1 ;;
   *gone*) echo "ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader"; exit 1 ;;

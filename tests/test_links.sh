@@ -87,6 +87,40 @@ YTDLP_WEB_NO_MAIN=1 T="$T" perl -e '
   like("cls-yt-same", (classify("ERROR: [youtube] x: Sign in to confirm you’re not a bot", 0, "youtube"))[1], qr/YouTube 认为/);
   is("cls-extract-not-404", (classify("ERROR: [TikTok] 1: Unable to extract video url; not found", 0, "tiktok"))[0], "blocked");
   is("cls-oom", (classify("", 9, "bili"))[0], "fatal");
+  like("cls-oom-msg", (classify("", 9, "youtube"))[1], qr/360p/);
+  is("is-oom-sig9", is_oom("", 9), 1);
+  is("is-oom-py", is_oom("Traceback: MemoryError", 0), 1);
+  is("is-oom-normal", is_oom("ERROR: video unavailable", 0), 0);
+
+  # 64MB 小内存检测与 yt-dlp 省内存参数
+  {
+    local $ENV{YTDLP_WEB_MEM_MB} = 1024;
+    local $ENV{YTDLP_WEB_SWAP_MB} = 0;
+    is("mem-lvl-1g", low_mem_level(), 0);
+    is("base-1g-norate", (grep { $_ eq "--limit-rate" } base_args("/tmp")) ? 1 : 0, 0);
+  }
+  {
+    local $ENV{YTDLP_WEB_MEM_MB} = 256;
+    local $ENV{YTDLP_WEB_SWAP_MB} = 512;
+    is("mem-lvl-256", low_mem_level(), 1);
+    like("base-256", join(" ", base_args("/tmp")), qr/--no-resize-buffer --buffer-size 32K .*--limit-rate 2M/);
+  }
+  {
+    local $ENV{YTDLP_WEB_MEM_MB} = 64;
+    local $ENV{YTDLP_WEB_SWAP_MB} = 512;
+    is("mem-lvl-64-swap", low_mem_level(), 2);
+    like("base-64-swap", join(" ", base_args("/tmp")), qr/--no-resize-buffer --buffer-size 16K .*--http-chunk-size 2M --limit-rate 1M/);
+  }
+  {
+    local $ENV{YTDLP_WEB_MEM_MB} = 64;
+    local $ENV{YTDLP_WEB_SWAP_MB} = 0;
+    is("mem-lvl-64-noswap", low_mem_level(), 3);
+    like("base-64-noswap", join(" ", base_args("/tmp")), qr/--no-resize-buffer --buffer-size 16K .*--http-chunk-size 1M --limit-rate 512K/);
+  }
+  {
+    local $C{ffmpeg} = "/bin/sh";
+    is("q-yt-nomerge", join(" ", quality_args("p480", "youtube", { no_merge => 1 })), "-f b -S vcodec:h264,res:480,acodec:aac --merge-output-format mp4");
+  }
 
   # 方法表：YouTube 照旧以直接下载开头；其他平台每一步都写明走哪种网络
   my @yt = map { $_->{key} } all_methods("youtube");
